@@ -1,0 +1,257 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
+)
+
+// ReadOnlyEnv is named in the "writes disabled" message.
+const ReadOnlyEnv = "CODENAV_GO_MCP_READ_ONLY"
+
+// GoGuardRule is the Go-specific part of the write guard: only .go files, never generated ones.
+func GoGuardRule(c edits.FileChange) error {
+	if filepath.Ext(c.Path) != ".go" {
+		return toolerr.Inputf("%s is not a .go file", filepath.Base(c.Path))
+	}
+	if c.Old != nil && gosrc.IsGenerated(*c.Old) {
+		return toolerr.Inputf("%s is generated (// Code generated ... DO NOT EDIT.); change its generator instead", filepath.Base(c.Path))
+	}
+	return nil
+}
+
+// absPath resolves a workspace-relative path and checks the guard's path rules.
+func (w *Workspace) absPath(p string) (string, error) {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(w.Root, p)
+	}
+	p = filepath.Clean(p)
+	if err := w.Journal.Guard.CheckPath(p); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+func maxErrors(n int) string {
+	if n < 0 {
+		return "no limit"
+	}
+	return fmt.Sprint(n)
+}
+
+// finishPlan simulates plan, then writes it when the new errors stay within maxNew (<0: unlimited)
+// and apply is set; otherwise it keeps the plan as a preview.
+func finishPlan(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply bool, maxNew int, includeDeps, allowLarge bool) (string, error) {
+	if len(plan.Changes) == 0 {
+		return "No changes: the edit leaves the code as it is.", nil
+	}
+	if err := w.Journal.Guard.CheckPlan(plan, allowLarge || !apply); err != nil {
+		return "", err
+	}
+	delta, err := Simulate(ctx, w, plan, includeDeps)
+	if err != nil {
+		return "", err
+	}
+	return conclude(w, plan, delta, apply, maxNew, allowLarge)
+}
+
+func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool) (string, error) {
+	var out []string
+	out = append(out, plan.Description, plan.Summary(w.Root), "", diagdelta.Format(delta, 15))
+	for _, n := range plan.Notes {
+		out = append(out, "Note: "+n)
+	}
+	newErrs := len(delta.NewErrors())
+	switch {
+	case apply && (maxNew < 0 || newErrs <= maxNew):
+		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
+			id := w.Store.Add(plan)
+			return strings.Join(append(out, "", "Not written: "+err.Error(), "Preview id: "+id), "\n"), nil
+		}
+		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
+		if err != nil {
+			return "", err
+		}
+		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
+	case apply:
+		id := w.Store.Add(plan)
+		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q) to write it anyway.", newErrs, maxErrors(maxNew), id, id))
+		out = append(out, "", plan.Diff(w.Root, 2, 120))
+	default:
+		id := w.Store.Add(plan)
+		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q) writes it.", id), "", plan.Diff(w.Root, 2, 200))
+	}
+	return strings.Join(out, "\n"), nil
+}
+
+type editIn struct {
+	FilePath          string `json:"file_path" jsonschema:"Go file, relative to the workspace root"`
+	OldString         string `json:"old_string,omitempty"`
+	NewString         string `json:"new_string,omitempty"`
+	ReplaceAll        bool   `json:"replace_all,omitempty"`
+	NewText           string `json:"new_text,omitempty" jsonschema:"complete new file content (also creates a new file)"`
+	Apply             *bool  `json:"apply,omitempty" jsonschema:"default true; false only previews"`
+	MaxNewErrors      *int   `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit"`
+	IncludeDependents *bool  `json:"include_dependents,omitempty" jsonschema:"default true: also type-check importing packages"`
+}
+
+func flag(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+func limit(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+// addWrite registers a tool that may change files.
+func addWrite[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
+	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
+	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
+		w, err := h.Acquire(ctx, req.Session)
+		var out string
+		if err == nil {
+			out, err = fn(ctx, w, in)
+		}
+		if err != nil {
+			t, ok := toolerr.Format(err)
+			if !ok {
+				return nil, nil, err
+			}
+			out = t
+		}
+		return text(h.Notes().Annotate(out)), nil, nil
+	})
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
+	abs, err := w.absPath(in.FilePath)
+	if err != nil {
+		return nil, err
+	}
+	if filepath.Ext(abs) != ".go" {
+		return nil, toolerr.Inputf("%q is not a .go file.", in.FilePath)
+	}
+	old, bom, rerr := edits.ReadSource(abs)
+	exists := rerr == nil
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return nil, rerr
+	}
+	var next string
+	switch {
+	case in.NewText != "":
+		next = in.NewText
+	case in.OldString != "":
+		if !exists {
+			return nil, toolerr.Inputf("%s does not exist; pass new_text to create it.", in.FilePath)
+		}
+		n := strings.Count(old, in.OldString)
+		switch {
+		case n == 0:
+			return nil, toolerr.Inputf("old_string was not found in %s (it must match exactly, including whitespace).", in.FilePath)
+		case n > 1 && !in.ReplaceAll:
+			return nil, toolerr.Inputf("old_string matches %d times in %s; add context to make it unique or pass replace_all=true.", n, in.FilePath)
+		}
+		count := 1
+		if in.ReplaceAll {
+			count = -1
+		}
+		next = strings.Replace(old, in.OldString, edits.MatchEOL(in.NewString, old), count)
+	default:
+		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
+	}
+	formatted, err := gosrc.Format(abs, strings.ReplaceAll(next, "\r\n", "\n"))
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		formatted = edits.MatchEOL(formatted, old)
+	}
+	c := edits.FileChange{Path: abs, New: &formatted, NewBOM: bom}
+	if exists {
+		c.Old, c.OldBOM = &old, bom
+	}
+	if c.IsNoop() {
+		return edits.NewPlan("edit "+in.FilePath, nil), nil
+	}
+	return edits.NewPlan("edit "+in.FilePath, []edits.FileChange{c}), nil
+}
+
+type applyIn struct {
+	ID         string `json:"id" jsonschema:"preview id returned by a previous call"`
+	AllowLarge bool   `json:"allow_large,omitempty"`
+}
+
+type undoIn struct {
+	ID string `json:"id,omitempty" jsonschema:"edit id; default: the latest edit"`
+}
+
+type verifyIn struct {
+	IncludeDependents *bool `json:"include_dependents,omitempty"`
+}
+
+// RegisterWrite registers the edit tools.
+func RegisterWrite(s *mcp.Server, h Host) {
+	addWrite(s, h, "edit", "Edit text in a Go file, type-checked: edit(file_path, old_string, new_string) or edit(file_path, new_text). "+
+		"old_string must match exactly once unless replace_all=true. The result must parse; it is gofmt-ed. Writes when the new errors in the file and the packages importing it stay within max_new_errors (default 0); otherwise nothing is written and the result lists them plus an id for apply_edit. apply=false always previews; undo_edit reverts.",
+		func(ctx context.Context, w *Workspace, in editIn) (string, error) {
+			plan, err := planEdit(w, in)
+			if err != nil {
+				return "", err
+			}
+			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
+		})
+
+	addWrite(s, h, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
+		func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
+			plan, err := w.Store.Get(in.ID)
+			if err != nil {
+				return "", err
+			}
+			if err := w.Journal.CheckFresh(plan); err != nil {
+				return "", err
+			}
+			if err := w.Journal.Guard.CheckPlan(plan, in.AllowLarge); err != nil {
+				return "", err
+			}
+			delta, err := Simulate(ctx, w, plan, true)
+			if err != nil {
+				return "", err
+			}
+			w.Store.Discard(in.ID)
+			return conclude(w, plan, delta, true, -1, in.AllowLarge)
+		})
+
+	addWrite(s, h, "undo_edit", "Revert an applied edit (the latest by default). Refuses when its files changed afterwards.",
+		func(ctx context.Context, w *Workspace, in undoIn) (string, error) {
+			e, err := w.Journal.Undo(in.ID, ReadOnlyEnv)
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("Reverted edit %s: %s\n%s", e.ID, e.Plan.Description, e.Plan.Summary(w.Root)), nil
+		})
+
+	addWrite(s, h, "verify_changes", "Diagnostics delta of the uncommitted changes against git HEAD: new vs fixed errors in changed Go files and the packages importing them.",
+		func(ctx context.Context, w *Workspace, in verifyIn) (string, error) {
+			return verifyChanges(ctx, w, flag(in.IncludeDependents, true))
+		})
+}
+
+var _ = format.Relative

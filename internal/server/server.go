@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/tools"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/workspace"
 )
 
@@ -31,9 +33,11 @@ type Manager struct {
 	selector *workspace.Selector
 	board    *notices.Board
 
-	mu     sync.Mutex
-	client *lsp.Client
-	sel    workspace.Selection
+	mu      sync.Mutex
+	client  *lsp.Client
+	sel     workspace.Selection
+	journal *txn.Journal
+	store   *txn.PlanStore
 }
 
 func NewManager() *Manager {
@@ -91,11 +95,12 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 			return nil, err
 		}
 		m.client, m.sel = c, sel
+		m.journal, m.store = txn.NewJournal(guardFor(sel.Root)), txn.NewPlanStore()
 	}
 	if err := m.client.Refresh(); err != nil {
 		return nil, err
 	}
-	return &tools.Workspace{Client: m.client, Root: m.sel.Root, Source: m.sel.Source}, nil
+	return &tools.Workspace{Client: m.client, Root: m.sel.Root, Source: m.sel.Source, Journal: m.journal, Store: m.store}, nil
 }
 
 func goplsSettings() map[string]any {
@@ -125,8 +130,31 @@ func New(version string) (*mcp.Server, *Manager) {
 		Instructions: "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics.",
 	})
 	tools.RegisterNav(s, m)
+	tools.RegisterWrite(s, m)
 	return s, m
 }
 
 // Explain forwards to the workspace selector.
 func (m *Manager) Explain(source string) string { return m.selector.Explain(source) }
+
+func goEnv(name string) string {
+	out, err := exec.Command("go", "env", name).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func guardFor(root string) txn.WriteGuard {
+	g := txn.WriteGuard{Root: root, MaxFiles: txn.DefaultMaxFiles, Extra: tools.GoGuardRule}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvReadOnly))) {
+	case "1", "true", "yes", "on":
+		g.ReadOnly = true
+	}
+	for _, d := range []string{goEnv("GOROOT"), goEnv("GOMODCACHE")} {
+		if d != "" {
+			g.NeverWrite = append(g.NeverWrite, d)
+		}
+	}
+	return g
+}

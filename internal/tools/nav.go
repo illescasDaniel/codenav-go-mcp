@@ -15,12 +15,15 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/params"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 )
 
 // Workspace is a started client plus the root it serves.
 type Workspace struct {
 	Client       *lsp.Client
 	Root, Source string
+	Journal      *txn.Journal
+	Store        *txn.PlanStore
 }
 
 // Host supplies the workspace for a call.
