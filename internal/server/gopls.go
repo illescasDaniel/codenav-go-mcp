@@ -1,0 +1,50 @@
+package server
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+)
+
+// GoplsCommand locates gopls: $CODENAV_GO_MCP_GOPLS, then GOBIN / GOPATH/bin, then PATH,
+// and as a last resort `go run golang.org/x/tools/gopls@latest` (with a warning).
+func GoplsCommand() (cmd []string, warning string, err error) {
+	if p := os.Getenv(EnvGopls); p != "" {
+		fields := strings.Fields(p)
+		if _, err := exec.LookPath(fields[0]); err != nil {
+			return nil, "", fmt.Errorf("$%s=%q is not executable: %w", EnvGopls, p, err)
+		}
+		return fields, "", nil
+	}
+	for _, dir := range goBinDirs() {
+		p := filepath.Join(dir, "gopls")
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return []string{p}, "", nil
+		}
+	}
+	if p, err := exec.LookPath("gopls"); err == nil {
+		return []string{p}, "", nil
+	}
+	if goTool, err := exec.LookPath("go"); err == nil {
+		return []string{goTool, "run", "golang.org/x/tools/gopls@latest"},
+			"gopls was not found; falling back to `go run golang.org/x/tools/gopls@latest` (slow on first use). Install it with `go install golang.org/x/tools/gopls@latest`.", nil
+	}
+	return nil, "", fmt.Errorf("gopls not found and no go toolchain on PATH; install it with `go install golang.org/x/tools/gopls@latest` or set $%s", EnvGopls)
+}
+
+func goBinDirs() []string {
+	var dirs []string
+	if v := os.Getenv("GOBIN"); v != "" {
+		dirs = append(dirs, v)
+	}
+	if v := os.Getenv("GOPATH"); v != "" {
+		for _, p := range filepath.SplitList(v) {
+			dirs = append(dirs, filepath.Join(p, "bin"))
+		}
+	} else if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, "go", "bin"))
+	}
+	return dirs
+}
