@@ -162,7 +162,13 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			return "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  "), nil
 		}
 		if len(all) == 0 {
-			return "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + ".", nil
+			hint := ""
+			for _, u := range unfixable {
+				if strings.Contains(u, "imported and not used") {
+					hint = " For unused imports use organize_imports=true."
+				}
+			}
+			return "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint, nil
 		}
 	}
 

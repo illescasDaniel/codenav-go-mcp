@@ -511,3 +511,35 @@ func TestOutlineGroupsAndMethodNames(t *testing.T) {
 		t.Fatalf("methods are shown as T.M:\n%s", out)
 	}
 }
+
+func TestReadOnlyBlockedEditHasNoApplyHint(t *testing.T) {
+	cs, _ := session(t, map[string]string{EnvReadOnly: "1"})
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "return s.Area() * k", "new_string": "return \"x\""})
+	if strings.Contains(out, "Preview id") || strings.Contains(out, "apply_edit") {
+		t.Fatalf("read-only must not advertise apply_edit:\n%s", out)
+	}
+	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "unused int", "new_string": "unused int64", "apply": false})
+	if strings.Contains(out, "apply_edit") {
+		t.Fatalf("read-only preview must not advertise apply_edit:\n%s", out)
+	}
+}
+
+func TestEditRefusesConflictingArgs(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "Scale", "new_string": "Scale2", "new_text": "package shapes\n"})
+	if !strings.Contains(out, "not both") {
+		t.Fatalf("conflicting args:\n%s", out)
+	}
+}
+
+func TestRenameKeepsFilesGofmted(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Shape.Area", "new_name": "SurfaceArea"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("rename:\n%s", out)
+	}
+	cmd := exec.Command("gofmt", "-l", root)
+	if b, _ := cmd.Output(); len(b) > 0 {
+		t.Fatalf("files not gofmt-ed after rename: %s", b)
+	}
+}

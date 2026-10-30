@@ -180,6 +180,13 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	if err != nil {
 		return nil, err
 	}
+	for i := range changes {
+		if c := &changes[i]; c.New != nil && strings.HasSuffix(c.Path, ".go") {
+			if f, err := gosrc.Format(c.Path, *c.New); err == nil {
+				c.New = &f
+			}
+		}
+	}
 	desc := fmt.Sprintf("rename %s -> %s", oldName, in.NewName)
 	var notes []string
 	if len(linked) > 0 {
@@ -198,11 +205,10 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			after[c.Path] = *c.New
 		}
 	}
-	only := ""
-	if in.Parameter != "" || kind == 0 { // a parameter or local variable (not a top-level or member symbol) is not visible outside its file
-		only = root.path
+	// A parameter or local variable is fully resolved by gopls; same-named text elsewhere is unrelated.
+	if in.Parameter == "" && kind != 0 {
+		notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, after, ""), oldName)...)
 	}
-	notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, after, only), oldName)...)
 	return edits.NewPlan(desc, changes, notes...), nil
 }
 

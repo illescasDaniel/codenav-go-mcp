@@ -80,6 +80,7 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		out = append(out, "Note: "+n)
 	}
 	newErrs := len(delta.NewErrors())
+	readOnly := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv) != nil
 	switch {
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
@@ -91,10 +92,14 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		}
 		_ = w.Client.NoteWritten(planPaths(plan))
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
+	case apply && readOnly:
+		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s, and write tools are disabled (%s).", newErrs, maxErrors(maxNew), ReadOnlyEnv), "", plan.Diff(w.Root, 2, 120))
 	case apply:
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q) to write it anyway.", newErrs, maxErrors(maxNew), id, id))
 		out = append(out, "", plan.Diff(w.Root, 2, 120))
+	case readOnly:
+		out = append(out, "", "Preview only (apply=false); write tools are disabled ("+ReadOnlyEnv+").", "", plan.Diff(w.Root, 2, 200))
 	default:
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q) writes it.", id), "", plan.Diff(w.Root, 2, 200))
@@ -165,6 +170,9 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 	var next string
 	switch {
 	case in.NewText != "":
+		if in.OldString != "" {
+			return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text, not both.")
+		}
 		next = in.NewText
 	case in.OldString != "":
 		if !exists {
