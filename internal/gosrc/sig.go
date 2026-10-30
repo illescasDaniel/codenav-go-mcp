@@ -29,6 +29,7 @@ func (f *File) off(p token.Pos) int { return f.fset.Position(p).Offset }
 type Param struct {
 	Name, Type string
 	Variadic   bool
+	NameOff    int // offset of the name in the file (named parameters)
 }
 
 // Sig is the parameter list of a function declaration or interface method.
@@ -49,7 +50,7 @@ func (f *File) sigOf(ft *ast.FuncType) *Sig {
 			s.Params = append(s.Params, Param{Type: typ, Variadic: variadic})
 		}
 		for _, n := range field.Names {
-			s.Params = append(s.Params, Param{Name: n.Name, Type: typ, Variadic: variadic})
+			s.Params = append(s.Params, Param{Name: n.Name, Type: typ, Variadic: variadic, NameOff: f.off(n.Pos())})
 		}
 	}
 	return s

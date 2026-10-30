@@ -10,6 +10,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/mentions"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
@@ -27,6 +28,7 @@ type renameIn struct {
 	FilePath          string `json:"file_path,omitempty" jsonschema:"narrows name, or the file of line/column"`
 	Line              int    `json:"line,omitempty" jsonschema:"1-indexed, with file_path and column"`
 	Column            int    `json:"column,omitempty" jsonschema:"1-indexed UTF-16 offset"`
+	Parameter         string `json:"parameter,omitempty" jsonschema:"rename this parameter of the function or method given by name (or at line/column) instead of the function itself"`
 	Linked            *bool  `json:"linked,omitempty" jsonschema:"default true: rename the interface method and every implementation together"`
 	Apply             *bool  `json:"apply,omitempty"`
 	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
@@ -111,6 +113,14 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		}
 	default:
 		return nil, toolerr.Inputf("pass `name` (e.g. Square.Area) or `file_path` + `line` + `column`.")
+	}
+
+	if in.Parameter != "" {
+		var err error
+		if root, err = parameterOf(root, in.Parameter, w); err != nil {
+			return nil, err
+		}
+		kind = 0
 	}
 
 	rng, err := w.Client.PrepareRename(ctx, root.path, root.line+1, root.col+1)
@@ -214,4 +224,34 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 		}
 	}
 	return members, nil
+}
+
+// parameterOf moves root from a function's name to the name of its parameter.
+func parameterOf(fn member, param string, w *Workspace) (member, error) {
+	text, _, err := edits.ReadSource(fn.path)
+	if err != nil {
+		return member{}, err
+	}
+	f, err := gosrc.ParseFile(fn.path, text)
+	if err != nil {
+		return member{}, err
+	}
+	sig, err := f.SigAt(edits.Offset(text, fn.line, fn.col))
+	if err != nil {
+		return member{}, toolerr.Inputf("parameter= needs a function or method: %v", err)
+	}
+	var names []string
+	for _, p := range sig.Params {
+		if p.Name == param {
+			line, col := edits.PositionOf(text, p.NameOff)
+			return member{fn.path, line, col}, nil
+		}
+		if p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	if len(names) == 0 {
+		return member{}, toolerr.Inputf("the parameters of this function are unnamed or blank.")
+	}
+	return member{}, toolerr.Inputf("no parameter %q; it has: %s.", param, strings.Join(names, ", "))
 }

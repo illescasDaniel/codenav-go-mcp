@@ -229,3 +229,38 @@ func TestPickUpFilesChangedOnDisk(t *testing.T) {
 		t.Fatalf("deleted file still reported:\n%s", out)
 	}
 }
+
+func TestRenameParameter(t *testing.T) {
+	cs, root := session(t, nil)
+	if out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "parameter": "nope", "new_name": "factor"}); !strings.Contains(out, "no parameter") {
+		t.Fatalf("unknown parameter must be refused with the list:\n%s", out)
+	}
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "parameter": "k", "new_name": "factor"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("rename parameter:\n%s", out)
+	}
+	if src := readFile(t, root, "shapes/shapes.go"); !strings.Contains(src, "factor float64") || !strings.Contains(src, "* factor") || !strings.Contains(src, "func Scale(") {
+		t.Fatalf("parameter and its uses must be renamed, the function kept:\n%s", src)
+	}
+}
+
+func TestVerifyChangesReportsNewError(t *testing.T) {
+	cs, root := session(t, nil)
+	for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, {"-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"}} {
+		cmd := exec.Command("git", append([]string{"-C", root}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if out := call(t, cs, "verify_changes", map[string]any{}); !strings.Contains(out, "No uncommitted") {
+		t.Fatalf("clean tree:\n%s", out)
+	}
+	call(t, cs, "edit", map[string]any{
+		"file_path": "shapes/shapes.go", "old_string": "return s.Area() * k", "new_string": "return s.Area() * \"k\"", "max_new_errors": -1,
+	})
+	out := call(t, cs, "verify_changes", map[string]any{})
+	if !strings.Contains(out, "shapes.go") || !strings.Contains(strings.ToLower(out), "new") {
+		t.Fatalf("verify_changes must report the new error:\n%s", out)
+	}
+	t.Log(out)
+}
