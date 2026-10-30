@@ -5,6 +5,7 @@ package diagdelta
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -34,6 +35,34 @@ func (e Entry) strict() string {
 }
 func (e Entry) loose() string {
 	return fmt.Sprintf("%s|%s|%d|%s", e.Path, e.Code, e.Severity, e.Message)
+}
+
+var (
+	lineRefRE = regexp.MustCompile(`\bline \d+`)
+	posRefRE  = regexp.MustCompile(`\.go:\d+(?::\d+)?`)
+	quotedRE  = regexp.MustCompile("\"[^\"\n]*\"|`[^`\n]*`")
+)
+
+// mask hides what moves or renames change in a message: line numbers and quoted names.
+func mask(msg string) string {
+	msg = lineRefRE.ReplaceAllString(msg, "line N")
+	msg = posRefRE.ReplaceAllString(msg, ".go:N")
+	return quotedRE.ReplaceAllString(msg, "Q")
+}
+
+// Errors are never paired by the masked keys: offsetting a new error against a fixed one that
+// merely looks alike could let it slip past max_new_errors.
+func (e Entry) maskedInFile() string {
+	if e.IsError() {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%d|%s", e.Path, e.Code, e.Severity, mask(e.Message))
+}
+func (e Entry) maskedAnywhere() string {
+	if e.IsError() {
+		return ""
+	}
+	return fmt.Sprintf("%s|%d|%s", e.Code, e.Severity, mask(e.Message))
 }
 
 func (e Entry) Render() string {
@@ -94,6 +123,10 @@ func subtract(left, right []Entry, key func(Entry) string) (ul, ur []Entry) {
 	var order []string
 	for _, e := range right {
 		k := key(e)
+		if k == "" {
+			ur = append(ur, e)
+			continue
+		}
 		if _, ok := pool[k]; !ok {
 			order = append(order, k)
 		}
@@ -101,7 +134,7 @@ func subtract(left, right []Entry, key func(Entry) string) (ul, ur []Entry) {
 	}
 	for _, e := range left {
 		k := key(e)
-		if p := pool[k]; len(p) > 0 {
+		if p := pool[k]; k != "" && len(p) > 0 {
 			pool[k] = p[:len(p)-1]
 		} else {
 			ul = append(ul, e)
@@ -113,10 +146,14 @@ func subtract(left, right []Entry, key func(Entry) string) (ul, ur []Entry) {
 	return
 }
 
-// Diff pairs identical diagnostics, then pairs what is left by message alone.
+// Diff pairs identical diagnostics, then pairs what is left by message alone, then warnings and
+// hints by their message with line numbers and quoted names masked (first within a file, then
+// across files, so a move or rename does not show the same diagnostic as fixed and new).
 func Diff(before, after []Entry) Delta {
 	nw, fixed := subtract(after, before, Entry.strict)
 	nw, fixed = subtract(nw, fixed, Entry.loose)
+	nw, fixed = subtract(nw, fixed, Entry.maskedInFile)
+	nw, fixed = subtract(nw, fixed, Entry.maskedAnywhere)
 	less := func(s []Entry) {
 		sort.SliceStable(s, func(i, j int) bool {
 			a, b := s[i], s[j]

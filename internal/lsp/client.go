@@ -545,16 +545,6 @@ func (c *Client) Overlay(ctx context.Context, texts map[string]string, fn func()
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	uris := make([]string, 0, len(texts))
-	for p, text := range texts {
-		uri := PathToURI(c.absPath(p))
-		uris = append(uris, uri)
-		c.mu.Lock()
-		c.overlays[uri] = text
-		c.mu.Unlock()
-		if err := c.syncText(uri, text, overlayMtime, int64(len(text))); err != nil {
-			return err
-		}
-	}
 	defer func() {
 		for _, uri := range uris {
 			c.mu.Lock()
@@ -570,7 +560,74 @@ func (c *Client) Overlay(ctx context.Context, texts map[string]string, fn func()
 			}
 		}
 	}()
+	for p, text := range texts {
+		uri := PathToURI(c.absPath(p))
+		uris = append(uris, uri)
+		c.mu.Lock()
+		c.overlays[uri] = text
+		c.mu.Unlock()
+		if err := c.syncText(uri, text, overlayMtime, int64(len(text))); err != nil {
+			return err
+		}
+	}
 	return fn()
+}
+
+// NoteWritten records files this process just created, changed or deleted, so the next Refresh
+// does not mistake them for outside changes and a later outside deletion is still noticed. The
+// server is told once, through didChangeWatchedFiles; open documents are resynced or closed.
+func (c *Client) NoteWritten(paths []string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	var changes []map[string]any
+	for _, p := range paths {
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(c.opts.Root, p)
+		}
+		p = filepath.Clean(p)
+		uri := PathToURI(c.docPath(p))
+		st, err := os.Stat(p)
+		c.mu.Lock()
+		if c.snapshot == nil {
+			c.snapshot = map[string][2]int64{}
+		}
+		_, was := c.snapshot[p]
+		typ := 3
+		if err == nil {
+			c.snapshot[p] = [2]int64{st.ModTime().UnixNano(), st.Size()}
+			typ = 1
+			if was {
+				typ = 2
+			}
+		} else {
+			delete(c.snapshot, p)
+		}
+		_, isOpen := c.open[uri]
+		c.mu.Unlock()
+		if isOpen {
+			if err != nil {
+				_ = c.CloseDocument(uri)
+			} else if text, rerr := readDocumentText(p); rerr == nil {
+				_ = c.syncText(uri, text, st.ModTime().UnixNano(), st.Size())
+			}
+		}
+		changes = append(changes, map[string]any{"uri": uri, "type": typ})
+	}
+	return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
+}
+
+// docPath is absPath for a path that may not exist yet: its directory is resolved instead.
+func (c *Client) docPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	if r, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+		return filepath.Join(r, filepath.Base(p))
+	}
+	return filepath.Clean(p)
 }
 
 // -- position helpers --------------------------------------------------------

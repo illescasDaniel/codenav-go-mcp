@@ -7,11 +7,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -153,6 +156,73 @@ func matchTier(name, query string) int {
 		return 3
 	}
 	return fuzzyTier
+}
+
+// looseSpan judges a subsequence-only match (tier 4): the length of the stretch of name the query
+// letters are spread over, and whether the match looks intended. It does when the query starts
+// at the name's first letter and stays compact (span <= 3*len(query)), or when the query is part
+// of the name's camel-hump initials (mgr for MaxGroupRate).
+func looseSpan(name, query string) (span int, ok bool) {
+	name = BaseName(name)
+	n, q := []rune(strings.ToLower(name)), []rune(strings.ToLower(query))
+	if len(q) == 0 {
+		return 0, true
+	}
+	qi, first := 0, -1
+	for i, r := range n {
+		if qi < len(q) && r == q[qi] {
+			if first < 0 {
+				first = i
+			}
+			qi++
+			if qi == len(q) {
+				span = i - first + 1
+			}
+		}
+	}
+	if qi < len(q) {
+		return 0, false
+	}
+	if first == 0 && span <= 3*len(q) {
+		return span, true
+	}
+	var initials []rune
+	prev := '_'
+	for _, r := range name {
+		if prev == '_' || (unicode.IsUpper(r) && !unicode.IsUpper(prev)) {
+			initials = append(initials, unicode.ToLower(r))
+		}
+		prev = r
+	}
+	if len(q) >= 2 && strings.Contains(string(initials), string(q)) {
+		return len(q), true
+	}
+	return 0, false
+}
+
+// dropWeak removes the weak tier-4 matches from the ranked list and orders the rest by span.
+func dropWeak(ranked []*lsp.Symbol, query string) (kept []*lsp.Symbol, weak int) {
+	type spanned struct {
+		s    *lsp.Symbol
+		span int
+	}
+	var tail []spanned
+	for _, s := range ranked {
+		if matchTier(s.Name, query) < fuzzyTier {
+			kept = append(kept, s)
+			continue
+		}
+		if span, ok := looseSpan(s.Name, query); ok {
+			tail = append(tail, spanned{s, span})
+		} else {
+			weak++
+		}
+	}
+	sort.SliceStable(tail, func(i, j int) bool { return tail[i].span < tail[j].span })
+	for _, t := range tail {
+		kept = append(kept, t.s)
+	}
+	return kept, weak
 }
 
 func IsTestPath(p string) bool { return strings.HasSuffix(p, "_test.go") }
@@ -302,6 +372,10 @@ func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int
 			ranked = real
 		}
 	}
+	weak := 0
+	if query != "" {
+		ranked, weak = dropWeak(ranked, query)
+	}
 	shown := ranked[:min(len(ranked), max(0, limit))]
 	lines := make([]string, len(shown))
 	for i, s := range shown {
@@ -316,6 +390,9 @@ func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int
 			s = ""
 		}
 		lines = append(lines, fmt.Sprintf("(%d looser fuzzy match%s whose names don't contain %q hidden; pass fuzzy=true to list them)", hidden, s, query))
+	}
+	if weak > 0 {
+		lines = append(lines, fmt.Sprintf("(%d weak matches hidden)", weak))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -466,8 +543,15 @@ func fromDocumentSymbol(s *lsp.Symbol) *node {
 	return n
 }
 
+var methodNameRE = regexp.MustCompile(`^\(\*?([^)]+)\)\.`)
+
 // FormatOutline: indented "name  [Kind]  :start-end" tree from hierarchical document symbols.
-func FormatOutline(symbols []*lsp.Symbol) string {
+func FormatOutline(symbols []*lsp.Symbol) string { return FormatOutlineGroups(symbols, nil) }
+
+// FormatOutlineGroups is FormatOutline with const/var/type blocks shown as a header line over
+// their (indented) members. gopls names methods (T).M or (*T).M; they are shown as T.M like the
+// other tools do.
+func FormatOutlineGroups(symbols []*lsp.Symbol, groups []gosrc.Group) string {
 	if len(symbols) == 0 {
 		return "No symbols found."
 	}
@@ -479,17 +563,39 @@ func FormatOutline(symbols []*lsp.Symbol) string {
 	var lines []string
 	var walk func(ns []*node, depth int)
 	walk = func(ns []*node, depth int) {
+		cur := -1 // index of the group whose header was written last
 		for _, n := range ns {
+			if depth == 0 {
+				gi := -1
+				for i, g := range groups {
+					if n.start >= g.Start && n.start <= g.End {
+						gi = i
+					}
+				}
+				if gi >= 0 && gi != cur {
+					g := groups[gi]
+					tags := "group"
+					if g.Iota {
+						tags += ", iota"
+					}
+					lines = append(lines, fmt.Sprintf("%s (…)  [%s]  :%d-%d", g.Keyword, tags, g.Start+1, g.End+1))
+				}
+				cur = gi
+			}
+			indent := depth
+			if depth == 0 && cur >= 0 {
+				indent++
+			}
 			span := fmt.Sprintf(":%d", n.start+1)
 			if n.end != n.start {
 				span = fmt.Sprintf(":%d-%d", n.start+1, n.end+1)
 			}
-			lines = append(lines, fmt.Sprintf("%s%s  [%s]  %s", strings.Repeat("  ", depth), n.name, KindLabel(n.kind), span))
+			lines = append(lines, fmt.Sprintf("%s%s  [%s]  %s", strings.Repeat("  ", indent), methodNameRE.ReplaceAllString(n.name, "$1."), KindLabel(n.kind), span))
 			// Children of funcs/vars/consts are locals, not structure.
 			switch n.kind {
 			case 6, 9, 12, 13, 14:
 			default:
-				walk(n.children, depth+1)
+				walk(n.children, indent+1)
 			}
 		}
 	}
@@ -497,7 +603,9 @@ func FormatOutline(symbols []*lsp.Symbol) string {
 	return strings.Join(lines, "\n")
 }
 
-func FormatCallers(calls []lsp.IncomingCall, root string) string {
+// FormatCallers lists the callers. recvs maps a call's index to the receiver type of the method
+// that makes it (gopls reports methods as plain functions).
+func FormatCallers(calls []lsp.IncomingCall, root string, recvs map[int]string) string {
 	if len(calls) == 0 {
 		return "No callers found."
 	}
@@ -521,7 +629,14 @@ func FormatCallers(calls []lsp.IncomingCall, root string) string {
 		if site == "" {
 			site = fmt.Sprintf("L%d", callerLine)
 		}
-		lines[i] = fmt.Sprintf("%s  [%s]  (%s:%d) calls at %s", c.From.Name, KindLabel(c.From.Kind), Relative(c.From.URI, root), callerLine, site)
+		name, kind := c.From.Name, KindLabel(c.From.Kind)
+		switch recv := recvs[i]; {
+		case recv != "":
+			name, kind = recv+"."+name, "method"
+		case name == "init" && c.From.Kind == 13:
+			kind = "var initializer"
+		}
+		lines[i] = fmt.Sprintf("%s  [%s]  (%s:%d) calls at %s", name, kind, Relative(c.From.URI, root), callerLine, site)
 	}
 	return strings.Join(lines, "\n")
 }

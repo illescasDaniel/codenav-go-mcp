@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
@@ -200,13 +201,13 @@ func render(text string, lo, hi int, es []sigEdit) string {
 }
 
 type fileState struct {
-	path  string
-	text  string
-	bom   bool
-	parse *gosrc.File
-	es    []sigEdit
-	seen  map[int]bool // call sites already edited (references of linked methods overlap)
-	added bool         // an added parameter's value appears in this file
+	path     string
+	text     string
+	bom      bool
+	parse    *gosrc.File
+	es       []sigEdit
+	seen     map[int]bool // call sites already edited (references of linked methods overlap)
+	inserted []string     // added types (declaration) and values (call sites) written into this file
 }
 
 func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string, error) {
@@ -271,6 +272,11 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 			return "", toolerr.Inputf("%s:%d has unnamed parameters; name them first", edits.RelativeName(m.path, w.Root), m.line+1)
 		}
 		have := sig.Params
+		for _, e := range order {
+			if e.add != nil {
+				fs.inserted = append(fs.inserted, e.add.Type)
+			}
+		}
 		fs.es = append(fs.es, sigEdit{start: sig.Start, end: sig.End, build: func([]string) string { return paramList(have, order) }})
 
 		refs, err := w.Client.References(ctx, m.path, m.line+1, m.col+1, false)
@@ -315,11 +321,11 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 					dropped++
 				}
 			}
-			addsHere := false
 			for _, e := range order {
-				addsHere = addsHere || e.old < 0
+				if e.add != nil {
+					rfs.inserted = append(rfs.inserted, e.add.Value)
+				}
 			}
-			rfs.added = rfs.added || addsHere
 			ord, fx := order, fixed
 			rfs.es = append(rfs.es, sigEdit{start: c.Start, end: c.End, args: c.Args, build: func(args []string) string {
 				var out []string
@@ -343,6 +349,8 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+	declImports, _ := gosrc.ImportScope(files[root.path].path, files[root.path].text)
+	var importNotes []string
 	var changes []edits.FileChange
 	for _, p := range paths {
 		fs := files[p]
@@ -350,10 +358,13 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 			continue
 		}
 		next := render(fs.text, 0, len(fs.text), fs.es)
-		if fs.added {
-			if next, err = gosrc.EditImports(fs.path, next, "", in.Imports, false); err != nil {
-				return "", err
-			}
+		need, inotes, err := neededImports(w, fs, in.Imports, declImports)
+		if err != nil {
+			return "", err
+		}
+		importNotes = append(importNotes, inotes...)
+		if next, err = gosrc.EditImports(fs.path, next, "", need, false); err != nil {
+			return "", err
 		}
 		old := fs.text
 		c, err := fileChange(fs.path, next, &old, fs.bom)
@@ -366,6 +377,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	}
 
 	notes := []string{fmt.Sprintf("Updated %d call site(s).", calls)}
+	notes = append(notes, importNotes...)
 	if len(members) > 1 {
 		notes = append(notes, fmt.Sprintf("Changed %d interface/implementing method declarations together.", len(members)))
 	}
@@ -377,4 +389,54 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	}
 	plan := edits.NewPlan("change_signature "+in.Name, changes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
+}
+
+// neededImports lists the imports the added types and values written into fs need and fs lacks.
+// A qualifier is resolved from the imports= argument, then from the declaring file's imports,
+// then from the standard library; one that stays unknown is left for the type check to report.
+func neededImports(w *Workspace, fs *fileState, given []string, declImports map[string]string) (need, notes []string, err error) {
+	have, declared := gosrc.ImportScope(fs.path, fs.text)
+	pkg := gosrc.PackageName(fs.text)
+	userSpecs := map[string]string{}
+	for _, g := range given {
+		alias, p, perr := gosrc.ParseImportSpec(g)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		name := alias
+		if name == "" {
+			name = gosrc.ImportName(p)
+		}
+		userSpecs[name] = strings.TrimSpace(alias + " " + strconv.Quote(p))
+	}
+	done := map[string]bool{}
+	for _, expr := range fs.inserted {
+		for _, q := range gosrc.Qualifiers(expr) {
+			if done[q] {
+				continue
+			}
+			done[q] = true
+			if _, ok := have[q]; ok || declared[q] {
+				continue
+			}
+			spec, ok := userSpecs[q]
+			if !ok {
+				spec, ok = declImports[q]
+			}
+			if !ok {
+				var ambiguous bool
+				if spec, ambiguous = gosrc.StdlibImport(q); ambiguous {
+					return nil, nil, toolerr.Inputf("%q in %q matches several standard packages; pass imports=[...] with the one you mean.", q, expr)
+				}
+			}
+			switch {
+			case spec == "":
+			case q == pkg:
+				notes = append(notes, fmt.Sprintf("%s: %q refers to the file's own package; not imported.", edits.RelativeName(fs.path, w.Root), q))
+			default:
+				need = append(need, spec)
+			}
+		}
+	}
+	return need, notes, nil
 }

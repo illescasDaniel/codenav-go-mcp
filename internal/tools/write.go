@@ -42,6 +42,14 @@ func (w *Workspace) absPath(p string) (string, error) {
 	return p, nil
 }
 
+func planPaths(p *edits.EditPlan) []string {
+	var out []string
+	for _, c := range p.Changes {
+		out = append(out, c.Path)
+	}
+	return out
+}
+
 func maxErrors(n int) string {
 	if n < 0 {
 		return "no limit"
@@ -81,6 +89,7 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		if err != nil {
 			return "", err
 		}
+		_ = w.Client.NoteWritten(planPaths(plan))
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
 	case apply:
 		id := w.Store.Add(plan)
@@ -300,6 +309,7 @@ func RegisterWrite(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
+			_ = w.Client.NoteWritten(planPaths(e.Plan))
 			return fmt.Sprintf("Reverted edit %s: %s\n%s", e.ID, e.Plan.Description, e.Plan.Summary(w.Root)), nil
 		})
 

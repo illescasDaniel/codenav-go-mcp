@@ -192,7 +192,17 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	} else if kind == methodKind && flag(in.Linked, true) {
 		notes = append(notes, "No interface relationships found for this method.")
 	}
-	notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, mentions.CoveredBy(all)), oldName)...)
+	after := map[string]string{}
+	for _, c := range changes {
+		if c.New != nil {
+			after[c.Path] = *c.New
+		}
+	}
+	only := ""
+	if in.Parameter != "" || kind == 0 { // a parameter or local variable (not a top-level or member symbol) is not visible outside its file
+		only = root.path
+	}
+	notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, after, only), oldName)...)
 	return edits.NewPlan(desc, changes, notes...), nil
 }
 

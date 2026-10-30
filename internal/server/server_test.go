@@ -372,3 +372,142 @@ func TestReadOnlyHasNoPreviewID(t *testing.T) {
 		t.Fatalf("read-only:\n%s", out)
 	}
 }
+
+const newThing = "package util\n\nfunc NewThing() int { return 1 }\n"
+
+func searchHas(t *testing.T, cs *mcp.ClientSession, q, sub string) bool {
+	t.Helper()
+	return strings.Contains(call(t, cs, "search_symbol", map[string]any{"query": q}), sub)
+}
+
+func TestDeletedToolCreatedFileLeavesIndex(t *testing.T) {
+	for _, between := range []bool{false, true} {
+		cs, root := session(t, nil)
+		out := call(t, cs, "edit", map[string]any{"file_path": "util/new.go", "new_text": newThing})
+		if !strings.Contains(out, "Applied") {
+			t.Fatalf("create:\n%s", out)
+		}
+		if between && !searchHas(t, cs, "NewThing", "util/new.go") {
+			t.Fatal("created symbol not found")
+		}
+		if err := os.Remove(filepath.Join(root, "util/new.go")); err != nil {
+			t.Fatal(err)
+		}
+		if searchHas(t, cs, "NewThing", "util/new.go") {
+			t.Fatalf("symbol of a deleted file still found (search between=%v)", between)
+		}
+		if out := call(t, cs, "diagnostics", map[string]any{"file_path": "util/new.go"}); !strings.Contains(out, "File not found") {
+			t.Fatalf("diagnostics after deletion:\n%s", out)
+		}
+	}
+}
+
+func TestDeletedExternalFileEditedByToolLeavesIndex(t *testing.T) {
+	cs, root := session(t, nil)
+	p := filepath.Join(root, "shapes/extra.go")
+	if err := os.WriteFile(p, []byte("package shapes\n\nfunc ExtraThing() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/extra.go", "old_string": "return 1", "new_string": "return 2"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("edit:\n%s", out)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if searchHas(t, cs, "ExtraThing", "shapes/extra.go") {
+		t.Fatal("symbol of a deleted file still found")
+	}
+}
+
+func TestUndoCreateLeavesIndex(t *testing.T) {
+	cs, root := session(t, nil)
+	call(t, cs, "edit", map[string]any{"file_path": "util/new.go", "new_text": newThing})
+	if out := call(t, cs, "undo_edit", nil); !strings.Contains(out, "Reverted") {
+		t.Fatalf("undo:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "util/new.go")); err == nil {
+		t.Fatal("file still exists")
+	}
+	if searchHas(t, cs, "NewThing", "util/new.go") {
+		t.Fatal("symbol still found after undo")
+	}
+}
+
+func TestChangeSignatureAddsImports(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "change_signature", map[string]any{"name": "Scale", "add": []map[string]any{
+		{"name": "ctx", "type": "context.Context", "value": "context.Background()", "position": 0}}})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("change_signature:\n%s", out)
+	}
+	for _, f := range []string{"shapes/shapes.go", "app/app.go"} {
+		if !strings.Contains(readFile(t, root, f), `"context"`) {
+			t.Fatalf("%s must import context:\n%s", f, readFile(t, root, f))
+		}
+	}
+}
+
+func TestChangeSignatureImportOnlyWhereUsed(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "change_signature", map[string]any{"name": "Scale", "add": []map[string]any{
+		{"name": "sb", "type": "*strings.Builder", "value": "nil"}}})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("change_signature:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "shapes/shapes.go"), `"strings"`) {
+		t.Fatal("the declaration file must import strings")
+	}
+	if strings.Contains(readFile(t, root, "app/app.go"), `"strings"`) {
+		t.Fatal("the call-site file must not import strings (only the type uses it)")
+	}
+}
+
+func TestRenameDoesNotListRewrittenDoc(t *testing.T) {
+	cs, root := session(t, nil)
+	if err := os.WriteFile(filepath.Join(root, "shapes/tri.go"), []byte("package shapes\n\n// Tri is a triangle.\ntype Tri struct{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Tri", "new_name": "Trio", "apply": false})
+	if !strings.Contains(out, "Trio is a triangle") {
+		t.Fatalf("expected gopls to rewrite the doc comment:\n%s", out)
+	}
+	if strings.Contains(out, "appears in comments") {
+		t.Fatalf("rewritten doc comment listed:\n%s", out)
+	}
+}
+
+func TestCallersNamesMethodReceiver(t *testing.T) {
+	cs, root := session(t, nil)
+	if err := os.WriteFile(filepath.Join(root, "shapes/double.go"), []byte("package shapes\n\nfunc (s Square) Double() float64 { return Scale(s, 2, 0) }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, cs, "callers", map[string]any{"name": "Scale"})
+	if !strings.Contains(out, "Square.Double") || !strings.Contains(out, "[method]") {
+		t.Fatalf("callers:\n%s", out)
+	}
+	if !strings.Contains(out, "Total  [function]") {
+		t.Fatalf("plain functions stay functions:\n%s", out)
+	}
+}
+
+func TestOutlineGroupsAndMethodNames(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "outline", map[string]any{"file_path": "shapes/consts.go"})
+	var header, kindA string
+	for _, l := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(l, "iota") && strings.Contains(l, "group"):
+			header = l
+		case strings.Contains(l, "KindA"):
+			kindA = l
+		}
+	}
+	if header == "" || !strings.HasPrefix(kindA, "  ") {
+		t.Fatalf("KindA must sit indented under a group header mentioning iota:\n%s", out)
+	}
+	out = call(t, cs, "outline", map[string]any{"file_path": "shapes/shapes.go"})
+	if !strings.Contains(out, "Square.Area") || strings.Contains(out, "(Square)") {
+		t.Fatalf("methods are shown as T.M:\n%s", out)
+	}
+}

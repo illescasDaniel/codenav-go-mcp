@@ -10,7 +10,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/params"
@@ -278,7 +280,17 @@ func RegisterNav(s *mcp.Server, h Host) {
 			for i := range syms {
 				ptrs[i] = &syms[i]
 			}
-			return format.FormatOutline(ptrs), nil
+			var groups []gosrc.Group
+			abs := in.FilePath
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(w.Root, abs)
+			}
+			if text, _, err := edits.ReadSource(abs); err == nil {
+				if pf, err := gosrc.ParseFile(abs, text); err == nil {
+					groups = pf.Groups()
+				}
+			}
+			return format.FormatOutlineGroups(ptrs, groups), nil
 		})
 
 	add(s, h, "callers", "Who calls this function or method? Only real call sites, unlike references.",
@@ -302,7 +314,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			return format.FormatCallers(calls, w.Root), nil
+			return format.FormatCallers(calls, w.Root, callerReceivers(calls)), nil
 		})
 
 	add(s, h, "implementations", "For an interface (or interface method): the types implementing it. For a concrete type (or method): the interfaces it satisfies.",
@@ -342,4 +354,29 @@ func splitTests(locs []lsp.Location, root string) string {
 		return "No references found at that position."
 	}
 	return out
+}
+
+// callerReceivers finds, per call, the receiver type of the calling method: gopls' call hierarchy
+// reports methods as plain functions. Each caller file is parsed once.
+func callerReceivers(calls []lsp.IncomingCall) map[int]string {
+	parsed := map[string]*gosrc.File{}
+	recvs := map[int]string{}
+	for i, c := range calls {
+		p := lsp.URIToPath(c.From.URI)
+		pf, seen := parsed[p]
+		if !seen {
+			if text, _, err := edits.ReadSource(p); err == nil {
+				pf, _ = gosrc.ParseFile(p, text)
+			}
+			parsed[p] = pf
+		}
+		if pf == nil {
+			continue
+		}
+		start := c.From.SelectionRange.Start
+		if recv, ok := pf.FuncAt(edits.Offset(pf.Src, start.Line, start.Character)); ok && recv != "" {
+			recvs[i] = recv
+		}
+	}
+	return recvs
 }

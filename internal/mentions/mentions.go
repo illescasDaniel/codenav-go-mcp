@@ -14,7 +14,6 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
-	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 )
 
 const (
@@ -31,21 +30,6 @@ type Mention struct {
 	Snippet string
 }
 
-// Covered holds, per absolute path, the (line, UTF-16 character) starts the rename already edits.
-type Covered map[string]map[[2]int]bool
-
-func CoveredBy(by map[string][]lsp.TextEdit) Covered {
-	c := Covered{}
-	for p, es := range by {
-		m := map[[2]int]bool{}
-		for _, e := range es {
-			m[[2]int{e.Range.Start.Line, e.Range.Start.Character}] = true
-		}
-		c[p] = m
-	}
-	return c
-}
-
 func snippet(lines []string, row int) string {
 	if row < 1 || row > len(lines) {
 		return ""
@@ -57,7 +41,16 @@ func snippet(lines []string, row int) string {
 	return s
 }
 
-func goMentions(path, rel, name string, word *regexp.Regexp, covered map[[2]int]bool, text string) []Mention {
+// shortName: names this short are also ordinary words (a, id, go), so prose needs code context.
+func shortName(name string) bool { return len(name) < 3 }
+
+// codeContext matches name written as code in prose: `name`, [name], name( or .name
+func codeContext(name string) *regexp.Regexp {
+	q := regexp.QuoteMeta(name)
+	return regexp.MustCompile("`" + q + "`|\\[" + q + "\\]|(?:^|[^\\w])" + q + `\(|\.` + q + `(?:[^\w]|$)`)
+}
+
+func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string) []Mention {
 	lines := strings.Split(text, "\n")
 	var found []Mention
 	fset := token.NewFileSet()
@@ -72,30 +65,37 @@ func goMentions(path, rel, name string, word *regexp.Regexp, covered map[[2]int]
 		p := fset.Position(pos)
 		switch {
 		case tok == token.IDENT && lit == name:
-			line0 := p.Line - 1
-			char := 0
-			if line0 < len(lines) && p.Column-1 <= len(lines[line0]) {
-				char = lsp.Utf16Len(lines[line0][:p.Column-1])
-			}
-			if !covered[[2]int{line0, char}] {
-				found = append(found, Mention{rel, p.Line, "code", snippet(lines, p.Line)})
-			}
-		case tok == token.COMMENT && word.MatchString(lit):
+			found = append(found, Mention{rel, p.Line, "code", snippet(lines, p.Line)})
+		case tok == token.COMMENT && prose.MatchString(lit):
 			found = append(found, Mention{rel, p.Line, "comment", snippet(lines, p.Line)})
 		case (tok == token.STRING || tok == token.CHAR) && word.MatchString(lit):
+			if shortName(name) {
+				if v, err := strconv.Unquote(lit); err != nil || v != name {
+					continue
+				}
+			}
 			found = append(found, Mention{rel, p.Line, "string", snippet(lines, p.Line)})
 		}
 	}
 	return found
 }
 
-// Find lists occurrences of name the rename did not edit: Go identifiers, comments, strings, and docs.
-func Find(root, name string, covered Covered) []Mention {
+// Find lists occurrences of name that remain once the rename is applied: Go identifiers, comments,
+// strings, and docs. after maps an absolute path to its text after the rename; other files are
+// read from disk. only, when set, restricts the scan to that file (parameters and locals).
+func Find(root, name string, after map[string]string, only string) []Mention {
 	word := regexp.MustCompile(`(?:^|[^\w])` + regexp.QuoteMeta(name) + `(?:[^\w]|$)`)
+	prose := word // what counts in comments and text files
+	if shortName(name) {
+		prose = codeContext(name)
+	}
 	var found []Mention
 	seen := 0
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
+			return nil
+		}
+		if only != "" && !d.IsDir() && p != only {
 			return nil
 		}
 		if d.IsDir() {
@@ -120,18 +120,24 @@ func Find(root, name string, covered Covered) []Mention {
 		if seen++; seen > maxFiles {
 			return filepath.SkipAll
 		}
-		raw, rerr := os.ReadFile(p)
-		if rerr != nil || !strings.Contains(string(raw), name) {
+		text, ok := after[p]
+		if !ok {
+			raw, rerr := os.ReadFile(p)
+			if rerr != nil {
+				return nil
+			}
+			text, _ = edits.DecodeSource(raw)
+		}
+		if !strings.Contains(text, name) {
 			return nil
 		}
-		text, _ := edits.DecodeSource(raw)
 		rel := edits.RelativeName(p, root)
 		if isGo {
-			found = append(found, goMentions(p, rel, name, word, covered[p], text)...)
+			found = append(found, goMentions(p, rel, name, word, prose, text)...)
 			return nil
 		}
 		for i, line := range strings.Split(text, "\n") {
-			if word.MatchString(line) {
+			if prose.MatchString(line) {
 				found = append(found, Mention{rel, i + 1, "text", snippet([]string{line}, 1)})
 			}
 		}

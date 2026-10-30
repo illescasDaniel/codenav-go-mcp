@@ -140,3 +140,46 @@ func (f *File) Line(off int) string {
 	}
 	return strings.TrimSpace(f.Src[b : off+e])
 }
+
+// FuncAt returns the receiver type of the function declaration whose name starts at off
+// (without * or type parameters; "" for a plain function). ok is false when none starts there.
+func (f *File) FuncAt(off int) (recv string, ok bool) {
+	for _, decl := range f.ast.Decls {
+		d, isFunc := decl.(*ast.FuncDecl)
+		if !isFunc || f.off(d.Name.Pos()) != off {
+			continue
+		}
+		if d.Recv != nil && len(d.Recv.List) == 1 {
+			recv = recvName(d.Recv.List[0].Type)
+		}
+		return recv, true
+	}
+	return "", false
+}
+
+// Group is a parenthesised declaration block with several specs: const ( ... ).
+type Group struct {
+	Keyword    string // const, var or type
+	Start, End int    // 0-based lines of the keyword and the closing parenthesis
+	Iota       bool   // a spec uses iota
+}
+
+// Groups lists the parenthesised const/var/type blocks with more than one spec.
+func (f *File) Groups() []Group {
+	var out []Group
+	for _, decl := range f.ast.Decls {
+		d, ok := decl.(*ast.GenDecl)
+		if !ok || d.Tok == token.IMPORT || !d.Lparen.IsValid() || len(d.Specs) < 2 {
+			continue
+		}
+		g := Group{Keyword: d.Tok.String(), Start: f.fset.Position(d.TokPos).Line - 1, End: f.fset.Position(d.Rparen).Line - 1}
+		ast.Inspect(d, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id.Name == "iota" {
+				g.Iota = true
+			}
+			return !g.Iota
+		})
+		out = append(out, g)
+	}
+	return out
+}
