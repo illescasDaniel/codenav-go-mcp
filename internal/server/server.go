@@ -129,8 +129,8 @@ func New(version string) (*mcp.Server, *Manager) {
 	m := NewManager()
 	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{
 		Instructions: "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics. " +
-				"Edit it with edit, edit_symbol, rename_symbol, change_signature, move, quick_fix: each type-checks the change in memory first and writes only if it adds no new errors " +
-				"(apply=false previews; apply_edit applies a preview, undo_edit reverts, verify_changes re-checks the workspace).",
+			"Edit it with edit, edit_symbol, rename_symbol, change_signature, move, quick_fix: each type-checks the change in memory first and writes only if it adds no new errors " +
+			"(apply=false previews; apply_edit applies a preview, undo_edit reverts, verify_changes re-checks the workspace).",
 	})
 	tools.RegisterNav(s, m)
 	tools.RegisterWrite(s, m)

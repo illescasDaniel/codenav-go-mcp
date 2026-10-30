@@ -1,0 +1,11 @@
+{
+	"mcpServers": {
+		"codenav-go": {
+			"command": "go",
+			"args": ["run", "github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest"],
+			"env": {
+				"CODENAV_GO_MCP_READ_ONLY": "0"
+			}
+		}
+	}
+}
