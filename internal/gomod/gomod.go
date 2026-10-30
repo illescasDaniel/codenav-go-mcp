@@ -60,12 +60,17 @@ var listRuns atomic.Int64
 
 const listTTL = 2 * time.Minute
 
-var listCache struct {
-	sync.Mutex
-	root, key string
-	at        time.Time
-	pkgs      []pkg
+type listEntry struct {
+	key  string
+	at   time.Time
+	pkgs []pkg
 }
+
+// listCache holds the last `go list` result per directory (the root and the nested modules).
+var listCache = struct {
+	sync.Mutex
+	byDir map[string]listEntry
+}{byDir: map[string]listEntry{}}
 
 // fingerprint summarizes everything a `go list` result depends on that we can see cheaply: the
 // build flags and GOWORK/GOFLAGS, plus the path, mtime and size of every Go, go.mod and go.work
@@ -118,17 +123,16 @@ func list(ctx context.Context, root string) ([]pkg, error) {
 	key := fingerprint(root, flags)
 	if key != "" {
 		listCache.Lock()
-		if listCache.root == root && listCache.key == key && time.Since(listCache.at) < listTTL {
-			pkgs := listCache.pkgs
+		if e, ok := listCache.byDir[root]; ok && e.key == key && time.Since(e.at) < listTTL {
 			listCache.Unlock()
-			return pkgs, nil
+			return e.pkgs, nil
 		}
 		listCache.Unlock()
 	}
 	pkgs, err := runList(ctx, root, flags)
 	if key != "" && err == nil {
 		listCache.Lock()
-		listCache.root, listCache.key, listCache.at, listCache.pkgs = root, key, time.Now(), pkgs
+		listCache.byDir[root] = listEntry{key, time.Now(), pkgs}
 		listCache.Unlock()
 	}
 	return pkgs, err
@@ -162,8 +166,19 @@ func runList(ctx context.Context, root string, flags []string) ([]pkg, error) {
 // Related returns the Go files that can be affected by changing the given files: the other files of
 // their packages, and every file of packages importing those packages (including _test packages).
 // Edited files come first. Files that are not part of any listed package are returned as given.
+// A file of a nested module (a go.mod below root that no go.work lists) is looked up in that module:
+// `go list ./...` at the root leaves nested modules out.
 func Related(ctx context.Context, root string, edited []string) (files []string, err error) {
 	pkgs, err := list(ctx, root)
+	nestedDirs := map[string]bool{}
+	for _, f := range edited {
+		if n, ok := Uncovered(root, f); ok && !nestedDirs[n.Dir] {
+			nestedDirs[n.Dir] = true
+			if more, merr := list(ctx, n.Dir); merr == nil || len(more) > 0 {
+				pkgs = append(pkgs, more...)
+			}
+		}
+	}
 	seen := map[string]bool{}
 	add := func(f string) {
 		if !seen[f] {

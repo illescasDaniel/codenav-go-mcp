@@ -235,7 +235,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
+			sym, err := resolveSymbolRO(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}
@@ -303,7 +303,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
+			sym, err := resolveSymbolRO(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}
@@ -335,7 +335,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
+			sym, err := resolveSymbolRO(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}

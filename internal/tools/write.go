@@ -64,23 +64,28 @@ func maxErrors(n int) string {
 // finishPlan simulates plan, then writes it when the new errors stay within maxNew (<0: unlimited)
 // and apply is set; otherwise it keeps the plan as a preview.
 func finishPlan(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply bool, maxNew int, includeDeps, allowLarge bool) (string, error) {
-	if len(plan.Changes) == 0 {
-		return "No changes: the edit leaves the code as it is.", nil
-	}
-	if err := w.Journal.Guard.CheckPlan(plan, allowLarge || !apply); err != nil {
-		return "", err
-	}
-	delta, err := Simulate(ctx, w, plan, includeDeps)
-	if err != nil {
-		return "", err
-	}
-	plan.Notes = append(plan.Notes, nestedModuleNotes(w.Root, planPaths(plan))...)
-	out, _, err := conclude(w, plan, delta, apply, maxNew, allowLarge)
+	out, _, err := finishPlanID(ctx, w, plan, apply, maxNew, includeDeps, allowLarge)
 	return out, err
 }
 
+// finishPlanID is finishPlan that also returns the id of the edit when it was written ("" otherwise).
+func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply bool, maxNew int, includeDeps, allowLarge bool) (string, string, error) {
+	if len(plan.Changes) == 0 {
+		return "No changes: the edit leaves the code as it is.", "", nil
+	}
+	if err := w.Journal.Guard.CheckPlan(plan, allowLarge || !apply); err != nil {
+		return "", "", err
+	}
+	delta, err := Simulate(ctx, w, plan, includeDeps)
+	if err != nil {
+		return "", "", err
+	}
+	plan.Notes = append(plan.Notes, nestedModuleNotes(w.Root, planPaths(plan))...)
+	return conclude(w, plan, delta, apply, maxNew, allowLarge)
+}
+
 // nestedModuleNotes warns when edited files belong to a module the workspace does not build (a
-// nested go.mod with no go.work listing it): its importers are not part of the type check.
+// nested go.mod with no go.work listing it): importers in other modules are not part of the type check.
 func nestedModuleNotes(root string, paths []string) []string {
 	seen := map[string]bool{}
 	var notes []string
@@ -94,7 +99,7 @@ func nestedModuleNotes(root string, paths []string) []string {
 		if name == "" {
 			name = edits.RelativeName(n.Dir, root)
 		}
-		notes = append(notes, fmt.Sprintf("%s belongs to module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover; packages importing it (in it or in other modules) are not type-checked, so the error count may miss breakages. A go.work listing the modules (go work init . ./%s) fixes that.",
+		notes = append(notes, fmt.Sprintf("%s belongs to module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover; its own packages are type-checked, but packages of other modules importing it are not, so the error count may miss breakages there. A go.work listing the modules (go work init . ./%s) fixes that.",
 			edits.RelativeName(p, root), name, edits.RelativeName(n.Dir, root), edits.RelativeName(n.Dir, root)))
 	}
 	return notes
@@ -341,8 +346,8 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
 		})
 
-	addWrite(s, h, readOnly, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (e.g. add a missing import, declare missing methods; gopls has no fix for an unused local variable). Narrow with line or code. "+
-		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. Missing imports are added together in one block. organize_imports=true instead adds missing and removes unused imports, sorted; fix_all=true applies gopls' source.fixAll to the whole file. Fixes gopls only offers as a command are reported, not applied. Type-checked like edit; undo_edit reverts.",
+	addWrite(s, h, readOnly, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (e.g. add a missing import, declare missing methods; an unused local variable gets `_ = x` after its declaration). Narrow with line or code. "+
+		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title (a choice that fits only some diagnostics applies nothing unless strict=false). strict=true applies nothing unless every targeted diagnostic is fixed. The answer ends with `Applied:` and `Not fixed:` lines (with the reason per diagnostic). Missing imports are added together in one block. organize_imports=true instead adds missing and removes unused imports, sorted; fix_all=true applies gopls' source.fixAll to the whole file. Fixes gopls only offers as a command are reported, not applied. Type-checked like edit; undo_edit reverts.",
 		quickFix)
 
 	addWrite(s, h, readOnly, "change_signature", "Add, remove or reorder a function's or method's parameters and update every call site. "+

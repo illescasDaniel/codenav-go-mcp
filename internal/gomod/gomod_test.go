@@ -96,3 +96,43 @@ func TestListIsCachedUntilFilesChange(t *testing.T) {
 		t.Errorf("changed build flags must invalidate the cache, go list ran %d times", n)
 	}
 }
+
+func TestRelatedInsideNestedModule(t *testing.T) {
+	root := module(t)
+	writeTree(t, root, map[string]string{
+		"sub/go.mod":  "module example.com/sub\n\ngo 1.21\n",
+		"sub/a/a.go":  "package a\n\nfunc A() {}\n",
+		"sub/a/a2.go": "package a\n",
+		"sub/b/b.go":  "package b\n\nimport \"example.com/sub/a\"\n\nfunc B() { a.A() }\n",
+	})
+	files, _ := Related(context.Background(), root, []string{filepath.Join(root, "sub", "a", "a.go")})
+	if !has(files, "sub/a/a2.go") || !has(files, "sub/b/b.go") {
+		t.Errorf("the nested module's own package files and importers must be related: %v", files)
+	}
+}
+
+func TestRelatedWithCgoFiles(t *testing.T) {
+	root := module(t)
+	if out, err := exec.Command("go", "env", "CGO_ENABLED").Output(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Skip("cgo is disabled")
+	}
+	if _, err := exec.LookPath("cc"); err != nil {
+		if _, err := exec.LookPath("gcc"); err != nil {
+			t.Skip("no C compiler")
+		}
+	}
+	writeTree(t, root, map[string]string{
+		"cg/cg.go":    "package cg\n\n/*\nstatic int one(void) { return 1; }\n*/\nimport \"C\"\n\nfunc One() int { return int(C.one()) }\n",
+		"cg/other.go": "package cg\n",
+		"user/u.go":   "package user\n\nimport \"example.com/m/cg\"\n\nvar _ = cg.One\n",
+	})
+	ctx := context.Background()
+	files, _ := Related(ctx, root, []string{filepath.Join(root, "cg", "cg.go")})
+	if !has(files, "cg/other.go") || !has(files, "user/u.go") {
+		t.Errorf("a cgo file's package siblings and importers must be related: %v", files)
+	}
+	files, _ = Related(ctx, root, []string{filepath.Join(root, "cg", "other.go")})
+	if !has(files, "cg/cg.go") || !has(files, "user/u.go") {
+		t.Errorf("a plain file must relate to the cgo file and the importers: %v", files)
+	}
+}

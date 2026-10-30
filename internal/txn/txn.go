@@ -221,7 +221,21 @@ func (j *Journal) CheckPending() {
 var (
 	restoreFn       = restore
 	afterWritesHook func()
+	// beforeWriteHook runs just before each file is written (after the lock and the freshness check).
+	beforeWriteHook func(path string)
 )
+
+// checkUnchanged re-hashes the file right before it is written: the freshness check ran earlier and
+// another process may have touched the file since.
+func checkUnchanged(p *edits.EditPlan, c edits.FileChange) error {
+	if beforeWriteHook != nil {
+		beforeWriteHook(c.Path)
+	}
+	if want, ok := p.BaseHashes[c.Path]; ok && edits.FileHash(c.Path) != want {
+		return fmt.Errorf("the file changed on disk just before it was written, by another process or editor")
+	}
+	return nil
+}
 
 // rollback undoes the written changes, newest first, and names those that could not be restored.
 func (j *Journal) rollback(written []edits.FileChange) (stuck []string) {
@@ -270,6 +284,12 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 	if err := j.Guard.CheckPlan(p, allowLarge); err != nil {
 		return nil, err
 	}
+	unlock, lnote, err := j.lockWrites()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	j.notify(lnote)
 	if err := j.CheckFresh(p); err != nil {
 		return nil, err
 	}
@@ -277,7 +297,11 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 	j.notify(note)
 	var written []edits.FileChange
 	for _, c := range p.Changes {
-		if err := writeChange(c); err != nil {
+		err := checkUnchanged(p, c)
+		if err == nil {
+			err = writeChange(c)
+		}
+		if err != nil {
 			ilog.setState("rolling back")
 			stuck := j.rollback(written)
 			msg := fmt.Sprintf("writing %s failed (%v); ", edits.RelativeName(c.Path, j.Guard.Root), err)
@@ -340,6 +364,12 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 		}
 	}
 	e := j.entries[idx]
+	unlock, lnote, err := j.lockWrites()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	j.notify(lnote)
 	var stale []string
 	for path, want := range e.AppliedHashes {
 		if edits.FileHash(path) != want {
@@ -360,7 +390,11 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 	j.notify(note)
 	var written []edits.FileChange
 	for _, c := range inv.Changes {
-		if err := writeChange(c); err != nil {
+		err := checkUnchanged(inv, c)
+		if err == nil {
+			err = writeChange(c)
+		}
+		if err != nil {
 			ilog.setState("rolling back")
 			stuck := j.rollback(written)
 			msg := fmt.Sprintf("undo of %s failed (%v); ", e.ID, err)

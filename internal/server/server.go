@@ -13,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/tools"
@@ -91,7 +92,7 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 		if warn != "" {
 			m.board.Post(warn)
 		}
-		c := lsp.New(lsp.Options{Root: sel.Root, Command: cmd, Language: "go", InitOptions: goplsSettings(), WatchSuffix: ".go", SkipDir: exclude.IsDirName})
+		c := lsp.New(lsp.Options{Root: sel.Root, Command: cmd, Language: "go", InitOptions: goplsSettings(), WatchSuffix: ".go", SkipDir: exclude.IsDirName, ExtraFolders: uncoveredDirs(sel.Root)})
 		if err := c.Start(ctx); err != nil {
 			return nil, err
 		}
@@ -112,7 +113,24 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 	if err := m.client.Refresh(); err != nil {
 		return nil, err
 	}
+	// Modules found after the start (or listed in a go.work since) join or leave the server's folders.
+	if err := m.client.SyncFolders(uncoveredDirs(m.sel.Root)); err != nil {
+		return nil, err
+	}
 	return &tools.Workspace{Client: m.client, Root: m.sel.Root, Source: m.sel.Source, Journal: m.journal, Store: m.store}, nil
+}
+
+// maxExtraFolders bounds how many uncovered nested modules become gopls workspace folders.
+const maxExtraFolders = 20
+
+// uncoveredDirs lists the modules below root that its go.mod/go.work does not cover: gopls only
+// indexes the packages of a workspace folder (or of a file opened in them) for such modules.
+func uncoveredDirs(root string) []string {
+	var out []string
+	for _, n := range gomod.UncoveredModules(root, exclude.IsDirName, maxExtraFolders) {
+		out = append(out, n.Dir)
+	}
+	return out
 }
 
 func goplsSettings() map[string]any {

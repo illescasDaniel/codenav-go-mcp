@@ -1208,7 +1208,8 @@ func TestMoveIntoPackageMainRefused(t *testing.T) {
 func TestNotFoundHints(t *testing.T) {
 	cs, root := session(t, nil)
 	cases := map[string]string{
-		"fmt.Println":    "standard library",
+		"fmt.Nope":       "package fmt declares no Nope",
+		"rand.Int":       "standard library",
 		"len":            "Go builtin",
 		"shapes":         "is a package (directory shapes)",
 		"Square.Nope":    "type Square declares no Nope (methods promoted",
@@ -1228,7 +1229,7 @@ func TestNotFoundHints(t *testing.T) {
 	writeFile(t, root, "sub/go.mod", "module example.com/sub\n\ngo 1.24\n")
 	writeFile(t, root, "sub/s.go", "package sub\n\nfunc SubOnly() {}\n")
 	out := call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() {}", "new_string": "func SubOnly() int { return 1 }"})
-	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "not type-checked") {
+	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "are not, so the error count") {
 		t.Errorf("an edit in a nested module must say its importers are not checked:\n%s", out)
 	}
 	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})
@@ -1253,10 +1254,70 @@ func TestQuickFixChoiceWithoutMatch(t *testing.T) {
 
 func TestQuickFixUnusedVariable(t *testing.T) {
 	cs, root := session(t, nil)
-	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc unusedVar() {\n\tx := 1\n}\n")
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc unusedVar() {\n\tx := 1 // note\n\tfor i := range 3 {\n\t}\n}\n")
 	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
-	if !strings.Contains(out, "no fix for an unused local variable") || !strings.Contains(readFile(t, root, "shapes/unused.go"), "x := 1") {
-		t.Errorf("want an explanation and no change, got:\n%s", out)
+	want := "package shapes\n\nfunc unusedVar() {\n\tx := 1 // note\n\t_ = x\n\tfor i := range 3 {\n\t\t_ = i\n\t}\n}\n"
+	if got := readFile(t, root, "shapes/unused.go"); got != want || !strings.Contains(out, "Applied: Mark x as used (_ = x); Mark i as used (_ = i)") || !strings.HasSuffix(out, "Not fixed: none") {
+		t.Errorf("want _ = x and _ = i inserted and the contract lines, got:\n%s\n%s", out, got)
+	}
+}
+
+func TestQuickFixUnusedVariableCRLF(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\r\n\r\nfunc unusedVar() {\r\n\tx := 1\r\n}\r\n")
+	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	if got := readFile(t, root, "shapes/unused.go"); got != "package shapes\r\n\r\nfunc unusedVar() {\r\n\tx := 1\r\n\t_ = x\r\n}\r\n" {
+		t.Errorf("line endings must stay CRLF: %q", got)
+	}
+}
+
+func TestQuickFixShadowedVariableOnlyThatDeclaration(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc shadow() int {\n\tx := 1\n\tf := func() {\n\t\tx := 2\n\t}\n\tf()\n\treturn x\n}\n")
+	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	want := "package shapes\n\nfunc shadow() int {\n\tx := 1\n\tf := func() {\n\t\tx := 2\n\t\t_ = x\n\t}\n\tf()\n\treturn x\n}\n"
+	if got := readFile(t, root, "shapes/unused.go"); got != want {
+		t.Errorf("only the closure's x gets the use:\n%s", got)
+	}
+}
+
+// unusedAndMissing has one diagnostic with a fix by title ("Mark x ...") and one gopls fixes with
+// "Add import", plus one without any fix when withBad is set.
+func writeMixedDiagnostics(t *testing.T, root string, withBad bool) string {
+	t.Helper()
+	src := "package shapes\n\nfunc mixed() string {\n\tx := 1\n\treturn strings.ToUpper(\"a\")\n}\n"
+	if withBad {
+		src = "package shapes\n\nfunc mixed() {\n\tx := 1\n\tvar _ int = \"s\"\n}\n"
+	}
+	writeFile(t, root, "shapes/mixed.go", src)
+	return src
+}
+
+func TestQuickFixStrictAppliesNothingWhenSomethingIsLeft(t *testing.T) {
+	cs, root := session(t, nil)
+	src := writeMixedDiagnostics(t, root, true)
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go", "strict": true})
+	if readFile(t, root, "shapes/mixed.go") != src || !strings.Contains(out, "strict=true") || !strings.Contains(out, "Applied: nothing") || !strings.Contains(out, "Not fixed: ") || !strings.Contains(out, "(reason: ") {
+		t.Errorf("strict must apply nothing and say why:\n%s", out)
+	}
+	out = call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go"})
+	if !strings.Contains(readFile(t, root, "shapes/mixed.go"), "_ = x") || !strings.Contains(out, "reason: no fix offered") || !strings.Contains(out, "Applied: Mark x as used") {
+		t.Errorf("non-strict applies what it can and lists the rest:\n%s", out)
+	}
+}
+
+func TestQuickFixChoiceFittingSomeIsStrictByDefault(t *testing.T) {
+	cs, root := session(t, nil)
+	src := writeMixedDiagnostics(t, root, false)
+	args := map[string]any{"file_path": "shapes/mixed.go", "choice": "Mark x"}
+	out := call(t, cs, "quick_fix", args)
+	if readFile(t, root, "shapes/mixed.go") != src || !strings.Contains(out, "fits only some of the diagnostics") || !strings.Contains(out, "choice matched none of:") {
+		t.Errorf("a choice fitting only some diagnostics applies nothing by default:\n%s", out)
+	}
+	args["strict"] = false
+	out = call(t, cs, "quick_fix", args)
+	if !strings.Contains(readFile(t, root, "shapes/mixed.go"), "_ = x") || !strings.Contains(out, "choice matched none of:") {
+		t.Errorf("strict=false applies the matching fix:\n%s", out)
 	}
 }
 
@@ -1383,5 +1444,148 @@ func TestCheckLimitNamesSkippedFiles(t *testing.T) {
 	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "// Shape is a port.", "new_string": "// Shape is a port!", "apply": false})
 	if !strings.Contains(out, "beyond the 60-file limit were not type-checked: ") || !strings.Contains(out, "shapes/gen") {
 		t.Errorf("want the skipped files named, got:\n%s", out)
+	}
+}
+
+func TestSymbolInfoStdlibByName(t *testing.T) {
+	cs, root := session(t, nil)
+	for _, name := range []string{"json.Marshal", "encoding/json.Decoder.Decode", "http.Client", "http.Client.Timeout", "strings.Builder.WriteString"} {
+		out := call(t, cs, "symbol_info", map[string]any{"name": name, "include_references": false})
+		if strings.Contains(out, "No symbol") || !strings.Contains(out, "Definition:") || !strings.Contains(out, ".go:") {
+			t.Errorf("%s:\n%s", name, out)
+		}
+	}
+	out := call(t, cs, "symbol_info", map[string]any{"name": "json.Nope", "include_references": false})
+	if !strings.Contains(out, "No symbol found") || !strings.Contains(out, "Nope") {
+		t.Errorf("json.Nope:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".codenav_probe")); err == nil {
+		t.Error("the probe must never be written to disk")
+	}
+}
+
+func TestSymbolInfoDependencyByName(t *testing.T) {
+	cs, root := session(t, nil)
+	dep := t.TempDir()
+	writeFile(t, dep, "go.mod", "module example.org/dep\n\ngo 1.24\n")
+	writeFile(t, dep, "dep.go", "package dep\n\n// Pool holds things.\ntype Pool struct{ Size int }\n\nfunc (p *Pool) Grow() {}\n")
+	writeFile(t, root, "go.mod", "module example.com/fx\n\ngo 1.24\n\nrequire example.org/dep v0.0.0\n\nreplace example.org/dep => "+dep+"\n")
+	writeFile(t, root, "app/uses.go", "package app\n\nimport \"example.org/dep\"\n\nvar _ dep.Pool\n")
+	for name, want := range map[string]string{
+		"dep.Pool":                  "dep.go:4:6",
+		"example.org/dep.Pool.Grow": "dep.go:6:",
+		"dep.Pool.Size":             "dep.go:4:",
+		"example.org/dep.Pool.Size": "dep.go:4:",
+	} {
+		out := call(t, cs, "symbol_info", map[string]any{"name": name, "include_references": false})
+		if !strings.Contains(out, want) {
+			t.Errorf("%s: want %q in:\n%s", name, want, out)
+		}
+	}
+	out := call(t, cs, "symbol_info", map[string]any{"name": "example.org/nothere/pkg.Thing"})
+	if !strings.Contains(out, "no required module") {
+		t.Errorf("a module that is not required must say so:\n%s", out)
+	}
+	if out := call(t, cs, "rename_symbol", map[string]any{"name": "json.Marshal", "new_name": "Marshal2"}); !strings.Contains(out, "No symbol found") {
+		t.Errorf("write tools must not resolve standard-library names:\n%s", out)
+	}
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "app/uses.go"}); strings.Contains(out, "probe") {
+		t.Errorf("the probe must not leak into diagnostics:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".codenav_probe")); err == nil {
+		t.Error("the probe must never be written to disk")
+	}
+}
+
+// A module below the root that no go.work lists is a gopls workspace folder from the start, so its
+// symbols are found by name before any of its files was opened.
+func TestNestedModuleSymbolsFoundByName(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "sub/go.mod", "module example.com/sub\n\ngo 1.24\n")
+	writeFile(t, root, "sub/a/a.go", "package a\n\nfunc SubOnlyZZ() int { return 1 }\n\nfunc UseIt() int { return SubOnlyZZ() }\n")
+	out := call(t, cs, "search_symbol", map[string]any{"query": "SubOnlyZZ"})
+	if !strings.Contains(out, "sub/a/a.go") {
+		t.Fatalf("a nested module's symbols must be searchable from the start:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "SubOnlyZZ"})
+	if !strings.Contains(out, "sub/a/a.go:3") || !strings.Contains(out, "UseIt") {
+		t.Errorf("symbol_info in the nested module:\n%s", out)
+	}
+	out = call(t, cs, "edit", map[string]any{"file_path": "sub/a/a.go", "old_string": "func SubOnlyZZ() int { return 1 }", "new_string": "func SubOnlyZZ() string { return \"\" }", "apply": false})
+	if !strings.Contains(out, "UseIt") {
+		t.Errorf("the nested module's own importers are type-checked:\n%s", out)
+	}
+	// A module that appears later joins as well.
+	writeFile(t, root, "sub2/go.mod", "module example.com/sub2\n\ngo 1.24\n")
+	writeFile(t, root, "sub2/b/b.go", "package b\n\nfunc LateOnlyZZ() {}\n")
+	if out := call(t, cs, "search_symbol", map[string]any{"query": "LateOnlyZZ"}); !strings.Contains(out, "sub2/b/b.go") {
+		t.Errorf("a module found later must be searchable:\n%s", out)
+	}
+}
+
+const cgoSrc = `package cg
+
+/*
+#include <stdlib.h>
+
+static int add(int a, int b) { return a + b; }
+*/
+import "C"
+
+// Sum adds two numbers in C.
+func Sum(a, b int) int { return int(C.add(C.int(a), C.int(b))) }
+`
+
+// skipWithoutCgo skips a test that builds a package with import "C".
+func skipWithoutCgo(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CGO_ENABLED") == "0" {
+		t.Skip("CGO_ENABLED=0")
+	}
+	if out, err := exec.Command("go", "env", "CGO_ENABLED").Output(); err != nil || strings.TrimSpace(string(out)) != "1" {
+		t.Skip("cgo is disabled")
+	}
+	for _, cc := range []string{"cc", "gcc"} {
+		if _, err := exec.LookPath(cc); err == nil {
+			return
+		}
+	}
+	t.Skip("no C compiler")
+}
+
+func TestCgoPackage(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc)
+	writeFile(t, root, "cg/use.go", "package cg\n\nfunc Twice() int { return Sum(1, 2) * 2 }\n")
+	writeFile(t, root, "cgapp/app.go", "package cgapp\n\nimport \"example.com/fx/cg\"\n\nfunc Run() int { return cg.Sum(3, 4) }\n")
+
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "cg/cg.go"}); !strings.Contains(out, "No diagnostics") {
+		t.Errorf("a clean cgo file must have no diagnostics:\n%s", out)
+	}
+	out := call(t, cs, "definition", map[string]any{"file_path": "cgapp/app.go", "line": 5, "column": 28})
+	if !strings.Contains(out, "cg/cg.go:11") {
+		t.Errorf("definition across a cgo package:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "cg.Sum"})
+	if !strings.Contains(out, "cgapp/app.go") || !strings.Contains(out, "cg/use.go") {
+		t.Errorf("references of a function in a cgo file:\n%s", out)
+	}
+
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "cg.Sum", "new_name": "Total"})
+	got := readFile(t, root, "cg/cg.go")
+	if !strings.Contains(out, "Applied") || !strings.Contains(got, "func Total(") || !strings.Contains(got, "static int add(int a, int b) { return a + b; }\n*/\nimport \"C\"") ||
+		!strings.Contains(readFile(t, root, "cgapp/app.go"), "cg.Total(3, 4)") || !strings.Contains(readFile(t, root, "cg/use.go"), "Total(1, 2)") {
+		t.Errorf("rename through a cgo package:\n%s\n%s", out, got)
+	}
+
+	// The type check of an edit sees a break in the importer of a cgo package.
+	out = call(t, cs, "edit", map[string]any{"file_path": "cg/cg.go", "old_string": "func Total(a, b int) int", "new_string": "func Total(a, b, c int) int", "apply": false})
+	if !strings.Contains(out, "cgapp/app.go") {
+		t.Errorf("an importer of a cgo package must be type-checked:\n%s", out)
+	}
+	out = call(t, cs, "edit", map[string]any{"file_path": "cg/cg.go", "old_string": "return int(C.add(C.int(a), C.int(b)))", "new_string": "return int(C.add(C.int(a), \"x\"))"})
+	if strings.Contains(out, "Applied") {
+		t.Errorf("a type error inside a cgo call must block the write:\n%s", out)
 	}
 }

@@ -73,6 +73,9 @@ type Options struct {
 	// that appeared, changed or vanished since the last call are reported to the server.
 	WatchSuffix string
 	SkipDir     func(name string) bool
+	// ExtraFolders are directories below Root sent to the server as further workspace folders at
+	// start (modules the root's go.mod/go.work does not cover, which gopls would not index).
+	ExtraFolders []string
 }
 
 // Client talks LSP to one server process.
@@ -92,13 +95,20 @@ type Client struct {
 	stderr   []string
 	exited   chan struct{}
 	snapshot map[string][2]int64 // watched files on disk at the last Refresh (path -> mtime, size)
+	extra    map[string]bool     // workspace folders besides the root that the server knows
 
 	writeMu sync.Mutex
 	// opMu serialises overlay() against refresh()/EnsureOpen from other tool calls.
 	opMu sync.Mutex
 }
 
-func New(opts Options) *Client { return &Client{opts: opts} }
+func New(opts Options) *Client {
+	c := &Client{opts: opts, extra: map[string]bool{}}
+	for _, f := range opts.ExtraFolders {
+		c.extra[filepath.Clean(f)] = true
+	}
+	return c
+}
 
 func (c *Client) Root() string { return c.opts.Root }
 
@@ -223,7 +233,7 @@ func (c *Client) Start(ctx context.Context) error {
 				"didChangeWatchedFiles": map[string]any{"dynamicRegistration": true},
 				"configuration":         true},
 		},
-		"workspaceFolders": []map[string]any{{"uri": root, "name": filepath.Base(c.opts.Root)}},
+		"workspaceFolders": c.folders(),
 	}
 	if len(c.opts.InitOptions) > 0 {
 		params["initializationOptions"] = c.opts.InitOptions
@@ -233,6 +243,61 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 	return c.Notify("initialized", map[string]any{})
+}
+
+// folders lists the workspace folders sent at start: the root, then the extra ones.
+func (c *Client) folders() []map[string]any {
+	out := []map[string]any{{"uri": PathToURI(c.opts.Root), "name": filepath.Base(c.opts.Root)}}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, f := range sortedKeys(c.extra) {
+		out = append(out, map[string]any{"uri": PathToURI(f), "name": filepath.Base(f)})
+	}
+	return out
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SyncFolders makes the extra workspace folders (besides the root) exactly dirs, telling the server
+// with workspace/didChangeWorkspaceFolders. gopls builds a view for each folder, so the packages of a
+// module the root does not cover show up in workspace/symbol without a file of it being opened first.
+func (c *Client) SyncFolders(dirs []string) error {
+	want := map[string]bool{}
+	for _, d := range dirs {
+		want[filepath.Clean(d)] = true
+	}
+	c.mu.Lock()
+	var added, removed []map[string]any
+	for _, d := range sortedKeys(want) {
+		if !c.extra[d] {
+			added = append(added, map[string]any{"uri": PathToURI(d), "name": filepath.Base(d)})
+		}
+	}
+	for _, d := range sortedKeys(c.extra) {
+		if !want[d] {
+			removed = append(removed, map[string]any{"uri": PathToURI(d), "name": filepath.Base(d)})
+		}
+	}
+	started := c.started
+	c.extra = want
+	c.mu.Unlock()
+	if !started || len(added)+len(removed) == 0 {
+		return nil
+	}
+	if added == nil {
+		added = []map[string]any{}
+	}
+	if removed == nil {
+		removed = []map[string]any{}
+	}
+	return c.Notify("workspace/didChangeWorkspaceFolders", map[string]any{"event": map[string]any{"added": added, "removed": removed}})
 }
 
 // Stop shuts the server down.

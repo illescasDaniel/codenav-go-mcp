@@ -66,7 +66,7 @@ written until that is on the table. Output is always gofmt-ed with imports fixed
 | `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs |
 | `change_signature` | Add / remove / reorder parameters and rewrite every call site; linked methods follow. Uses as a value are listed as manual work |
 | `move` | With `name`: move a top-level func, type, const or var to another file, in the same or another package (qualifiers and imports rewritten; refuses unexported-use problems, import cycles and name clashes). Without `name`: move a package directory (`file_path` -> `to_file`) and rewrite every import |
-| `quick_fix` | Apply gopls's quick fixes and organize imports; ambiguous fixes are listed instead of guessed |
+| `quick_fix` | Apply gopls's quick fixes and organize imports; ambiguous fixes are listed instead of guessed. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
 | `verify_changes` | Which errors the working tree gained or lost since a git revision (default `HEAD`) |
 | `apply_edit` / `undo_edit` | Write a previewed edit by id; revert an applied one |
 
@@ -97,18 +97,26 @@ constraints is invisible to the type check (the response says when an edit touch
 
 ## Limitations
 
-- **Nested modules need a `go.work`.** gopls loads only the modules that the root `go.mod` or `go.work`
-  covers. A directory with its own `go.mod` that is not listed in `go.work` is invisible to name
-  lookups, and edits to it are not type-checked. Tools say so when they meet one; run
-  `go work init . ./sub` (plus `go work use` for more) to include it.
-- **Name lookups cover the workspace only.** `name="fmt.Println"` cannot resolve a standard-library or
-  dependency symbol. Use `hover` or `definition` with `file_path`/`line`/`column` on a use of it.
+- **Nested modules:** gopls loads only the modules that the root `go.mod` or `go.work` covers. A directory
+  with its own `go.mod` outside that is added to gopls as an extra workspace folder, so its symbols are found
+  by name and its own packages are type-checked. Packages of *other* modules that import it are not seen, so
+  an edit there can break importers without the error count showing it. Tools say so when they meet one;
+  `go work init . ./sub` joins the modules properly.
+- **Name lookups outside the workspace** work for the read-only tools (`symbol_info`, `callers`,
+  `implementations`): `json.Marshal`, `encoding/json.Decoder.Decode` or a symbol of a required dependency
+  resolve through a scratch file that exists only as a gopls overlay (never on disk). A short qualifier is
+  matched against the imports seen in the workspace and the standard library; a full import path always
+  works. A package no module provides is reported as such. Write tools refuse these symbols.
 - **Large workspaces:** gopls returns at most 100 symbols per query. An exact name hidden among more
   fuzzy matches is still found, because a suffix query and a qualified query are retried, but `search_symbol`
   output for broad queries is truncated.
 - **New directories:** files written outside the tools are picked up on the next call. A brand-new
   package directory is loaded by opening one of its files, so the first call after creating it can
   take a moment longer.
+- **Concurrent writers:** applying and undoing take an advisory file lock (`<state dir>/<hash of workspace>/lock`),
+  so two server processes on one workspace take turns, and every file is re-hashed right before it is written;
+  a file that changed in between fails the write clearly. On OSes without `flock` support the lock is skipped
+  with a note.
 - **Crash safety:** before a multi-file write the server records the plan, base hashes and the original
   files in a log under the user cache directory (`<cache>/codenav-go-mcp/<hash of workspace>/`, never in
   the tree) and removes it when the write finishes or is rolled back. If the process dies mid-write, the
@@ -120,7 +128,10 @@ constraints is invisible to the type check (the response says when an edit touch
   the in-memory "after" state (by a `//go:build ignore` stub when the whole directory goes), so importers
   the rewrite missed show up as errors. Only importers gopls loads under the current GOOS/GOARCH and
   `CODENAV_GO_MCP_BUILD_FLAGS` are seen.
-- **Not offered by gopls, so not by `quick_fix`:** removing an unused local variable (use `edit`).
+- **Unused local variables:** gopls offers no fix for `declared and not used`, so `quick_fix` adds its own,
+  "Mark x as used (`_ = x`)", after the declaring statement (or at the start of each body or clause for
+  `if`/`for`/`switch` initializers, range variables and type-switch bindings). Removing the variable is
+  still a job for `edit`. Unused parameters are not handled.
 
 ## Which `gopls` runs
 
