@@ -166,9 +166,24 @@ func Diff(before, after []Entry) Delta {
 			return a.Column < b.Column
 		})
 	}
+	unchanged := len(after) - len(nw)
 	less(nw)
 	less(fixed)
-	return Delta{New: nw, Fixed: fixed, Unchanged: len(after) - len(nw)}
+	return Delta{New: dedupe(nw), Fixed: dedupe(fixed), Unchanged: unchanged}
+}
+
+// dedupe drops repeats of the same diagnostic (path, position, message) from a sorted list.
+func dedupe(es []Entry) []Entry {
+	seen := map[string]bool{}
+	out := es[:0:0]
+	for _, e := range es {
+		k := fmt.Sprintf("%s|%d|%d|%s", e.Path, e.Line, e.Column, e.Message)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func Format(d Delta, limit int) string {

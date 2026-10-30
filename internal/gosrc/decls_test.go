@@ -117,3 +117,15 @@ func TestCarveSpec(t *testing.T) {
 		}
 	}
 }
+
+func TestEditImportsCollapsesSingleImport(t *testing.T) {
+	old := "package p\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nfunc F() string { fmt.Println(); return strings.ToUpper(\"a\") }\n"
+	next := strings.Replace(old, "fmt.Println(); ", "", 1)
+	got, err := EditImports("p.go", next, old, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "import \"strings\"\n") || strings.Contains(got, "import (") {
+		t.Errorf("single import should collapse:\n%s", got)
+	}
+}

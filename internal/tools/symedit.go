@@ -202,7 +202,7 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		if err := gosrc.CheckSyntax("source.go", wrapped); err != nil {
 			return nil, err
 		}
-		next = text[:d.Closing] + "\n" + edits.MatchEOL(source, text) + "\n" + text[d.Closing:]
+		next = insertMember(text, d.Closing, edits.MatchEOL(source, text))
 	default:
 		if err := checkSnippet(source, nil); err != nil {
 			return nil, err
@@ -330,4 +330,14 @@ func blockText(text string, start, end int) string {
 		return text[b:]
 	}
 	return text[b : end+e]
+}
+
+// insertMember puts member before the closing brace at offset closing; it adds no blank line
+// when the brace already starts its own line.
+func insertMember(text string, closing int, member string) string {
+	before := text[:closing]
+	if !strings.HasSuffix(before, "\n") {
+		before += "\n"
+	}
+	return before + member + "\n" + text[closing:]
 }

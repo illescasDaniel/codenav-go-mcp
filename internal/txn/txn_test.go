@@ -179,3 +179,29 @@ func TestPlanStore(t *testing.T) {
 		t.Error("discarded plan still found")
 	}
 }
+
+func TestPlanStoreAppliedID(t *testing.T) {
+	s := NewPlanStore()
+	id := s.Add(edits.NewPlan("x", nil))
+	s.MarkApplied(id)
+	if _, err := s.Get(id); err == nil || !strings.Contains(err.Error(), "already applied") || !strings.Contains(err.Error(), "undo_edit") {
+		t.Errorf("want an already-applied error, got %v", err)
+	}
+}
+
+func TestCheckPathRefusesSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "real.go")
+	write(t, target, "package p\n")
+	link := filepath.Join(root, "link.go")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skip(err)
+	}
+	g := WriteGuard{Root: root}
+	if err := g.CheckPath(link); err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Errorf("want symlink refusal, got %v", err)
+	}
+	if err := g.CheckPath(target); err != nil {
+		t.Errorf("regular file refused: %v", err)
+	}
+}

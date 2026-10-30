@@ -249,6 +249,7 @@ func EditImports(filename, src, oldSrc string, add []string, prune bool) (string
 	if !changed {
 		return src, nil
 	}
+	collapseSingleImports(f)
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, f); err != nil {
 		return "", toolerr.Inputf("cannot print the file after editing imports: %v", err)
@@ -453,4 +454,30 @@ func CarveSpec(filename, src string, nameOff int) (string, int, error) {
 		}
 	}
 	return "", 0, toolerr.Inputf("that symbol is not a const, var or type.")
+}
+
+// collapseSingleImports turns `import (\n\t"x"\n)` into `import "x"` (comment-free specs only).
+func collapseSingleImports(f *ast.File) {
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.IMPORT || !g.Lparen.IsValid() || len(g.Specs) != 1 {
+			continue
+		}
+		s := g.Specs[0].(*ast.ImportSpec)
+		if s.Doc != nil || s.Comment != nil || g.Doc != nil {
+			continue
+		}
+		if len(f.Comments) > 0 {
+			inside := false
+			for _, c := range f.Comments {
+				if c.Pos() > g.Lparen && c.End() < g.Rparen {
+					inside = true
+				}
+			}
+			if inside {
+				continue
+			}
+		}
+		g.Lparen, g.Rparen = token.NoPos, token.NoPos
+	}
 }

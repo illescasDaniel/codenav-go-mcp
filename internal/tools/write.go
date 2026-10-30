@@ -307,7 +307,7 @@ func RegisterWrite(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			w.Store.Discard(in.ID)
+			w.Store.MarkApplied(in.ID)
 			return conclude(w, plan, delta, true, -1, in.AllowLarge)
 		})
 

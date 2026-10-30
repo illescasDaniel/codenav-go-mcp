@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
@@ -64,6 +65,11 @@ func sameEdit(a, b codeAction) bool {
 	return string(x) == string(y)
 }
 
+var spaceRunRE = regexp.MustCompile(` {2,}`)
+
+// tidy collapses runs of spaces in a gopls action title for display (matching uses the original).
+func tidy(title string) string { return spaceRunRE.ReplaceAllString(title, " ") }
+
 func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) {
 	abs, err := w.absPath(in.FilePath)
 	if err != nil {
@@ -91,7 +97,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			return "", err
 		}
 		addEdits(all, by)
-		titles = append(titles, acts[0].Title)
+		titles = append(titles, tidy(acts[0].Title))
 	} else {
 		diags, err := w.Client.Diagnostics(ctx, abs)
 		if err != nil {
@@ -149,11 +155,11 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 					return "", err
 				}
 				addEdits(all, by)
-				titles = append(titles, acts[0].Title)
+				titles = append(titles, tidy(acts[0].Title))
 			default:
 				opts := make([]string, 0, len(acts))
 				for _, a := range acts[:min(len(acts), 8)] {
-					opts = append(opts, "      - "+a.Title)
+					opts = append(opts, "      - "+tidy(a.Title))
 				}
 				ambiguous = append(ambiguous, label+"\n"+strings.Join(opts, "\n"))
 			}

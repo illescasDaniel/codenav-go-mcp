@@ -42,6 +42,9 @@ func (g WriteGuard) CheckWritesEnabled(hint string) error {
 }
 
 func (g WriteGuard) CheckPath(path string) error {
+	if st, err := os.Lstat(path); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		return toolerr.Inputf("%s is a symlink; edit its target inside the workspace instead", edits.RelativeName(path, g.Root))
+	}
 	root, err := filepath.EvalSymlinks(g.Root)
 	if err != nil {
 		root = g.Root
@@ -322,9 +325,12 @@ type PlanStore struct {
 	mu    sync.Mutex
 	ids   []string
 	plans map[string]*edits.EditPlan
+	used  map[string]bool // ids already applied
 }
 
-func NewPlanStore() *PlanStore { return &PlanStore{plans: map[string]*edits.EditPlan{}} }
+func NewPlanStore() *PlanStore {
+	return &PlanStore{plans: map[string]*edits.EditPlan{}, used: map[string]bool{}}
+}
 
 func (s *PlanStore) Add(p *edits.EditPlan) string {
 	s.mu.Lock()
@@ -344,6 +350,9 @@ func (s *PlanStore) Get(id string) (*edits.EditPlan, error) {
 	defer s.mu.Unlock()
 	p, ok := s.plans[id]
 	if !ok {
+		if s.used[id] {
+			return nil, toolerr.Inputf("preview %q was already applied; use undo_edit to revert it, or run the edit again", id)
+		}
 		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s)", id, strings.Join(s.ids, ", "))
 	}
 	return p, nil
@@ -361,8 +370,16 @@ func (s *PlanStore) Discard(id string) {
 	}
 }
 
+// MarkApplied drops the plan and remembers that its id was consumed.
+func (s *PlanStore) MarkApplied(id string) {
+	s.Discard(id)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.used[id] = true
+}
+
 func (s *PlanStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.plans, s.ids = map[string]*edits.EditPlan{}, nil
+	s.plans, s.ids, s.used = map[string]*edits.EditPlan{}, nil, map[string]bool{}
 }

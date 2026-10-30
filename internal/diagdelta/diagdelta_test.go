@@ -23,3 +23,11 @@ func TestDiffNeverPairsErrorsLoosely(t *testing.T) {
 		t.Fatalf("the same error in another file is a new error: %+v", d)
 	}
 }
+
+func TestDiffDedupesIdenticalDiagnostics(t *testing.T) {
+	e := Entry{Path: "a.go", Line: 3, Column: 2, Severity: 1, Message: "undefined: Color"}
+	d := Diff(nil, []Entry{e, e, e})
+	if len(d.New) != 1 {
+		t.Fatalf("identical diagnostics must be listed once: %+v", d)
+	}
+}

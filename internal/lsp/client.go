@@ -656,7 +656,7 @@ func (c *Client) checkPosition(abs string, line, column int) error {
 		return &InvalidPositionError{fmt.Sprintf("line %d is outside the file (it has %d lines)", line, len(lines))}
 	}
 	if width := Utf16Len(lines[line-1]); column < 1 || column > width+1 {
-		return &InvalidPositionError{fmt.Sprintf("column %d is outside line %d (it has %d characters)", column, line, width)}
+		return &InvalidPositionError{fmt.Sprintf("column %d is outside line %d (it has %d UTF-16 columns)", column, line, width)}
 	}
 	return nil
 }

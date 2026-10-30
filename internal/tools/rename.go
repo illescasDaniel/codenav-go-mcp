@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"go/token"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -85,6 +86,30 @@ func (w *Workspace) inWorkspace(path string) bool {
 	return err == nil && !strings.HasPrefix(rel, "..") && !exclude.IsExcluded(path, w.Root)
 }
 
+// packageDir finds a directory below root named name that holds .go files ("" if none).
+func packageDir(root, name string) string {
+	if name == "" || strings.ContainsAny(name, "./") {
+		return ""
+	}
+	found := ""
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != "" || !d.IsDir() {
+			return nil
+		}
+		if path != root && (exclude.IsDirName(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
+			return filepath.SkipDir
+		}
+		if d.Name() == name {
+			if m, _ := filepath.Glob(filepath.Join(path, "*.go")); len(m) > 0 {
+				found, _ = filepath.Rel(root, path)
+				found = filepath.ToSlash(found)
+			}
+		}
+		return nil
+	})
+	return found
+}
+
 // planRename renames the member and, when linked, everything gopls' rename leaves behind that
 // would break the program: implementations of an interface method, and the interface methods a
 // concrete method satisfies, followed transitively.
@@ -98,6 +123,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	case in.Name != "":
 		sym, err := resolve.Resolve(ctx, w.Client, w.Root, in.Name, in.FilePath)
 		if err != nil {
+			if dir := packageDir(w.Root, in.Name); dir != "" && strings.HasPrefix(err.Error(), "No symbol found") {
+				return nil, toolerr.Inputf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", in.Name, dir)
+			}
 			return nil, err
 		}
 		root = member{lsp.URIToPath(sym.URI), sym.Line, sym.Column}

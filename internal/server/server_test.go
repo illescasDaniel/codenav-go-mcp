@@ -543,3 +543,58 @@ func TestRenameKeepsFilesGofmted(t *testing.T) {
 		t.Fatalf("files not gofmt-ed after rename: %s", b)
 	}
 }
+
+func TestEditSymbolInsertIntoNoBlankLine(t *testing.T) {
+	cs, root := session(t, nil)
+	src := "package shapes\n\ntype Opts struct {\n\tA int\n}\n\ntype Lister interface {\n\tList() []int\n}\n"
+	if err := os.WriteFile(filepath.Join(root, "shapes", "opts.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, src := range map[string]string{"Opts": "B string", "Lister": "Len() int"} {
+		out := call(t, cs, "edit_symbol", map[string]any{"action": "insert", "position": "into", "name": name, "file_path": "shapes/opts.go", "source": src})
+		if !strings.Contains(out, "Applied") {
+			t.Fatalf("insert into %s not applied:\n%s", name, out)
+		}
+	}
+	got := readFile(t, root, "shapes/opts.go")
+	if !strings.Contains(got, "\tA int\n\tB string\n}") || !strings.Contains(got, "\tList() []int\n\tLen() int\n}") {
+		t.Errorf("no blank line expected:\n%s", got)
+	}
+}
+
+func TestRenamePackageNameExplained(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shapes", "new_name": "forms"})
+	if !strings.Contains(out, "is a package, not a symbol") || !strings.Contains(out, "file_path=shapes") {
+		t.Errorf("want package explanation:\n%s", out)
+	}
+}
+
+func TestEditRefusesSymlink(t *testing.T) {
+	cs, root := session(t, nil)
+	outside := filepath.Join(t.TempDir(), "o.go")
+	if err := os.WriteFile(outside, []byte("package shapes\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "shapes", "link.go")); err != nil {
+		t.Skip(err)
+	}
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/link.go", "new_text": "package shapes\n\nvar X = 1\n"})
+	if !strings.Contains(out, "is a symlink") {
+		t.Errorf("want symlink refusal:\n%s", out)
+	}
+	if st, err := os.Lstat(filepath.Join(root, "shapes", "link.go")); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Error("the symlink must stay")
+	}
+}
+
+func TestApplyEditTwice(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": scaleSig, "new_string": "func Scale(s Shape, k float64)"})
+	id := out[strings.Index(out, `apply_edit(id="`)+len(`apply_edit(id="`):]
+	id = id[:strings.Index(id, `"`)]
+	call(t, cs, "apply_edit", map[string]any{"id": id})
+	if out := call(t, cs, "apply_edit", map[string]any{"id": id}); !strings.Contains(out, "already applied") {
+		t.Errorf("want already-applied message:\n%s", out)
+	}
+}
