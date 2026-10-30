@@ -142,7 +142,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			}
 			return "No diagnostics to fix in " + rel + at + ".", nil
 		}
-		var ambiguous, unfixable []string
+		var ambiguous, unfixable, noMatch []string
 		for i, d := range wanted {
 			if i == 25 {
 				break
@@ -162,6 +162,14 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 					if strings.Contains(strings.ToLower(a.Title), strings.ToLower(in.Choice)) {
 						kept = append(kept, a)
 					}
+				}
+				if len(kept) == 0 && len(acts) > 0 {
+					opts := make([]string, 0, len(acts))
+					for _, a := range acts[:min(len(acts), 8)] {
+						opts = append(opts, "      - "+tidy(a.Title))
+					}
+					noMatch = append(noMatch, label+"\n"+strings.Join(opts, "\n"))
+					continue
 				}
 				acts = kept
 			}
@@ -201,11 +209,17 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 		if len(ambiguous) > 0 {
 			return "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  "), nil
 		}
+		if len(noMatch) > 0 && len(all) == 0 && len(importSpecs) == 0 {
+			return fmt.Sprintf("No fix matches choice=%q; nothing was changed. Offered:\n  %s", in.Choice, strings.Join(noMatch, "\n  ")), nil
+		}
 		if len(all) == 0 && len(importSpecs) == 0 {
 			hint := ""
 			for _, u := range unfixable {
 				if strings.Contains(u, "imported and not used") {
 					hint = " For unused imports use organize_imports=true."
+				}
+				if strings.Contains(u, "declared and not used") {
+					hint += " gopls has no fix for an unused local variable; delete it or assign it to _ with edit."
 				}
 			}
 			if len(unfixable) == 0 {

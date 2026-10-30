@@ -79,3 +79,16 @@ func TestUnifiedDiffAndInverse(t *testing.T) {
 		t.Error("inverse wrong")
 	}
 }
+
+func TestRestoreEOLMixed(t *testing.T) {
+	old := "a\r\nb\nc\r\nd\n"
+	if got, want := RestoreEOL("a\nB\nc\nd\n", old), "a\r\nB\nc\r\nd\n"; got != want {
+		t.Errorf("same line count: got %q want %q", got, want)
+	}
+	if got, want := RestoreEOL("a\nx\ny\nc\nd\n", "a\r\nb\r\nc\r\nd\n"), "a\r\nx\r\ny\r\nc\r\nd\n"; got != want {
+		t.Errorf("inserted lines: got %q want %q", got, want)
+	}
+	if got, want := RestoreEOL("a\nb\n", "a\r\nb\r\n"), "a\r\nb\r\n"; got != want {
+		t.Errorf("uniform CRLF: got %q want %q", got, want)
+	}
+}

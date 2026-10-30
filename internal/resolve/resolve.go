@@ -3,6 +3,7 @@ package resolve
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"path/filepath"
 	"strings"
@@ -95,6 +96,65 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 	return strings.Join(lines, "\n")
 }
 
+// NotFoundError is a name that matches no workspace symbol. It reads as an input error; callers
+// that know more about the language can replace the hint (see Query).
+type NotFoundError struct {
+	Query string
+	Err   *toolerr.InputError
+}
+
+func (e *NotFoundError) Error() string { return e.Err.Msg }
+func (e *NotFoundError) Unwrap() error { return e.Err }
+
+// SymbolCap is gopls's limit on workspace/symbol results; a result list this long may have
+// dropped the exact match in favour of fuzzy ones.
+const SymbolCap = 100
+
+// lookup queries workspace/symbol for last (the final dotted part of query). When gopls's result
+// list is capped, the exact symbol can be missing ("U" among 800 "U0_n"), so it also asks for
+// names ending in last ("U$") and, for a dotted query, the qualified form ("short.U").
+func lookup(ctx context.Context, c *lsp.Client, query, last string) ([]*lsp.Symbol, error) {
+	syms, err := c.WorkspaceSymbol(ctx, last)
+	if err != nil {
+		return nil, err
+	}
+	if len(syms) >= SymbolCap {
+		extra := []string{last + "$"}
+		if query != last {
+			extra = append(extra, query)
+		}
+		for _, q := range extra {
+			more, err := c.WorkspaceSymbol(ctx, q)
+			if err != nil {
+				return nil, err
+			}
+			for _, s := range more {
+				// A package-qualified query makes gopls report "short.U"; keep names as the plain query does.
+				if pb := pkgBase(s.ContainerName) + "."; s.ContainerName != "" && strings.HasPrefix(s.Name, pb) && strings.HasPrefix(q, pb) {
+					s.Name = strings.TrimPrefix(s.Name, pb)
+				}
+				syms = append(syms, s)
+			}
+		}
+	}
+	var all []*lsp.Symbol
+	seen := map[string]bool{}
+	for i := range syms {
+		s := &syms[i]
+		if s.Location == nil {
+			continue
+		}
+		uri, l, col := format.SymbolPosition(s)
+		key := fmt.Sprintf("%s|%s|%d|%d", s.Name, uri, l, col)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		all = append(all, s)
+	}
+	return all, nil
+}
+
 // Resolve finds the one symbol named query, optionally restricted to file (workspace-relative).
 func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symbol, error) {
 	query = strings.TrimSpace(query)
@@ -102,15 +162,9 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 	if i := strings.LastIndex(query, "."); i >= 0 {
 		last = query[i+1:]
 	}
-	syms, err := c.WorkspaceSymbol(ctx, last)
+	all, err := lookup(ctx, c, query, last)
 	if err != nil {
 		return Symbol{}, err
-	}
-	var all []*lsp.Symbol
-	for i := range syms {
-		if syms[i].Location != nil {
-			all = append(all, &syms[i])
-		}
 	}
 	var exact, loose []*lsp.Symbol
 	for _, s := range format.Rank(all, last) {
@@ -149,10 +203,7 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 		if !strings.Contains(query, ".") {
 			hint = " (struct fields and methods are named Type.Name)"
 		}
-		if strings.Contains(query, ".") {
-			hint = " (methods promoted through embedding are not declared symbols; query the embedded type's method instead)"
-		}
-		return Symbol{}, toolerr.Inputf("No symbol found matching %q%s.", query, hint)
+		return Symbol{}, &NotFoundError{Query: query, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q%s.", query, hint)}}
 	case 1:
 		return fromLSP(cands[0]), nil
 	}

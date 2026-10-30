@@ -21,7 +21,6 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/params"
-	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 )
@@ -236,7 +235,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, in.FilePath)
+			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}
@@ -304,7 +303,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, in.FilePath)
+			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}
@@ -322,7 +321,12 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			return format.FormatCallers(calls, w.Root, callerReceivers(calls)), nil
+			calls, omitted := realCalls(calls)
+			out := format.FormatCallers(calls, w.Root, callerReceivers(calls))
+			if omitted > 0 {
+				out += fmt.Sprintf("\n(%d non-call reference(s) omitted: uses as a function or method value, such as f := %s; see references)", omitted, sym.Name)
+			}
+			return out, nil
 		})
 
 	add(s, h, "implementations", "For an interface (or interface method): the types implementing it. For a concrete type (or method): the interfaces it satisfies.",
@@ -331,7 +335,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, in.FilePath)
+			sym, err := resolveSymbol(ctx, w, name, in.FilePath)
 			if err != nil {
 				return "", err
 			}
@@ -430,6 +434,40 @@ func splitTests(locs []lsp.Location, root string) string {
 		return "No references found at that position."
 	}
 	return out
+}
+
+// realCalls drops the sites gopls' incoming calls include that are not calls: a function or
+// method value (f := Target, var h func() int = Target, m := t.M). A site is kept when its
+// identifier is the callee of a call expression. Files that cannot be read or parsed are kept as is.
+func realCalls(calls []lsp.IncomingCall) (kept []lsp.IncomingCall, omitted int) {
+	parsed := map[string]*gosrc.File{}
+	for _, c := range calls {
+		p := lsp.URIToPath(c.From.URI)
+		pf, seen := parsed[p]
+		if !seen {
+			if text, _, err := edits.ReadSource(p); err == nil {
+				pf, _ = gosrc.ParseFile(p, text)
+			}
+			parsed[p] = pf
+		}
+		if pf == nil {
+			kept = append(kept, c)
+			continue
+		}
+		var ranges []lsp.Range
+		for _, r := range c.FromRanges {
+			if pf.CallAt(edits.Offset(pf.Src, r.Start.Line, r.Start.Character)) != nil {
+				ranges = append(ranges, r)
+			} else {
+				omitted++
+			}
+		}
+		if len(ranges) > 0 || len(c.FromRanges) == 0 {
+			c.FromRanges = ranges
+			kept = append(kept, c)
+		}
+	}
+	return kept, omitted
 }
 
 // callerReceivers finds, per call, the receiver type of the calling method: gopls' call hierarchy

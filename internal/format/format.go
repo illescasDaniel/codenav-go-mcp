@@ -262,7 +262,9 @@ var kindByLabel = func() map[string]int {
 	for k, v := range lsp.SymbolKindNames {
 		m[v] = k
 	}
-	// gopls reports Go structs as Struct and interfaces as Interface; let "type" cover both.
+	// gopls reports Go structs as Struct and interfaces as Interface; let "type" cover both. Other named
+	// types (type Color int) come as LSP Class, labelled "type"; "class" stays accepted as a filter.
+	m["class"] = 5
 	return m
 }()
 
@@ -287,7 +289,9 @@ func ParseKindFilter(kind string) (map[int]bool, error) {
 		if !ok {
 			var valid []string
 			for l := range kindByLabel {
-				valid = append(valid, l)
+				if l != "type" {
+					valid = append(valid, l)
+				}
 			}
 			sort.Strings(valid)
 			return nil, toolerr.Inputf("unknown symbol kind %q; use one or more of: type, %s", strings.TrimSpace(part), strings.Join(valid, ", "))
@@ -435,10 +439,14 @@ func FormatDiagnostic(d lsp.Diagnostic) string {
 }
 
 func FormatDiagnostics(items []lsp.Diagnostic, limit int) string {
-	items = lsp.DedupeDiagnostics(items)
+	items = append([]lsp.Diagnostic(nil), lsp.DedupeDiagnostics(items)...)
 	if len(items) == 0 {
 		return "No diagnostics."
 	}
+	sort.SliceStable(items, func(i, j int) bool {
+		a, b := items[i].Range.Start, items[j].Range.Start
+		return a.Line < b.Line || a.Line == b.Line && a.Character < b.Character
+	})
 	shown := items[:min(len(items), max(0, limit))]
 	lines := make([]string, len(shown))
 	for i, d := range shown {

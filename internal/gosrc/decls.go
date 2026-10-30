@@ -586,3 +586,47 @@ func collapseSingleImports(f *ast.File) {
 		g.Lparen, g.Rparen = token.NoPos, token.NoPos
 	}
 }
+
+// IsEmbeddedFieldAt reports whether the identifier starting at byte offset off names an embedded
+// struct field (`struct{ Base }`, `*Base`, `pkg.Base`, `Base[T]`): a field without an explicit name.
+func IsEmbeddedFieldAt(filename, src string, off int) bool {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return false
+	}
+	found := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		st, ok := n.(*ast.StructType)
+		if !ok || found {
+			return !found
+		}
+		for _, fld := range st.Fields.List {
+			if len(fld.Names) != 0 {
+				continue
+			}
+			t := fld.Type
+			for {
+				switch x := t.(type) {
+				case *ast.StarExpr:
+					t = x.X
+					continue
+				case *ast.IndexExpr:
+					t = x.X
+					continue
+				case *ast.IndexListExpr:
+					t = x.X
+					continue
+				case *ast.SelectorExpr:
+					t = x.Sel
+					continue
+				}
+				break
+			}
+			if id, ok := t.(*ast.Ident); ok && fset.Position(id.Pos()).Offset == off {
+				found = true
+			}
+		}
+		return true
+	})
+	return found
+}

@@ -179,6 +179,7 @@ type Journal struct {
 
 	mu      sync.Mutex
 	entries []*Applied
+	undone  map[string]bool // ids of edits reverted by Undo
 	max     int
 }
 
@@ -323,7 +324,18 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 		}
 	}
 	j.entries = append(j.entries[:idx], j.entries[idx+1:]...)
+	if j.undone == nil {
+		j.undone = map[string]bool{}
+	}
+	j.undone[e.ID] = true
 	return e, nil
+}
+
+// WasUndone reports whether the edit with this id was reverted by Undo.
+func (j *Journal) WasUndone(id string) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.undone[id]
 }
 
 // PlanStore holds previewed plans waiting to be applied by id.
@@ -374,6 +386,14 @@ func (s *PlanStore) Discard(id string) {
 			break
 		}
 	}
+}
+
+// AppliedAs is the edit id a consumed preview id became.
+func (s *PlanStore) AppliedAs(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	eid, ok := s.used[id]
+	return eid, ok
 }
 
 // MarkApplied drops the plan and remembers that its id was consumed, and as which edit.

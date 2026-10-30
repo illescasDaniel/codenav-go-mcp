@@ -259,6 +259,7 @@ type EditPlan struct {
 	Changes     []FileChange
 	Notes       []string
 	BaseHashes  map[string]string // path -> hash of bytes at plan time ("" = absent)
+	AllowLarge  bool              // allow_large was given when the plan was made; apply_edit honours it
 }
 
 func NewPlan(desc string, changes []FileChange, notes ...string) *EditPlan {
@@ -479,6 +480,62 @@ func MatchEOL(text, like string) string {
 		return text
 	}
 	return strings.ReplaceAll(text, "\n", eol)
+}
+
+// RestoreEOL gives text (any line endings) the line endings of like, line by line when like mixes
+// CRLF and LF: lines of an unchanged leading and trailing run keep their own terminator (with equal
+// line counts every line keeps its counterpart's), the rest get like's dominant ending. So a mixed
+// file is not normalised and unchanged lines stay out of the diff.
+func RestoreEOL(text, like string) string {
+	crlf := strings.Count(like, "\r\n")
+	if crlf == 0 || crlf == strings.Count(like, "\n") {
+		return MatchEOL(text, like)
+	}
+	eol := detectEOL(like)
+	oldLines := strings.SplitAfter(like, "\n")
+	newLines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	// newLines[i] for i < len(newLines)-1 is followed by a newline; the last part never is.
+	n := len(newLines) - 1
+	ends := make([]string, n)
+	for i := range ends {
+		ends[i] = eol
+	}
+	term := func(l string) (content, end string) {
+		if strings.HasSuffix(l, "\r\n") {
+			return l[:len(l)-2], "\r\n"
+		}
+		if strings.HasSuffix(l, "\n") {
+			return l[:len(l)-1], "\n"
+		}
+		return l, ""
+	}
+	var olds [][2]string
+	for _, l := range oldLines {
+		if c, e := term(l); e != "" {
+			olds = append(olds, [2]string{c, e})
+		}
+	}
+	if len(olds) == n {
+		for i := range ends {
+			ends[i] = olds[i][1]
+		}
+	} else {
+		i := 0
+		for ; i < n && i < len(olds) && newLines[i] == olds[i][0]; i++ {
+			ends[i] = olds[i][1]
+		}
+		for j, k := n-1, len(olds)-1; j >= i && k >= i && newLines[j] == olds[k][0]; j, k = j-1, k-1 {
+			ends[j] = olds[k][1]
+		}
+	}
+	var b strings.Builder
+	for i, l := range newLines {
+		b.WriteString(l)
+		if i < n {
+			b.WriteString(ends[i])
+		}
+	}
+	return b.String()
 }
 
 // Offset converts a 0-based LSP position (UTF-16 character) to a byte offset in text.

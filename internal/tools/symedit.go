@@ -86,7 +86,7 @@ func siblingDecls(w *Workspace, path, text, name string) []string {
 }
 
 func locate(ctx context.Context, w *Workspace, name, file string) (*located, error) {
-	sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, file)
+	sym, err := resolveSymbol(ctx, w, name, file)
 	unbuilt := false
 	if err != nil && file != "" && strings.HasPrefix(err.Error(), "No symbol") {
 		// The file may be excluded from the current build (a build tag): gopls does not index it.

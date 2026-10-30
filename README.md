@@ -95,6 +95,22 @@ its own package (a type's methods follow it when it changes package).
 Known limits: package moves refuse directories holding non-Go files; code excluded by build
 constraints is invisible to the type check (the response says when an edit touches it).
 
+## Limitations
+
+- **Nested modules need a `go.work`.** gopls loads only the modules that the root `go.mod` or `go.work`
+  covers. A directory with its own `go.mod` that is not listed in `go.work` is invisible to name
+  lookups, and edits to it are not type-checked. Tools say so when they meet one; run
+  `go work init . ./sub` (plus `go work use` for more) to include it.
+- **Name lookups cover the workspace only.** `name="fmt.Println"` cannot resolve a standard-library or
+  dependency symbol. Use `hover` or `definition` with `file_path`/`line`/`column` on a use of it.
+- **Large workspaces:** gopls returns at most 100 symbols per query. An exact name hidden among more
+  fuzzy matches is still found, because a suffix query and a qualified query are retried, but `search_symbol`
+  output for broad queries is truncated.
+- **New directories:** files written outside the tools are picked up on the next call. A brand-new
+  package directory is loaded by opening one of its files, so the first call after creating it can
+  take a moment longer.
+- **Not offered by gopls, so not by `quick_fix`:** removing an unused local variable (use `edit`).
+
 ## Which `gopls` runs
 
 1. `$CODENAV_GO_MCP_GOPLS`

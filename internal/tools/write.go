@@ -14,8 +14,10 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 )
 
 // ReadOnlyEnv is named in the "writes disabled" message.
@@ -72,8 +74,30 @@ func finishPlan(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply b
 	if err != nil {
 		return "", err
 	}
+	plan.Notes = append(plan.Notes, nestedModuleNotes(w.Root, planPaths(plan))...)
 	out, _, err := conclude(w, plan, delta, apply, maxNew, allowLarge)
 	return out, err
+}
+
+// nestedModuleNotes warns when edited files belong to a module the workspace does not build (a
+// nested go.mod with no go.work listing it): its importers are not part of the type check.
+func nestedModuleNotes(root string, paths []string) []string {
+	seen := map[string]bool{}
+	var notes []string
+	for _, p := range paths {
+		n, ok := gomod.Uncovered(root, p)
+		if !ok || seen[n.Dir] {
+			continue
+		}
+		seen[n.Dir] = true
+		name := n.Path
+		if name == "" {
+			name = edits.RelativeName(n.Dir, root)
+		}
+		notes = append(notes, fmt.Sprintf("%s belongs to module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover; packages importing it (in it or in other modules) are not type-checked, so the error count may miss breakages. A go.work listing the modules (go work init . ./%s) fixes that.",
+			edits.RelativeName(p, root), name, edits.RelativeName(n.Dir, root), edits.RelativeName(n.Dir, root)))
+	}
+	return notes
 }
 
 func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool) (string, string, error) {
@@ -100,16 +124,31 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	case apply && readOnly:
 		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s, and write tools are disabled (%s).", newErrs, maxErrors(maxNew), ReadOnlyEnv), "", plan.Diff(w.Root, 2, 120))
 	case apply:
+		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
-		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q) to write it anyway.", newErrs, maxErrors(maxNew), id, id))
+		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q%s) to write it anyway.", newErrs, maxErrors(maxNew), id, id, largeArg(w, plan)))
 		out = append(out, "", plan.Diff(w.Root, 2, 120))
 	case readOnly:
 		out = append(out, "", "Preview only (apply=false); write tools are disabled ("+ReadOnlyEnv+").", "", plan.Diff(w.Root, 2, 200))
 	default:
+		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
-		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q) writes it.", id), "", plan.Diff(w.Root, 2, 200))
+		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q%s) writes it.", id, largeArg(w, plan)), "", plan.Diff(w.Root, 2, 200))
 	}
 	return strings.Join(out, "\n"), editID, nil
+}
+
+// largeArg is the extra apply_edit argument a preview over the file limit needs: none when
+// allow_large was given with the preview (the stored plan remembers it).
+func largeArg(w *Workspace, plan *edits.EditPlan) string {
+	limit := w.Journal.Guard.MaxFiles
+	if limit == 0 {
+		limit = txn.DefaultMaxFiles
+	}
+	if plan.AllowLarge || len(plan.Changes) <= limit {
+		return ""
+	}
+	return fmt.Sprintf(", allow_large=true; it touches %d files, over the limit of %d", len(plan.Changes), limit)
 }
 
 type editIn struct {
@@ -235,7 +274,7 @@ func fileChange(abs, next string, old *string, bom bool) (edits.FileChange, erro
 	}
 	c := edits.FileChange{Path: abs, NewBOM: bom}
 	if old != nil {
-		formatted = edits.MatchEOL(formatted, *old)
+		formatted = edits.RestoreEOL(formatted, *old)
 		c.Old, c.OldBOM = old, bom
 	}
 	c.New = &formatted
@@ -302,7 +341,7 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
 		})
 
-	addWrite(s, h, readOnly, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (add a missing import, remove an unused variable or import, ...). Narrow with line or code. "+
+	addWrite(s, h, readOnly, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (e.g. add a missing import, declare missing methods; gopls has no fix for an unused local variable). Narrow with line or code. "+
 		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. Missing imports are added together in one block. organize_imports=true instead adds missing and removes unused imports, sorted; fix_all=true applies gopls' source.fixAll to the whole file. Fixes gopls only offers as a command are reported, not applied. Type-checked like edit; undo_edit reverts.",
 		quickFix)
 
@@ -322,6 +361,9 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 	if !readOnly {
 		addWrite(s, h, readOnly, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
 			func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
+				if eid, ok := w.Store.AppliedAs(in.ID); ok && w.Journal.WasUndone(eid) {
+					return "", toolerr.Inputf("preview %q was applied as edit %s and has since been undone; run the refactoring again for a fresh preview.", in.ID, eid)
+				}
 				plan, err := w.Store.Get(in.ID)
 				if err != nil {
 					return "", err
@@ -329,14 +371,15 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 				if err := w.Journal.CheckFresh(plan); err != nil {
 					return "", err
 				}
-				if err := w.Journal.Guard.CheckPlan(plan, in.AllowLarge); err != nil {
+				allowLarge := in.AllowLarge || plan.AllowLarge
+				if err := w.Journal.Guard.CheckPlan(plan, allowLarge); err != nil {
 					return "", err
 				}
 				delta, err := Simulate(ctx, w, plan, true)
 				if err != nil {
 					return "", err
 				}
-				out, editID, err := conclude(w, plan, delta, true, -1, in.AllowLarge)
+				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge)
 				if err != nil {
 					return "", err
 				}

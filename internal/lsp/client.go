@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -588,6 +589,15 @@ func (c *Client) NoteWritten(paths []string) error {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 	var changes []map[string]any
+	c.mu.Lock()
+	var before map[string][2]int64
+	if c.snapshot != nil {
+		before = make(map[string][2]int64, len(c.snapshot))
+		for k, v := range c.snapshot {
+			before[k] = v
+		}
+	}
+	c.mu.Unlock()
 	for _, p := range paths {
 		if !filepath.IsAbs(p) {
 			p = filepath.Join(c.opts.Root, p)
@@ -621,7 +631,17 @@ func (c *Client) NoteWritten(paths []string) error {
 		}
 		changes = append(changes, map[string]any{"uri": uri, "type": typ})
 	}
-	return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
+	if err := c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes}); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	now := make(map[string][2]int64, len(c.snapshot))
+	for k, v := range c.snapshot {
+		now[k] = v
+	}
+	c.mu.Unlock()
+	c.loadNewDirs(newDirFiles(before, now))
+	return nil
 }
 
 // docPath is absPath for a path that may not exist yet: its directory is resolved instead.
@@ -967,6 +987,7 @@ func (c *Client) Refresh() error {
 	if len(changes) == 0 {
 		return nil
 	}
+	newDirs := newDirFiles(prev, now)
 	for _, ch := range changes {
 		if ch["type"] == 2 {
 			uri := ch["uri"].(string)
@@ -980,7 +1001,60 @@ func (c *Client) Refresh() error {
 			}
 		}
 	}
-	return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
+	if err := c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes}); err != nil {
+		return err
+	}
+	c.loadNewDirs(newDirs)
+	return nil
+}
+
+// loadNewDirs makes gopls load the packages of files created in directories it did not know.
+// gopls only reloads the packages of known directories on didChangeWatchedFiles, so such a file
+// stays invisible to workspace/symbol (even seconds later). Opening it and pulling its diagnostics
+// loads the package synchronously; the document stays open and Refresh keeps it in sync.
+func (c *Client) loadNewDirs(files []string) {
+	for _, p := range files {
+		if uri, err := c.EnsureOpen(p); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = c.Request(ctx, "textDocument/diagnostic", map[string]any{"textDocument": map[string]any{"uri": uri}})
+			cancel()
+		}
+	}
+}
+
+// maxNewDirOpens bounds how many new directories Refresh opens a file in (a big checkout should
+// not turn into thousands of didOpens).
+const maxNewDirOpens = 50
+
+// newDirFiles picks one file in each directory that has watched files now but had none at the last
+// scan. prev == nil (the first scan) yields nothing: gopls loads the initial tree itself.
+func newDirFiles(prev, now map[string][2]int64) []string {
+	if prev == nil {
+		return nil
+	}
+	known := map[string]bool{}
+	for p := range prev {
+		known[filepath.Dir(p)] = true
+	}
+	pick := map[string]string{}
+	for p := range now {
+		d := filepath.Dir(p)
+		if known[d] {
+			continue
+		}
+		if cur, ok := pick[d]; !ok || p < cur {
+			pick[d] = p
+		}
+	}
+	out := make([]string, 0, len(pick))
+	for _, p := range pick {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	if len(out) > maxNewDirOpens {
+		out = out[:maxNewDirOpens]
+	}
+	return out
 }
 
 func (c *Client) openFileFor(uri string) bool {

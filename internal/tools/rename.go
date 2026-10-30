@@ -2,11 +2,15 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
@@ -14,7 +18,6 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/mentions"
-	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
@@ -122,11 +125,14 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	if !token.IsIdentifier(in.NewName) {
 		return nil, toolerr.Inputf("%q is not a valid Go identifier (it must not be a keyword either).", in.NewName)
 	}
+	if in.Name != "" && (in.Line > 0 || in.Column > 0) {
+		return nil, toolerr.Inputf("pass either name or file_path + line + column, not both (line/column would be ignored for name=%q).", in.Name)
+	}
 	var root member
 	var kind int
 	switch {
 	case in.Name != "":
-		sym, err := resolve.Resolve(ctx, w.Client, w.Root, in.Name, in.FilePath)
+		sym, err := resolveSymbol(ctx, w, in.Name, in.FilePath)
 		if err != nil {
 			if dir := packageDir(w.Root, in.Name); dir != "" && strings.HasPrefix(err.Error(), "No symbol found") {
 				return nil, toolerr.Inputf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", in.Name, dir)
@@ -170,9 +176,12 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 				return nil, packageRenameError(w, gosrc.PackageName(src), root.path)
 			}
 		}
-		return nil, err
+		return nil, renameFailure(w, root.path, err)
 	}
 	if rng == nil {
+		if identAt(root.path, root.line, root.col) == "_" {
+			return nil, toolerr.Inputf("_ (the blank identifier) cannot be renamed; it declares nothing. Give the value a name with edit instead.")
+		}
 		return nil, toolerr.Inputf("nothing renameable at %s:%d:%d.", edits.RelativeName(root.path, w.Root), root.line+1, root.col+1)
 	}
 	text, _, err := edits.ReadSource(root.path)
@@ -214,7 +223,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	if len(members) == 1 {
 		we, err := w.Client.Rename(ctx, root.path, root.line+1, root.col+1, in.NewName)
 		if err != nil {
-			return nil, err
+			return nil, renameFailure(w, root.path, err)
 		}
 		by, err := edits.ParseWorkspaceEdit(we)
 		if err != nil {
@@ -249,6 +258,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	desc := fmt.Sprintf("rename %s -> %s", oldName, in.NewName)
 	var notes []string
+	if in.Parameter == "" && gosrc.IsEmbeddedFieldAt(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)) {
+		notes = append(notes, fmt.Sprintf("%s is an embedded field; renaming it also renames the type %s (and every other embedding of it).", oldName, oldName))
+	}
 	if len(linked) > 0 {
 		var lines []string
 		seenLine := map[string]bool{}
@@ -280,9 +292,31 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	// A parameter or local variable is fully resolved by gopls; same-named text elsewhere is unrelated.
 	if in.Parameter == "" && kind != 0 {
-		notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, after, ""), oldName)...)
+		notes = append(notes, mentions.Notes(mentions.FindScoped(w.Root, oldName, after, "", couldRefer(root.path, oldName)), oldName)...)
 	}
 	return edits.NewPlan(desc, changes, notes...), nil
+}
+
+// couldRefer accepts the Go files that could name the symbol declared in declFile: the files of its
+// directory (including ones excluded by build constraints, which the type checker never saw) and,
+// for an exported name, the files importing its package. Elsewhere a same-named identifier is
+// another symbol. nil (no filter) when the package's import path is unknown.
+func couldRefer(declFile, name string) func(path, text string) bool {
+	dir := filepath.Dir(declFile)
+	same := func(path string) bool { return filepath.Dir(path) == dir }
+	if !token.IsExported(name) {
+		return func(path, _ string) bool { return same(path) }
+	}
+	m, err := moduleOf(dir)
+	if err != nil {
+		return nil
+	}
+	ip, err := importPathOf(m, dir)
+	if err != nil {
+		return nil
+	}
+	quoted := strconv.Quote(ip)
+	return func(path, text string) bool { return same(path) || strings.Contains(text, quoted) }
 }
 
 // linkedMembers returns root plus every method that has to change with it: the interface methods it
@@ -306,7 +340,7 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 		d, err := gosrc.FindDeclAt(m.path, text, edits.Offset(text, m.line, m.col))
 		return err == nil && d.Keyword == "func" && d.Method
 	}
-	var blockers []string
+	var blockers, hidden []string
 	for i := 0; i < len(members); i++ {
 		m := members[i]
 		locs, err := w.Client.Implementation(ctx, m.path, m.line+1, m.col+1)
@@ -322,7 +356,12 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 			seen[n.key()] = true
 			if !w.inWorkspace(n.path) {
 				if isConcrete {
-					blockers = append(blockers, fmt.Sprintf("%s:%d", edits.RelativeName(n.path, w.Root), n.line+1))
+					label, exported := foreignInterface(n)
+					if exported {
+						blockers = append(blockers, label)
+					} else {
+						hidden = append(hidden, label)
+					}
 				} else {
 					skipped++
 				}
@@ -334,13 +373,20 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 			members = append(members, n)
 		}
 	}
-	if len(blockers) > 0 {
-		shown := strings.Join(blockers[:min(len(blockers), 3)], ", ")
-		if len(blockers) > 3 {
-			shown += fmt.Sprintf(" and %d more", len(blockers)-3)
+	if len(blockers)+len(hidden) > 0 {
+		// Unexported foreign interfaces (the stdlib's private `stringer` copies) are noise next to fmt.Stringer.
+		what := "an interface method of "
+		list := blockers
+		if len(list) == 0 {
+			what, list = "a method of unexported interface(s) ", hidden
 		}
-		return nil, 0, toolerr.Inputf("%s is also an interface method in %s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
-			"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, shown, doing)
+		list = uniqueSorted(list)
+		shown := strings.Join(list[:min(len(list), 3)], ", ")
+		if len(list) > 3 {
+			shown += fmt.Sprintf(" and %d more", len(list)-3)
+		}
+		return nil, 0, toolerr.Inputf("%s is also %s%s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
+			"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, what, shown, doing)
 	}
 	return members, skipped, nil
 }
@@ -380,4 +426,129 @@ func parameterOf(fn member, param string, w *Workspace) (member, error) {
 		return member{}, toolerr.Inputf("the parameters of this function are unnamed or blank.")
 	}
 	return member{}, toolerr.Inputf("no parameter %q; it has: %s.", param, strings.Join(names, ", "))
+}
+
+// identAt is the identifier covering line/col (0-based, UTF-16) in path, or "".
+func identAt(path string, line, col int) string {
+	src, _, err := edits.ReadSource(path)
+	if err != nil {
+		return ""
+	}
+	off := edits.Offset(src, line, col)
+	isID := func(b byte) bool {
+		return b == '_' || b >= '0' && b <= '9' || b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= 0x80
+	}
+	a, b := off, off
+	for a > 0 && isID(src[a-1]) {
+		a--
+	}
+	for b < len(src) && isID(src[b]) {
+		b++
+	}
+	return src[a:b]
+}
+
+var (
+	goplsLocRE      = regexp.MustCompile(`^\s*(\S+\.go):(\d+):(\d+):\s*(.*)$`)
+	goplsConflictRE = regexp.MustCompile(`^conflicts with (\w+) in same block$`)
+)
+
+// renameFailure rewrites gopls' rename refusal ("tool/main.go:6:2: renaming this var ... conflicts with
+// var in same block") with workspace-relative paths and the name of the conflicting declaration.
+func renameFailure(w *Workspace, renamed string, err error) error {
+	var re *lsp.RequestError
+	if !errors.As(err, &re) || re.Code == -1 {
+		return err
+	}
+	var out []string
+	for i, ln := range strings.Split(strings.TrimSpace(re.Message), "\n") {
+		m := goplsLocRE.FindStringSubmatch(ln)
+		if m == nil {
+			out = append(out, strings.TrimSpace(ln))
+			continue
+		}
+		abs := goplsPath(w.Root, renamed, m[1])
+		l, _ := strconv.Atoi(m[2])
+		c, _ := strconv.Atoi(m[3])
+		where := fmt.Sprintf("%s:%s:%s", edits.RelativeName(abs, w.Root), m[2], m[3])
+		msg := m[4]
+		if cm := goplsConflictRE.FindStringSubmatch(msg); cm != nil {
+			msg = fmt.Sprintf("conflicts with %s %s in the same scope", cm[1], identAt(abs, l-1, c-1))
+		}
+		if i == 0 {
+			out = append(out, fmt.Sprintf("Cannot rename: %s: %s", where, strings.TrimPrefix(msg, "renaming this ")))
+		} else {
+			out = append(out, fmt.Sprintf("  %s: %s", where, msg))
+		}
+	}
+	return toolerr.Inputf("%s", strings.Join(out, "\n"))
+}
+
+// goplsPath maps a path from a gopls message (absolute, or relative to some directory gopls chose)
+// to an absolute path in the workspace.
+func goplsPath(root, renamed, p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	// gopls prints "dir/file.go"; conflicts are in the renamed file's package, so look there first.
+	suffix := string(filepath.Separator) + filepath.FromSlash(p)
+	if strings.HasSuffix(renamed, suffix) {
+		return renamed
+	}
+	if near := filepath.Join(filepath.Dir(renamed), filepath.Base(p)); strings.HasSuffix(near, suffix) {
+		if _, err := os.Stat(near); err == nil {
+			return near
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, p)); err == nil {
+		return filepath.Join(root, p)
+	}
+	found := ""
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if found != "" {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && path != root && (exclude.IsDirName(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(path, suffix) {
+			found = path
+		}
+		return nil
+	})
+	if found != "" {
+		return found
+	}
+	return filepath.Join(root, p)
+}
+
+// foreignInterface labels the interface declaring the method at m ("fmt.Stringer"), falling back to
+// its file:line; exported is false for an interface nobody outside its package can name.
+func foreignInterface(m member) (label string, exported bool) {
+	label = fmt.Sprintf("%s:%d", m.path, m.line+1)
+	text, _, err := edits.ReadSource(m.path)
+	if err != nil {
+		return label, true
+	}
+	name := enclosingTypeName(m.path, text, edits.Offset(text, m.line, m.col))
+	if name == "" {
+		return label, true
+	}
+	return gosrc.PackageName(text) + "." + name, token.IsExported(name)
+}
+
+func uniqueSorted(xs []string) []string {
+	out := append([]string(nil), xs...)
+	sort.Strings(out)
+	k := 0
+	for i, x := range out {
+		if i == 0 || x != out[k-1] {
+			out[k] = x
+			k++
+		}
+	}
+	return out[:k]
 }

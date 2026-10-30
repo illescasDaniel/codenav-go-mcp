@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -605,6 +606,34 @@ func TestApplyEditTwice(t *testing.T) {
 	if !strings.Contains(out, "already applied as edit "+editID) || !strings.Contains(out, `undo_edit(id="`+editID+`")`) {
 		t.Errorf("want already-applied message naming the edit id:\n%s", out)
 	}
+	if out := call(t, cs, "undo_edit", nil); !strings.Contains(out, "Reverted") {
+		t.Fatalf("undo_edit:\n%s", out)
+	}
+	out = call(t, cs, "apply_edit", map[string]any{"id": id})
+	if !strings.Contains(out, "has since been undone") || strings.Contains(out, "undo_edit reverts") {
+		t.Errorf("an undone edit must say so:\n%s", out)
+	}
+}
+
+func TestAllowLargeRememberedByPreview(t *testing.T) {
+	cs, root := session(t, nil)
+	for i := 0; i < 41; i++ {
+		writeFile(t, root, fmt.Sprintf("shapes/h%d.go", i), fmt.Sprintf("package shapes\n\nvar h%d = Half\n", i))
+	}
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Half", "new_name": "HalfX", "apply": false})
+	if !strings.Contains(out, "allow_large=true; it touches 42 files") {
+		t.Errorf("preview must say apply_edit needs allow_large:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Half", "new_name": "HalfX", "apply": false, "allow_large": true})
+	if strings.Contains(out, "allow_large=true;") {
+		t.Errorf("no allow_large hint once given:\n%s", out)
+	}
+	if out := call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)}); !strings.Contains(out, "Applied") {
+		t.Fatalf("apply_edit must honour the preview's allow_large:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "shapes/h40.go"), "HalfX") {
+		t.Error("not written")
+	}
 }
 
 func writeFile(t *testing.T, root, rel, content string) {
@@ -675,6 +704,9 @@ func TestRenameForeignInterfaceStillBlocks(t *testing.T) {
 	out := call(t, cs, "rename_symbol", map[string]any{"name": "V.String", "new_name": "Text"})
 	if strings.Contains(out, "Applied") || !strings.Contains(out, "outside the workspace") {
 		t.Fatalf("want refusal:\n%s", out)
+	}
+	if !strings.Contains(out, "fmt.Stringer") || strings.Contains(out, ".stringer") {
+		t.Errorf("want fmt.Stringer named and unexported stringer copies left out:\n%s", out)
 	}
 }
 
@@ -1026,5 +1058,257 @@ func TestDiagnosticsDedupesSameMessageOnLine(t *testing.T) {
 	out = call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/dup2.go"})
 	if n := strings.Count(out, "no new variables"); n != 1 || !strings.Contains(out, "5:2 [error NoNewVar]") {
 		t.Errorf("want the problem once, as the 5:2 error; listed %d times:\n%s", n, out)
+	}
+}
+
+func TestExactNameAmongCappedFuzzyHits(t *testing.T) {
+	cs, root := session(t, nil)
+	// gopls caps workspace/symbol at 100 results and scores "U" no higher than "U0_1", so with this
+	// many fuzzy hits the exact matches are often dropped.
+	for p := 0; p < 4; p++ {
+		var b strings.Builder
+		fmt.Fprintf(&b, "package many%d\n\n", p)
+		for i := 0; i < 200; i++ {
+			fmt.Fprintf(&b, "func U%d_%d() {}\n", p, i)
+		}
+		writeFile(t, root, fmt.Sprintf("many%d/m.go", p), b.String())
+	}
+	writeFile(t, root, "short/s.go", "package short\n\nfunc U() int { return 1 }\n")
+	writeFile(t, root, "usedep/u.go", "package usedep\n\nfunc U() int { return 2 }\n")
+	out := call(t, cs, "symbol_info", map[string]any{"name": "short.U", "include_references": false})
+	if !strings.Contains(out, "short/s.go:3:6") {
+		t.Errorf("short.U must resolve to short/s.go:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "usedep.U", "include_references": false})
+	if !strings.Contains(out, "usedep/u.go:3:6") {
+		t.Errorf("usedep.U must resolve to usedep/u.go:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "U", "include_references": false})
+	if !strings.Contains(out, "2 symbols match") || !strings.Contains(out, "short/s.go") || !strings.Contains(out, "usedep/u.go") {
+		t.Errorf("bare U must be reported as ambiguous:\n%s", out)
+	}
+}
+
+func TestPickUpFilesInNewDirectory(t *testing.T) {
+	cs, root := session(t, nil)
+	if out := call(t, cs, "search_symbol", map[string]any{"query": "Scale"}); !strings.Contains(out, "Scale") {
+		t.Fatalf("baseline:\n%s", out)
+	}
+	writeFile(t, root, "brandnew/x.go", "package brandnew\n\nfunc X1() {}\n")
+	if out := call(t, cs, "symbol_info", map[string]any{"name": "brandnew.X1", "include_references": false}); !strings.Contains(out, "brandnew/x.go:3:6") {
+		t.Errorf("symbol_info must see a file created in a new directory:\n%s", out)
+	}
+	if out := call(t, cs, "search_symbol", map[string]any{"query": "X1"}); !strings.Contains(out, "brandnew/x.go") {
+		t.Errorf("search_symbol must see a file created in a new directory:\n%s", out)
+	}
+}
+
+func TestCallersSkipFunctionValues(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/values.go", `package shapes
+
+func Target() int { return 1 }
+
+type T struct{}
+
+func (T) M() int { return 2 }
+
+var h func() int = Target
+
+func Use() int {
+	f := Target
+	var t T
+	m := t.M
+	defer Target()
+	return f() + h() + m() + Target() + t.M()
+}
+`)
+	out := call(t, cs, "callers", map[string]any{"name": "Target"})
+	if !strings.Contains(out, "Use  [function]") || !strings.Contains(out, "calls at L15, L16") || strings.Contains(out, "L12") || strings.Contains(out, "init") {
+		t.Errorf("only real calls of Target:\n%s", out)
+	}
+	if !strings.Contains(out, "2 non-call reference(s) omitted") {
+		t.Errorf("omitted value uses must be counted:\n%s", out)
+	}
+	out = call(t, cs, "callers", map[string]any{"name": "T.M"})
+	if !strings.Contains(out, "calls at L16") || strings.Contains(out, "L14") || !strings.Contains(out, "1 non-call reference(s) omitted") {
+		t.Errorf("method value is not a call:\n%s", out)
+	}
+}
+
+func TestRenameMentionsOnlyRelatedPackages(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "other/other.go", "package other\n\nconst Half = 2\n\nfunc Use() int { return Half }\n")
+	writeFile(t, root, "shapes/tagged.go", "//go:build ignore\n\npackage shapes\n\nvar tagged = Half\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Half", "new_name": "HalfX", "apply": false})
+	if !strings.Contains(out, "did not link") || !strings.Contains(out, "shapes/tagged.go") {
+		t.Errorf("the build-tag-excluded sibling must be listed:\n%s", out)
+	}
+	if strings.Contains(out, "other/other.go") {
+		t.Errorf("an unrelated package's own Half must not be listed:\n%s", out)
+	}
+}
+
+func TestChangeSignatureManualUsesListedOnce(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/vals.go", "package shapes\n\nvar areaOf = Square{}.Area\n\nvar shapeArea = Shape.Area\n")
+	out := call(t, cs, "change_signature", map[string]any{"name": "Shape.Area", "add": []map[string]any{{"name": "k", "type": "float64", "value": "1"}}, "apply": false})
+	if !strings.Contains(out, "need manual work") {
+		t.Fatalf("value uses must be listed:\n%s", out)
+	}
+	if n := strings.Count(out, "shapes/vals.go:3:"); n != 1 {
+		t.Errorf("each use once, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "2 use(s) need manual work") {
+		t.Errorf("count must match the deduplicated list:\n%s", out)
+	}
+}
+
+func TestRenameKeepsMixedLineEndings(t *testing.T) {
+	cs, root := session(t, nil)
+	const mixed = "package shapes\r\n\nfunc mixedA() int { return 1 }\r\n\nfunc mixedUse() float64 { return Scale(Square{1}, 2, 0) }\n\nfunc mixedB() int { return 2 }\r\n"
+	writeFile(t, root, "shapes/mixed.go", mixed)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "new_name": "Resize", "apply": false})
+	if strings.Contains(out, "-func mixedA") || strings.Contains(out, "-func mixedB") || strings.Contains(out, "-package") {
+		t.Errorf("unchanged lines must stay out of the diff:\n%s", out)
+	}
+	call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)})
+	if got, want := readFile(t, root, "shapes/mixed.go"), strings.Replace(mixed, "Scale", "Resize", 1); got != want {
+		t.Errorf("per-line endings must be kept:\ngot  %q\nwant %q", got, want)
+	}
+}
+
+func TestRenameEmbeddedFieldNote(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/derived.go", "package shapes\n\ntype Base struct{ ID int }\n\ntype Derived struct {\n\tBase\n\tName string\n}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Derived.Base", "new_name": "Root", "apply": false})
+	if !strings.Contains(out, "Base is an embedded field; renaming it also renames the type") {
+		t.Errorf("embedded field rename must say the type follows:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "Derived.Name", "new_name": "Label", "apply": false})
+	if strings.Contains(out, "embedded field") {
+		t.Errorf("a named field is not embedded:\n%s", out)
+	}
+}
+
+func TestMoveIntoPackageMainRefused(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "cmd/tool/main.go", "package main\n\nfunc main() {}\n")
+	out := call(t, cs, "move", map[string]any{"name": "Scale", "to_file": "cmd/tool/scale.go"})
+	if !strings.Contains(out, "destination is package main") || !strings.Contains(out, "app/app.go") {
+		t.Errorf("moving a used symbol into package main must be refused with the reason:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "cmd/tool/scale.go")); err == nil {
+		t.Error("nothing must be written")
+	}
+}
+
+func TestNotFoundHints(t *testing.T) {
+	cs, root := session(t, nil)
+	cases := map[string]string{
+		"fmt.Println":    "standard library",
+		"len":            "Go builtin",
+		"shapes":         "is a package (directory shapes)",
+		"Square.Nope":    "type Square declares no Nope (methods promoted",
+		"shapes.Nope":    "package shapes declares no Nope",
+		"zzpkg.Thing":    "no type or package named zzpkg",
+		"NoSuchThingZZZ": "struct fields and methods are named Type.Name",
+	}
+	for name, want := range cases {
+		out := call(t, cs, "symbol_info", map[string]any{"name": name})
+		if !strings.Contains(out, want) {
+			t.Errorf("%s: want %q in:\n%s", name, want, out)
+		}
+		if want != cases["Square.Nope"] && strings.Contains(out, "promoted through embedding") {
+			t.Errorf("%s: the embedding hint is irrelevant here:\n%s", name, out)
+		}
+	}
+	writeFile(t, root, "sub/go.mod", "module example.com/sub\n\ngo 1.24\n")
+	writeFile(t, root, "sub/s.go", "package sub\n\nfunc SubOnly() {}\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() {}", "new_string": "func SubOnly() int { return 1 }"})
+	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "not type-checked") {
+		t.Errorf("an edit in a nested module must say its importers are not checked:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})
+	if !strings.Contains(out, "example.com/sub (sub)") || !strings.Contains(out, "go.work") {
+		t.Errorf("a failed lookup must mention the uncovered nested module:\n%s", out)
+	}
+	writeFile(t, root, "go.work", "go 1.24\n\nuse (\n\t.\n\t./sub\n)\n")
+	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})
+	if strings.Contains(out, "example.com/sub") {
+		t.Errorf("a module listed in go.work is covered:\n%s", out)
+	}
+}
+
+func TestQuickFixChoiceWithoutMatch(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/stub.go", "package shapes\n\ntype Stub struct{}\n\nvar _ Shape = Stub{}\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/stub.go", "choice": "zzz"})
+	if !strings.Contains(out, `No fix matches choice="zzz"`) || !strings.Contains(out, "Offered:") || strings.Contains(readFile(t, root, "shapes/stub.go"), "Area()") {
+		t.Errorf("an unmatched choice must change nothing and list the titles:\n%s", out)
+	}
+}
+
+func TestQuickFixUnusedVariable(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc unusedVar() {\n\tx := 1\n}\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	if !strings.Contains(out, "no fix for an unused local variable") || !strings.Contains(readFile(t, root, "shapes/unused.go"), "x := 1") {
+		t.Errorf("want an explanation and no change, got:\n%s", out)
+	}
+}
+
+func TestRenameNameWithPositionRefused(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Square", "new_name": "Box", "file_path": "shapes/shapes.go", "line": 3, "column": 1})
+	if !strings.Contains(out, "not both") {
+		t.Errorf("want a refusal for name plus line/column, got:\n%s", out)
+	}
+}
+
+func TestRenameFriendlyRefusals(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "cmd/tool/main.go", "package main\n\nfunc main() {\n\tvar _ int\n\ta, b := 1, 2\n\t_, _ = a, b\n}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "cmd/tool/main.go", "line": 4, "column": 6, "new_name": "zz"})
+	if !strings.Contains(out, "_ (the blank identifier) cannot be renamed") {
+		t.Errorf("blank identifier: got\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"file_path": "cmd/tool/main.go", "line": 5, "column": 2, "new_name": "b"})
+	if !strings.Contains(out, "cmd/tool/main.go:5:5: conflicts with var b in the same scope") || strings.Contains(out, "LSP error") {
+		t.Errorf("conflict: got\n%s", out)
+	}
+	// gopls prints "app/app.go" here; the fixture's root app/app.go must not be mistaken for it.
+	writeFile(t, root, "cmd/app/app.go", "package app\n\nfunc Helper() {}\n\nvar Other = 1\n")
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "Helper", "file_path": "cmd/app/app.go", "new_name": "Other"})
+	if !strings.Contains(out, "cmd/app/app.go:5:5: conflicts with var Other in the same scope") {
+		t.Errorf("nested path: got\n%s", out)
+	}
+}
+
+func TestMoveToNewFileKeepsBOM(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/bom.go", "\ufeffpackage shapes\n\nfunc Bommed() int { return 1 }\n\nfunc Other() int { return 2 }\n")
+	out := call(t, cs, "move", map[string]any{"name": "Bommed", "to_file": "shapes/bommed.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	if got := readFile(t, root, "shapes/bommed.go"); !strings.HasPrefix(got, "\ufeffpackage shapes") {
+		t.Errorf("new file should keep the source's BOM:\n%q", got)
+	}
+	out = call(t, cs, "move", map[string]any{"name": "Other", "to_file": "geom/other.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("cross-package move:\n%s", out)
+	}
+	if got := readFile(t, root, "geom/other.go"); !strings.HasPrefix(got, "\ufeffpackage geom") {
+		t.Errorf("new file in another package should keep the source's BOM:\n%q", got)
+	}
+}
+
+func TestOutlineNamedBasicTypeIsType(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/color.go", "package shapes\n\ntype Color int\n")
+	out := call(t, cs, "outline", map[string]any{"file_path": "shapes/color.go"})
+	if !strings.Contains(out, "Color  [type]") || strings.Contains(out, "class") {
+		t.Errorf("want Color labelled [type]:\n%s", out)
 	}
 }

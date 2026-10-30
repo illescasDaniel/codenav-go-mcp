@@ -40,3 +40,13 @@ func TestFormatDiagnosticsDedupesKeepingError(t *testing.T) {
 		t.Errorf("got %q", out)
 	}
 }
+
+func TestFormatDiagnosticsSortedByPosition(t *testing.T) {
+	mk := func(line, col int, msg string) lsp.Diagnostic {
+		return lsp.Diagnostic{Range: lsp.Range{Start: lsp.Position{Line: line, Character: col}}, Severity: 1, Message: msg}
+	}
+	out := FormatDiagnostics([]lsp.Diagnostic{mk(9, 0, "third"), mk(2, 5, "second"), mk(2, 1, "first")}, 10)
+	if a, b, c := strings.Index(out, "first"), strings.Index(out, "second"), strings.Index(out, "third"); !(a < b && b < c) {
+		t.Errorf("want line/column order, got:\n%s", out)
+	}
+}

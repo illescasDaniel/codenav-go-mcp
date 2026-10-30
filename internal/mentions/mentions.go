@@ -50,7 +50,7 @@ func codeContext(name string) *regexp.Regexp {
 	return regexp.MustCompile("`" + q + "`|\\[" + q + "\\]|(?:^|[^\\w])" + q + `\(|\.` + q + `(?:[^\w]|$)`)
 }
 
-func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string) []Mention {
+func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string, codeIn func(path, text string) bool) []Mention {
 	lines := strings.Split(text, "\n")
 	var found []Mention
 	fset := token.NewFileSet()
@@ -65,6 +65,9 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string)
 		p := fset.Position(pos)
 		switch {
 		case tok == token.IDENT && lit == name:
+			if codeIn != nil && !codeIn(path, text) {
+				continue
+			}
 			found = append(found, Mention{rel, p.Line, "code", snippet(lines, p.Line)})
 		case tok == token.COMMENT && prose.MatchString(lit):
 			found = append(found, Mention{rel, p.Line, "comment", snippet(lines, p.Line)})
@@ -84,6 +87,12 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string)
 // strings, and docs. after maps an absolute path to its text after the rename; other files are
 // read from disk. only, when set, restricts the scan to that file (parameters and locals).
 func Find(root, name string, after map[string]string, only string) []Mention {
+	return FindScoped(root, name, after, only, nil)
+}
+
+// FindScoped is Find with code mentions limited to the Go files codeIn accepts (the files that could
+// refer to the renamed symbol); comments, strings and docs are still searched everywhere.
+func FindScoped(root, name string, after map[string]string, only string, codeIn func(path, text string) bool) []Mention {
 	word := regexp.MustCompile(`(?:^|[^\w])` + regexp.QuoteMeta(name) + `(?:[^\w]|$)`)
 	prose := word // what counts in comments and text files
 	if shortName(name) {
@@ -133,7 +142,7 @@ func Find(root, name string, after map[string]string, only string) []Mention {
 		}
 		rel := edits.RelativeName(p, root)
 		if isGo {
-			found = append(found, goMentions(p, rel, name, word, prose, text)...)
+			found = append(found, goMentions(p, rel, name, word, prose, text, codeIn)...)
 			return nil
 		}
 		for i, line := range strings.Split(text, "\n") {

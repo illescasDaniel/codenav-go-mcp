@@ -188,7 +188,7 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 		old, _, _ := edits.ReadSource(dest)
 		dc, err = fileChange(dest, destText, &old, destBOM)
 	} else {
-		dc, err = fileChange(dest, destText, nil, false)
+		dc, err = fileChange(dest, destText, nil, l.bom) // and its byte-order mark
 		if err == nil {
 			dc.New = edits.Str(edits.MatchEOL(*dc.New, l.orig)) // a new file takes the line endings of the file it came from
 		}
@@ -477,6 +477,26 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 			})
 		}
 	}
+	if bName == "main" {
+		var importers []string
+		for f, specs := range addImport {
+			for _, sp := range specs {
+				if sp == bPath || sp == ". "+strconv.Quote(bPath) {
+					importers = append(importers, edits.RelativeName(f, w.Root))
+					break
+				}
+			}
+		}
+		if len(importers) > 0 {
+			sort.Strings(importers)
+			more := ""
+			if len(importers) > 3 {
+				more = fmt.Sprintf(" and %d more", len(importers)-3)
+				importers = importers[:3]
+			}
+			refuse("the destination is package main (a program); nothing can import it, but %s use(s) %s", strings.Join(importers, ", ")+more, display)
+		}
+	}
 	anyNeedA := len(needA) > 0
 	if B != nil || anyNeedA || usesM {
 		depsB, depsA := map[string]bool{}, goDeps(w.Root, A.PkgPath)
@@ -608,7 +628,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	if exists {
 		dc, err = fileChange(dest, next, &destText, destBOM)
 	} else {
-		dc, err = fileChange(dest, next, nil, false)
+		dc, err = fileChange(dest, next, nil, l.bom)
 		if err == nil {
 			dc.New = edits.Str(edits.MatchEOL(*dc.New, l.orig))
 		}

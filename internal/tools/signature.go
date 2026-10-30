@@ -10,7 +10,6 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
-	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
@@ -214,7 +213,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	if len(in.Add)+len(in.Remove)+len(in.Reorder) == 0 {
 		return "", toolerr.Inputf("nothing to change: pass add, remove or reorder")
 	}
-	sym, err := resolve.Resolve(ctx, w.Client, w.Root, in.Name, in.FilePath)
+	sym, err := resolveSymbol(ctx, w, in.Name, in.FilePath)
 	if err != nil {
 		return "", err
 	}
@@ -266,6 +265,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 
 	var order []entry
 	var manual []string
+	manualSeen := map[string]bool{} // linked members share references; list each use once
 	calls, dropped := 0, 0
 	for mi, m := range members {
 		fs, err := state(m.path)
@@ -309,15 +309,21 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 			off := edits.Offset(rfs.text, r.Range.Start.Line, r.Range.Start.Character)
 			where := fmt.Sprintf("%s:%d: %s", edits.RelativeName(rfs.path, w.Root), r.Range.Start.Line+1, rfs.parse.Line(off))
 			c := rfs.parse.CallAt(off)
+			addManual := func(why string) {
+				if key := fmt.Sprintf("%s:%d", rfs.path, off); !manualSeen[key] {
+					manualSeen[key] = true
+					manual = append(manual, where+"  ("+why+")")
+				}
+			}
 			switch {
 			case c == nil:
-				manual = append(manual, where+"  (used as a value, not called)")
+				addManual("used as a value, not called")
 				continue
 			case len(c.Args) < fixed || (!variadic && len(c.Args) != fixed):
-				manual = append(manual, where+"  (argument count does not match: f(g()) or a spread of several results)")
+				addManual("argument count does not match: f(g()) or a spread of several results")
 				continue
 			case c.Ellipsis && (!variadic || len(order) == 0 || order[len(order)-1].old != nparams-1):
-				manual = append(manual, where+"  (passes xs... to a variadic parameter that is changing)")
+				addManual("passes xs... to a variadic parameter that is changing")
 				continue
 			}
 			if rfs.seen[c.Start] {
