@@ -177,6 +177,12 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 	default:
 		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
 	}
+	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
+}
+
+// planFile turns the complete new text of one file into a plan: gofmt-ed, line endings and BOM of
+// the old file kept. old/exists describe the file on disk.
+func planFile(abs, desc, next, old string, exists, bom bool, notes ...string) (*edits.EditPlan, error) {
 	formatted, err := gosrc.Format(abs, strings.ReplaceAll(next, "\r\n", "\n"))
 	if err != nil {
 		return nil, err
@@ -189,9 +195,9 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		c.Old, c.OldBOM = &old, bom
 	}
 	if c.IsNoop() {
-		return edits.NewPlan("edit "+in.FilePath, nil), nil
+		return edits.NewPlan(desc, nil), nil
 	}
-	return edits.NewPlan("edit "+in.FilePath, []edits.FileChange{c}), nil
+	return edits.NewPlan(desc, []edits.FileChange{c}, notes...), nil
 }
 
 type applyIn struct {
@@ -218,6 +224,28 @@ func RegisterWrite(s *mcp.Server, h Host) {
 			}
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
 		})
+
+	addWrite(s, h, "edit_symbol", "Replace, insert or delete a top-level func, method, type, const or var by name, type-checked like edit. "+
+		"action=replace: name + source (the complete new definition, doc comment included; one not given is dropped and the result says so). "+
+		"action=insert: source + file_path, position after/before a symbol (name), into a struct or interface (name), or end of the file (default; creates the file). "+
+		"action=delete: name only; refuses while the symbol is used (force=true deletes anyway). imports=[...] adds the imports the new code needs; imports left unused by the edit are dropped. "+
+		"Writes when the new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
+		editSymbol)
+
+	addWrite(s, h, "rename_symbol", "Rename a symbol everywhere it is used (gopls rename), type-checked. Give name (Square.Area, shapes.Scale; file_path narrows) or file_path+line+column (1-indexed). "+
+		"linked=true (default): renaming a method also renames the interface methods it satisfies and every implementation, since gopls leaves those behind and the program would stop compiling. "+
+		"The result lists the linked methods and the places still using the old name (strings, comments, docs). Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
+		func(ctx context.Context, w *Workspace, in renameIn) (string, error) {
+			plan, err := planRename(ctx, w, in)
+			if err != nil {
+				return "", err
+			}
+			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
+		})
+
+	addWrite(s, h, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (add a missing import, remove an unused variable or import, ...). Narrow with line or code. "+
+		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. organize_imports=true instead adds missing and removes unused imports, sorted. Type-checked like edit; undo_edit reverts.",
+		quickFix)
 
 	addWrite(s, h, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
 		func(ctx context.Context, w *Workspace, in applyIn) (string, error) {

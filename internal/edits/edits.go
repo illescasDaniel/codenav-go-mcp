@@ -468,3 +468,18 @@ func MatchEOL(text, like string) string {
 	}
 	return strings.ReplaceAll(text, "\n", eol)
 }
+
+// Offset converts a 0-based LSP position (UTF-16 character) to a byte offset in text.
+func Offset(text string, line, character int) int {
+	return offset(text, lineStarts(text), line, character)
+}
+
+// PositionOf is the inverse of Offset: the 0-based line and UTF-16 character of a byte offset.
+func PositionOf(text string, off int) (line, character int) {
+	if off > len(text) {
+		off = len(text)
+	}
+	line = strings.Count(text[:off], "\n")
+	begin := strings.LastIndex(text[:off], "\n") + 1
+	return line, lsp.Utf16Len(text[begin:off])
+}
