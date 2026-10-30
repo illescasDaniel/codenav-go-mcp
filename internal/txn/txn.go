@@ -177,19 +177,60 @@ func pruneEmptyDirs(path, stop string) {
 type Journal struct {
 	Guard WriteGuard
 
+	// LogDir holds the intent log (see beginIntent); "" disables it.
+	LogDir string
+	// Notify receives out-of-band messages (a degraded log, dropped history); may be nil.
+	Notify func(msg string)
+
 	mu      sync.Mutex
 	entries []*Applied
 	undone  map[string]bool // ids of edits reverted by Undo
 	max     int
 }
 
-func NewJournal(g WriteGuard) *Journal { return &Journal{Guard: g, max: 20} }
+func NewJournal(g WriteGuard) *Journal {
+	return &Journal{Guard: g, max: 20, LogDir: DefaultLogDir(g.Root)}
+}
 
-// Rebind re-targets at another workspace; earlier edits cannot be undone from here.
+func (j *Journal) notify(msg string) {
+	if j.Notify != nil && msg != "" {
+		j.Notify(msg)
+	}
+}
+
+// Rebind re-targets at another workspace; earlier edits cannot be undone from here, which it says.
 func (j *Journal) Rebind(g WriteGuard) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.Guard, j.entries = g, nil
+	if n := len(j.entries); n > 0 {
+		j.notify(fmt.Sprintf("the workspace changed to %s: the undo history of %d edit(s) in %s was dropped and cannot be reverted with undo_edit", g.Root, n, j.Guard.Root))
+	}
+	j.Guard, j.entries, j.undone, j.LogDir = g, nil, nil, DefaultLogDir(g.Root)
+}
+
+// CheckPending reports (through Notify) a write that an earlier run left unfinished.
+func (j *Journal) CheckPending() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if msg := Leftover(j.LogDir, j.Guard.Root); msg != "" {
+		j.notify(msg)
+	}
+}
+
+// Test seams.
+var (
+	restoreFn       = restore
+	afterWritesHook func()
+)
+
+// rollback undoes the written changes, newest first, and names those that could not be restored.
+func (j *Journal) rollback(written []edits.FileChange) (stuck []string) {
+	for i := len(written) - 1; i >= 0; i-- {
+		if restoreFn(written[i]) != nil {
+			stuck = append(stuck, edits.RelativeName(written[i].Path, j.Guard.Root))
+		}
+	}
+	return stuck
 }
 
 func (j *Journal) History() []*Applied {
@@ -232,24 +273,27 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 	if err := j.CheckFresh(p); err != nil {
 		return nil, err
 	}
+	ilog, note := beginIntent(j.LogDir, "apply", p)
+	j.notify(note)
 	var written []edits.FileChange
 	for _, c := range p.Changes {
 		if err := writeChange(c); err != nil {
-			var stuck []string
-			for i := len(written) - 1; i >= 0; i-- {
-				if restore(written[i]) != nil {
-					stuck = append(stuck, edits.RelativeName(written[i].Path, j.Guard.Root))
-				}
-			}
+			ilog.setState("rolling back")
+			stuck := j.rollback(written)
 			msg := fmt.Sprintf("writing %s failed (%v); ", edits.RelativeName(c.Path, j.Guard.Root), err)
 			if len(stuck) > 0 {
 				msg += "COULD NOT RESTORE: " + strings.Join(stuck, ", ")
 			} else {
 				msg += "no changes were kept"
+				ilog.done()
 			}
 			return nil, toolerr.Inputf("%s", msg)
 		}
 		written = append(written, c)
+	}
+	ilog.done()
+	if afterWritesHook != nil {
+		afterWritesHook()
 	}
 	for _, c := range p.Changes {
 		if c.Kind() == "delete" {
@@ -258,7 +302,11 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 	}
 	e := &Applied{ID: newID(), Plan: p, AppliedHashes: map[string]string{}}
 	for _, c := range p.Changes {
-		e.AppliedHashes[c.Path] = edits.FileHash(c.Path)
+		// Hash what we wrote, not what is on disk now: a concurrent writer must not look like ours.
+		e.AppliedHashes[c.Path] = ""
+		if nb := c.NewBytes(); nb != nil {
+			e.AppliedHashes[c.Path] = edits.HashBytes(nb)
+		}
 	}
 	j.entries = append(j.entries, e)
 	if len(j.entries) > j.max {
@@ -308,16 +356,25 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 	if err := j.Guard.CheckPlan(inv, true); err != nil {
 		return nil, err
 	}
+	ilog, note := beginIntent(j.LogDir, "undo", inv)
+	j.notify(note)
 	var written []edits.FileChange
 	for _, c := range inv.Changes {
 		if err := writeChange(c); err != nil {
-			for i := len(written) - 1; i >= 0; i-- {
-				_ = restore(written[i])
+			ilog.setState("rolling back")
+			stuck := j.rollback(written)
+			msg := fmt.Sprintf("undo of %s failed (%v); ", e.ID, err)
+			if len(stuck) > 0 {
+				msg += "COULD NOT RESTORE: " + strings.Join(stuck, ", ")
+			} else {
+				msg += "nothing was reverted"
+				ilog.done()
 			}
-			return nil, toolerr.Inputf("undo of %s failed (%v); nothing was reverted", e.ID, err)
+			return nil, toolerr.Inputf("%s", msg)
 		}
 		written = append(written, c)
 	}
+	ilog.done()
 	for _, c := range inv.Changes {
 		if c.Kind() == "delete" {
 			pruneEmptyDirs(c.Path, j.Guard.Root)

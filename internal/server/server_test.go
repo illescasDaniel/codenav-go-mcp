@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -46,6 +47,7 @@ func session(t *testing.T, env map[string]string) (*mcp.ClientSession, string) {
 	copyTree(t, "../../testdata/fixture", root)
 	t.Setenv(EnvWorkspace, root)
 	t.Setenv(EnvReadOnly, "")
+	t.Setenv(txn.StateDirEnv, t.TempDir())
 	for k, v := range env {
 		t.Setenv(k, v)
 	}
@@ -1310,5 +1312,76 @@ func TestOutlineNamedBasicTypeIsType(t *testing.T) {
 	out := call(t, cs, "outline", map[string]any{"file_path": "shapes/color.go"})
 	if !strings.Contains(out, "Color  [type]") || strings.Contains(out, "class") {
 		t.Errorf("want Color labelled [type]:\n%s", out)
+	}
+}
+
+// An importer the directory move's rewrite does not reach (here: inside a nested git checkout)
+// must show up as a new error, because the moved-away files are gone in the after-state.
+func TestMoveDirectorySeesMissedImporter(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "other/.git", "gitdir: elsewhere\n")
+	writeFile(t, root, "other/use.go", "package other\n\nimport \"example.com/fx/shapes\"\n\nvar _ = shapes.Square{}\n")
+	out := call(t, cs, "move", map[string]any{"file_path": "shapes", "to_file": "geom/shapes"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "+ other/use.go") {
+		t.Fatalf("the missed importer must block the move:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "shapes/shapes.go")); err != nil {
+		t.Fatal("nothing may be moved")
+	}
+}
+
+func TestMoveDirectoryBlankImportMissedImporter(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "other/.git", "gitdir: elsewhere\n")
+	writeFile(t, root, "other/use.go", "package other\n\nimport _ \"example.com/fx/shapes\"\n")
+	out := call(t, cs, "move", map[string]any{"file_path": "shapes", "to_file": "geom/shapes"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "other/use.go") {
+		t.Fatalf("the missed blank importer must block the move:\n%s", out)
+	}
+}
+
+func TestInterruptedWriteIsReportedOnStart(t *testing.T) {
+	cs, root := session(t, nil)
+	dir := txn.DefaultLogDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	entry := fmt.Sprintf(`{"id":"dead","pid":0,"op":"apply","description":"edit two files","started":"2026-01-02T03:04:05Z","state":"writing",
+		"files":[{"path":%q,"kind":"modify","base_hash":"aaaaaaaaaaaaaaaaaaaa","new_hash":"bbbbbbbbbbbbbbbbbbbb"}]}`, filepath.Join(root, "shapes/shapes.go"))
+	if err := os.WriteFile(filepath.Join(dir, "intent.json"), []byte(entry), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, cs, "outline", map[string]any{"file_path": "shapes/shapes.go"})
+	if !strings.Contains(out, "interrupted while applying") || !strings.Contains(out, "shapes/shapes.go") {
+		t.Fatalf("want a notice about the half-written file:\n%s", out)
+	}
+	if out2 := call(t, cs, "outline", map[string]any{"file_path": "shapes/shapes.go"}); strings.Contains(out2, "interrupted") {
+		t.Error("the notice is shown once")
+	}
+}
+
+func TestQuickFixSaysWhatItSkipped(t *testing.T) {
+	cs, root := session(t, nil)
+	var sb strings.Builder
+	sb.WriteString("package shapes\n\nfunc manyUnused() {\n")
+	for i := 0; i < 30; i++ {
+		fmt.Fprintf(&sb, "\tv%d := %d\n", i, i)
+	}
+	sb.WriteString("}\n")
+	writeFile(t, root, "shapes/many.go", sb.String())
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/many.go"})
+	if !strings.Contains(out, "first 25 of 30 diagnostics were examined") || !strings.Contains(out, "v25") || !strings.Contains(out, "v29") {
+		t.Errorf("want the skipped diagnostics named, got:\n%s", out)
+	}
+}
+
+func TestCheckLimitNamesSkippedFiles(t *testing.T) {
+	cs, root := session(t, nil)
+	for i := 0; i < 65; i++ {
+		writeFile(t, root, fmt.Sprintf("shapes/gen%02d.go", i), fmt.Sprintf("package shapes\n\nfunc gen%02d() {}\n", i))
+	}
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "// Shape is a port.", "new_string": "// Shape is a port!", "apply": false})
+	if !strings.Contains(out, "beyond the 60-file limit were not type-checked: ") || !strings.Contains(out, "shapes/gen") {
+		t.Errorf("want the skipped files named, got:\n%s", out)
 	}
 }

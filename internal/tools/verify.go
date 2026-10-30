@@ -60,8 +60,8 @@ func verifyChanges(ctx context.Context, w *Workspace, includeDeps bool) (string,
 		return "", err
 	}
 	out := "Uncommitted changes vs HEAD in " + strconv.Itoa(len(edited)) + " Go file(s).\n" + diagdelta.Format(d, 15)
-	if left > 0 {
-		out += "\n(" + strconv.Itoa(left) + " more dependent file(s) not checked)"
+	if len(left) > 0 {
+		out += "\n(" + leftOutNote(w, left) + ")"
 	}
 	return out, nil
 }

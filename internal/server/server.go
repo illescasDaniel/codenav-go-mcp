@@ -95,8 +95,19 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 		if err := c.Start(ctx); err != nil {
 			return nil, err
 		}
-		m.client, m.sel = c, sel
-		m.journal, m.store = txn.NewJournal(guardFor(sel.Root)), txn.NewPlanStore()
+		m.client = c
+		switch {
+		case m.journal == nil:
+			m.journal, m.store = txn.NewJournal(guardFor(sel.Root)), txn.NewPlanStore()
+			m.journal.Notify = m.board.Post
+			m.journal.CheckPending()
+		case sel.Root != m.sel.Root:
+			m.journal.Rebind(guardFor(sel.Root)) // posts a notice when undo history is dropped
+			m.journal.CheckPending()
+			m.store.Clear()
+		}
+		// Same workspace after a gopls restart: edits and previews are still valid.
+		m.sel = sel
 	}
 	if err := m.client.Refresh(); err != nil {
 		return nil, err

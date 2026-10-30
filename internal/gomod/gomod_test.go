@@ -1,0 +1,98 @@
+package gomod
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeTree(t *testing.T, root string, files map[string]string) {
+	t.Helper()
+	for name, body := range files {
+		p := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func module(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"go.mod":      "module example.com/m\n\ngo 1.21\n",
+		"lib/lib.go":  "package lib\n\nfunc F() {}\n",
+		"app/app.go":  "package app\n",
+		"app/tags.go": "//go:build integration\n\npackage app\n\nimport \"example.com/m/lib\"\n\nfunc G() { lib.F() }\n",
+	})
+	return root
+}
+
+func has(files []string, suffix string) bool {
+	for _, f := range files {
+		if strings.HasSuffix(f, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRelatedHonoursBuildFlags(t *testing.T) {
+	root := module(t)
+	lib := filepath.Join(root, "lib", "lib.go")
+	t.Setenv(EnvBuildFlags, "")
+	if files, _ := Related(context.Background(), root, []string{lib}); has(files, "app/tags.go") {
+		t.Errorf("tagged importer must be invisible without the tag: %v", files)
+	}
+	t.Setenv(EnvBuildFlags, "-tags=integration")
+	if files, _ := Related(context.Background(), root, []string{lib}); !has(files, "app/tags.go") {
+		t.Errorf("tagged importer must be found with -tags=integration: %v", files)
+	}
+}
+
+func TestListIsCachedUntilFilesChange(t *testing.T) {
+	root := module(t)
+	t.Setenv(EnvBuildFlags, "")
+	ctx := context.Background()
+	before := listRuns.Load()
+	if _, err := list(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := list(ctx, root); err != nil {
+		t.Fatal(err)
+	}
+	if n := listRuns.Load() - before; n != 1 {
+		t.Fatalf("second call must hit the cache, go list ran %d times", n)
+	}
+	writeTree(t, root, map[string]string{"app/more.go": "package app\n\nimport \"example.com/m/lib\"\n\nfunc H() { lib.F() }\n"})
+	pkgs, err := list(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := listRuns.Load() - before; n != 2 {
+		t.Fatalf("a new file must invalidate the cache, go list ran %d times", n)
+	}
+	found := false
+	for _, p := range pkgs {
+		for _, f := range p.files() {
+			found = found || strings.HasSuffix(f, "app/more.go")
+		}
+	}
+	if !found {
+		t.Error("stale result: new file missing")
+	}
+	t.Setenv(EnvBuildFlags, "-tags=integration")
+	_, _ = list(ctx, root)
+	if n := listRuns.Load() - before; n != 3 {
+		t.Errorf("changed build flags must invalidate the cache, go list ran %d times", n)
+	}
+}

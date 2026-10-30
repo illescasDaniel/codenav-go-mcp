@@ -9,9 +9,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 )
+
+// EnvBuildFlags are extra build flags (e.g. -tags=integration) gopls runs with; `go list` must see
+// the same ones, or the dependents it finds differ from the ones gopls type-checks.
+const EnvBuildFlags = "CODENAV_GO_MCP_BUILD_FLAGS"
 
 type pkg struct {
 	ImportPath   string
@@ -46,11 +55,92 @@ func (p pkg) importsPkg(path string) bool {
 	return false
 }
 
-// List returns every package of the module(s) under root.
+// listRuns counts real `go list` runs (tests check the cache with it).
+var listRuns atomic.Int64
+
+const listTTL = 2 * time.Minute
+
+var listCache struct {
+	sync.Mutex
+	root, key string
+	at        time.Time
+	pkgs      []pkg
+}
+
+// fingerprint summarizes everything a `go list` result depends on that we can see cheaply: the
+// build flags and GOWORK/GOFLAGS, plus the path, mtime and size of every Go, go.mod and go.work
+// file below root (and the governing go.work). "" means do not cache.
+func fingerprint(root string, flags []string) string {
+	var sb strings.Builder
+	sb.WriteString(strings.Join(flags, " ") + "|" + os.Getenv("GOWORK") + "|" + os.Getenv("GOFLAGS") + "|")
+	add := func(p string) {
+		if st, err := os.Stat(p); err == nil {
+			sb.WriteString(p + ":" + strconv.FormatInt(st.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(st.Size(), 10) + "\n")
+		}
+	}
+	if w := findWork(root); w != "" {
+		add(w)
+	}
+	n := 0
+	ok := true
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && exclude.IsDirName(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if name := d.Name(); strings.HasSuffix(name, ".go") || name == "go.mod" || name == "go.work" || name == "go.sum" {
+			if n++; n > 50000 {
+				ok = false
+				return filepath.SkipAll
+			}
+			if info, err := d.Info(); err == nil {
+				sb.WriteString(p + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10) + "\n")
+			}
+		}
+		return nil
+	})
+	if !ok {
+		return ""
+	}
+	return sb.String()
+}
+
+// list returns every package of the module(s) under root, cached while the files under root, the
+// go.mod/go.work files and the build flags are unchanged (so our own writes and outside edits both
+// invalidate it).
 func list(ctx context.Context, root string) ([]pkg, error) {
+	flags := strings.Fields(os.Getenv(EnvBuildFlags))
+	key := fingerprint(root, flags)
+	if key != "" {
+		listCache.Lock()
+		if listCache.root == root && listCache.key == key && time.Since(listCache.at) < listTTL {
+			pkgs := listCache.pkgs
+			listCache.Unlock()
+			return pkgs, nil
+		}
+		listCache.Unlock()
+	}
+	pkgs, err := runList(ctx, root, flags)
+	if key != "" && err == nil {
+		listCache.Lock()
+		listCache.root, listCache.key, listCache.at, listCache.pkgs = root, key, time.Now(), pkgs
+		listCache.Unlock()
+	}
+	return pkgs, err
+}
+
+func runList(ctx context.Context, root string, flags []string) ([]pkg, error) {
+	listRuns.Add(1)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "list", "-e", "-json=ImportPath,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports", "./...")
+	args := append([]string{"list", "-e"}, flags...)
+	args = append(args, "-json=ImportPath,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports", "./...")
+	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = root
 	var out bytes.Buffer
 	cmd.Stdout = &out

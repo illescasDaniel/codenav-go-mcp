@@ -109,6 +109,17 @@ constraints is invisible to the type check (the response says when an edit touch
 - **New directories:** files written outside the tools are picked up on the next call. A brand-new
   package directory is loaded by opening one of its files, so the first call after creating it can
   take a moment longer.
+- **Crash safety:** before a multi-file write the server records the plan, base hashes and the original
+  files in a log under the user cache directory (`<cache>/codenav-go-mcp/<hash of workspace>/`, never in
+  the tree) and removes it when the write finishes or is rolled back. If the process dies mid-write, the
+  next start posts a notice naming the files that may be half-written and the `cp`/`rm` commands that
+  restore them (the leftover is kept in a `recovered-*` folder there). If the log cannot be written, the
+  edit still goes ahead with a note. Undo history lives in memory only: switching workspaces drops it, and
+  says so.
+- **Moved or deleted files in the type-check:** a deleted file is replaced by its bare `package` clause in
+  the in-memory "after" state (by a `//go:build ignore` stub when the whole directory goes), so importers
+  the rewrite missed show up as errors. Only importers gopls loads under the current GOOS/GOARCH and
+  `CODENAV_GO_MCP_BUILD_FLAGS` are seen.
 - **Not offered by gopls, so not by `quick_fix`:** removing an unused local variable (use `edit`).
 
 ## Which `gopls` runs
@@ -125,7 +136,8 @@ constraints is invisible to the type check (the response says when an edit touch
 | `CODENAV_GO_MCP_WORKSPACE` | unset: follows the client's MCP roots when they name a worktree of the same git repository, else `CLAUDE_PROJECT_DIR`, else the working directory | Pins the project root |
 | `CODENAV_GO_MCP_READ_ONLY` | unset | `1`/`true`: write tools refuse to write |
 | `CODENAV_GO_MCP_GOPLS` | auto | Path to the gopls binary |
-| `CODENAV_GO_MCP_BUILD_FLAGS` | none | Passed to gopls as `buildFlags`, e.g. `-tags=integration` |
+| `CODENAV_GO_MCP_BUILD_FLAGS` | none | Passed to gopls as `buildFlags` and to `go list` (dependents), e.g. `-tags=integration` |
+| `CODENAV_GO_MCP_STATE_DIR` | `<user cache dir>/codenav-go-mcp` | Where the crash-recovery log is kept |
 
 ## Development
 

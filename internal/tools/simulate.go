@@ -2,6 +2,9 @@ package tools
 
 import (
 	"context"
+	"fmt"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,8 +104,9 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 	return d, nil
 }
 
-// FilesToCheck: edited Go files first, then their package siblings and importers (capped).
-func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDependents bool) ([]string, int) {
+// FilesToCheck: edited Go files first, then their package siblings and importers (capped). The
+// second result lists the files left out by the cap.
+func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDependents bool) ([]string, []string) {
 	var goEdited []string
 	for _, p := range edited {
 		if strings.HasSuffix(p, ".go") {
@@ -122,9 +126,56 @@ func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDep
 		}
 	}
 	if len(kept) > CheckLimit {
-		return kept[:CheckLimit], len(kept) - CheckLimit
+		return kept[:CheckLimit], kept[CheckLimit:]
 	}
-	return kept, 0
+	return kept, nil
+}
+
+// leftOutNote says exactly which files the CheckLimit cap skipped.
+func leftOutNote(w *Workspace, left []string) string {
+	var names []string
+	for _, f := range left[:min(len(left), 6)] {
+		names = append(names, edits.RelativeName(f, w.Root))
+	}
+	more := ""
+	if len(left) > len(names) {
+		more = fmt.Sprintf(", +%d more", len(left)-len(names))
+	}
+	return fmt.Sprintf("%d dependent file(s) beyond the %d-file limit were not type-checked: %s%s", len(left), CheckLimit, strings.Join(names, ", "), more)
+}
+
+// packageStub is what a deleted Go file leaves in the type-check: only its package clause, so the
+// package still exists but the file's declarations are gone ("" when the clause cannot be read).
+func packageStub(src string) string {
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, parser.PackageClauseOnly)
+	if err != nil || f.Name == nil {
+		return ""
+	}
+	return "package " + f.Name.Name + "\n"
+}
+
+// ignoreStub excludes a stub from every build. When every file of a directory is going away this
+// makes an import of the package fail ("build constraints exclude all Go files") instead of
+// resolving to an empty package.
+func ignoreStub(stub string) string { return "//go:build ignore\n\n" + stub }
+
+// dirFullyDeleted: the plan removes every Go file of dir and leaves none behind or adds one.
+func dirFullyDeleted(dir string, plan *edits.EditPlan, deleted map[string]bool) bool {
+	for _, c := range plan.Changes {
+		if filepath.Dir(c.Path) == dir && c.Kind() != "delete" {
+			return false
+		}
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") && !deleted[filepath.Join(dir, e.Name())] {
+			return false
+		}
+	}
+	return true
 }
 
 // Simulate shows what applying plan would do to the diagnostics, writing nothing.
@@ -141,19 +192,31 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 		switch c.Kind() {
 		case "delete":
 			deleted[p] = true
+			// gopls would otherwise keep loading the file from disk, so importers of what it
+			// declared would still resolve.
+			if c.Old != nil {
+				if stub := packageStub(*c.Old); stub != "" {
+					after[p] = stub
+				}
+			}
 			continue
 		case "create":
 			created[p] = true
 		}
 		after[p] = *c.New
 	}
+	for p := range deleted {
+		if stub := after[p]; stub != "" && dirFullyDeleted(filepath.Dir(p), plan, deleted) {
+			after[p] = ignoreStub(stub)
+		}
+	}
 	check, leftOut := FilesToCheck(ctx, w, changed, includeDependents)
 	d, err := Delta(ctx, w, nil, after, check, created, deleted)
 	if err != nil {
 		return d, err
 	}
-	if leftOut > 0 {
-		d.Unchecked = append(d.Unchecked, "more dependent file(s) beyond the 60-file limit")
+	if len(leftOut) > 0 {
+		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
 	}
 	for _, p := range changed {
 		if b, err := os.ReadFile(p); err == nil && gomod.HasBuildConstraint(string(b)) {

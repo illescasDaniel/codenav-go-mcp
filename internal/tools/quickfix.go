@@ -81,6 +81,26 @@ var spaceRunRE = regexp.MustCompile(` {2,}`)
 // tidy collapses runs of spaces in a gopls action title for display (matching uses the original).
 func tidy(title string) string { return spaceRunRE.ReplaceAllString(title, " ") }
 
+// quickFixLimit caps how many diagnostics one quick_fix call examines.
+const quickFixLimit = 25
+
+// skippedDiagnostics says which diagnostics a quick_fix call did not look at ("" if it saw all).
+func skippedDiagnostics(wanted []lsp.Diagnostic) string {
+	if len(wanted) <= quickFixLimit {
+		return ""
+	}
+	rest := wanted[quickFixLimit:]
+	var lines []string
+	for _, d := range rest[:min(len(rest), 8)] {
+		lines = append(lines, fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0]))
+	}
+	more := ""
+	if len(rest) > len(lines) {
+		more = fmt.Sprintf("; +%d more", len(rest)-len(lines))
+	}
+	return fmt.Sprintf("\nOnly the first %d of %d diagnostics were examined; not examined: %s%s. Repeat with line=N or code=... (or run again after applying) to reach them.", quickFixLimit, len(wanted), strings.Join(lines, "; "), more)
+}
+
 func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) {
 	abs, err := w.absPath(in.FilePath)
 	if err != nil {
@@ -98,6 +118,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 		return "", toolerr.Inputf("pass either organize_imports or fix_all, not both.")
 	}
 	var importSpecs []string
+	var notes []string
 	if in.OrganizeImports || in.FixAll {
 		kind, clean := "source.organizeImports", "The imports of "+rel+" are already organized."
 		if in.FixAll {
@@ -144,7 +165,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 		}
 		var ambiguous, unfixable, noMatch []string
 		for i, d := range wanted {
-			if i == 25 {
+			if i == quickFixLimit {
 				break
 			}
 			label := fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0])
@@ -206,11 +227,12 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 				ambiguous = append(ambiguous, label+"\n"+strings.Join(opts, "\n"))
 			}
 		}
+		skipped := skippedDiagnostics(wanted)
 		if len(ambiguous) > 0 {
-			return "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  "), nil
+			return "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  ") + skipped, nil
 		}
 		if len(noMatch) > 0 && len(all) == 0 && len(importSpecs) == 0 {
-			return fmt.Sprintf("No fix matches choice=%q; nothing was changed. Offered:\n  %s", in.Choice, strings.Join(noMatch, "\n  ")), nil
+			return fmt.Sprintf("No fix matches choice=%q; nothing was changed. Offered:\n  %s%s", in.Choice, strings.Join(noMatch, "\n  "), skipped), nil
 		}
 		if len(all) == 0 && len(importSpecs) == 0 {
 			hint := ""
@@ -230,9 +252,12 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 					}
 					unfixable = append(unfixable, fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0]))
 				}
-				return fmt.Sprintf("gopls offers no quick fix that changes anything for the %d diagnostic(s): %s.%s", len(wanted), strings.Join(unfixable, "; "), hint), nil
+				return fmt.Sprintf("gopls offers no quick fix that changes anything for the %d diagnostic(s): %s.%s%s", len(wanted), strings.Join(unfixable, "; "), hint, skipped), nil
 			}
-			return "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint, nil
+			return "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint + skipped, nil
+		}
+		if skipped != "" {
+			notes = append(notes, strings.TrimSpace(skipped))
 		}
 	}
 
@@ -274,6 +299,6 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			uniq = append(uniq, t)
 		}
 	}
-	plan := edits.NewPlan("quick_fix "+rel+": "+strings.Join(uniq, "; "), changes)
+	plan := edits.NewPlan("quick_fix "+rel+": "+strings.Join(uniq, "; "), changes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
 }
