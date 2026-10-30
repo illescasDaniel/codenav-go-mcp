@@ -132,29 +132,10 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	// The members that must change together. gopls checks each rename on its own and refuses
 	// to break an interface relationship, so for several members the edits come from references.
 	members := []member{root}
-	seen := map[string]bool{root.key(): true}
 	if flag(in.Linked, true) && kind == methodKind {
-		for i := 0; i < len(members); i++ {
-			m := members[i]
-			locs, err := w.Client.Implementation(ctx, m.path, m.line+1, m.col+1)
-			if err != nil {
-				return nil, err
-			}
-			for _, l := range locs {
-				n := member{lsp.URIToPath(l.URI), l.Range.Start.Line, l.Range.Start.Character}
-				if seen[n.key()] {
-					continue
-				}
-				seen[n.key()] = true
-				if !w.inWorkspace(n.path) {
-					return nil, toolerr.Inputf("%s is also an implementation or interface method in %s, outside the workspace; renaming it would break that relationship. "+
-						"Choose another name, or pass linked=false to rename only this declaration and its uses.", oldName, edits.RelativeName(n.path, w.Root))
-				}
-				if len(members) > maxLinked {
-					return nil, toolerr.Inputf("more than %d linked methods; pass linked=false to rename only this one.", maxLinked)
-				}
-				members = append(members, n)
-			}
+		var err error
+		if members, err = linkedMembers(ctx, w, root, oldName, "renaming it"); err != nil {
+			return nil, err
 		}
 	}
 
@@ -203,4 +184,34 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	notes = append(notes, mentions.Notes(mentions.Find(w.Root, oldName, mentions.CoveredBy(all)), oldName)...)
 	return edits.NewPlan(desc, changes, notes...), nil
+}
+
+// linkedMembers returns root plus every method that has to change with it: the interface methods it
+// satisfies and the implementations of those, transitively (via textDocument/implementation).
+func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing string) ([]member, error) {
+	members := []member{root}
+	seen := map[string]bool{root.key(): true}
+	for i := 0; i < len(members); i++ {
+		m := members[i]
+		locs, err := w.Client.Implementation(ctx, m.path, m.line+1, m.col+1)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range locs {
+			n := member{lsp.URIToPath(l.URI), l.Range.Start.Line, l.Range.Start.Character}
+			if seen[n.key()] {
+				continue
+			}
+			seen[n.key()] = true
+			if !w.inWorkspace(n.path) {
+				return nil, toolerr.Inputf("%s is also an implementation or interface method in %s, outside the workspace; %s would break that relationship. "+
+					"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, edits.RelativeName(n.path, w.Root), doing)
+			}
+			if len(members) > maxLinked {
+				return nil, toolerr.Inputf("more than %d linked methods; pass linked=false (include_overrides=false) to change only this one.", maxLinked)
+			}
+			members = append(members, n)
+		}
+	}
+	return members, nil
 }

@@ -161,3 +161,14 @@ func TestLinkedRename(t *testing.T) {
 		t.Fatalf("interface and every implementation must be renamed:\n%s", src)
 	}
 }
+
+func TestChangeSignature(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "change_signature", map[string]any{"name": "Scale", "remove": []string{"unused"}})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("change_signature:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "app/app.go"), "shapes.Scale(x, 2)") || strings.Contains(readFile(t, root, "shapes/shapes.go"), "unused") {
+		t.Fatal("declaration and call site must both change")
+	}
+}

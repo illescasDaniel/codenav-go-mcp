@@ -180,19 +180,31 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
 }
 
-// planFile turns the complete new text of one file into a plan: gofmt-ed, line endings and BOM of
-// the old file kept. old/exists describe the file on disk.
-func planFile(abs, desc, next, old string, exists, bom bool, notes ...string) (*edits.EditPlan, error) {
+// fileChange turns the complete new text of one file into a change: gofmt-ed, line endings and BOM
+// of the old file kept. old is nil for a new file.
+func fileChange(abs, next string, old *string, bom bool) (edits.FileChange, error) {
 	formatted, err := gosrc.Format(abs, strings.ReplaceAll(next, "\r\n", "\n"))
 	if err != nil {
+		return edits.FileChange{}, err
+	}
+	c := edits.FileChange{Path: abs, NewBOM: bom}
+	if old != nil {
+		formatted = edits.MatchEOL(formatted, *old)
+		c.Old, c.OldBOM = old, bom
+	}
+	c.New = &formatted
+	return c, nil
+}
+
+// planFile is fileChange for a single-file plan. old/exists describe the file on disk.
+func planFile(abs, desc, next, old string, exists, bom bool, notes ...string) (*edits.EditPlan, error) {
+	var oldp *string
+	if exists {
+		oldp = &old
+	}
+	c, err := fileChange(abs, next, oldp, bom)
+	if err != nil {
 		return nil, err
-	}
-	if exists {
-		formatted = edits.MatchEOL(formatted, old)
-	}
-	c := edits.FileChange{Path: abs, New: &formatted, NewBOM: bom}
-	if exists {
-		c.Old, c.OldBOM = &old, bom
 	}
 	if c.IsNoop() {
 		return edits.NewPlan(desc, nil), nil
@@ -246,6 +258,12 @@ func RegisterWrite(s *mcp.Server, h Host) {
 	addWrite(s, h, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (add a missing import, remove an unused variable or import, ...). Narrow with line or code. "+
 		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. organize_imports=true instead adds missing and removes unused imports, sorted. Type-checked like edit; undo_edit reverts.",
 		quickFix)
+
+	addWrite(s, h, "change_signature", "Add, remove or reorder a function's or method's parameters and update every call site. "+
+		"name: Scale, shapes.Scale or Square.Area. add=[{name,type,value,position?}] (value is the argument written at every existing call: Go has no defaults); remove=[names]; reorder=[all remaining names in the new order]; imports=[...] for the added types/values. "+
+		"Call sites come from gopls references. include_overrides (default true) changes an interface method and its implementations together. Uses as a value, f(g()) with several results and xs... to a changing variadic are listed as manual work. "+
+		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
+		changeSignature)
 
 	addWrite(s, h, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
 		func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
