@@ -262,6 +262,9 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if len(j.entries) == 0 {
+		if id != "" {
+			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server", id)
+		}
 		return nil, toolerr.Inputf("nothing to undo: no edits were applied by this server")
 	}
 	idx := len(j.entries) - 1

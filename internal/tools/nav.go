@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -207,6 +208,13 @@ func RegisterNav(s *mcp.Server, h Host) {
 		func(ctx context.Context, w *Workspace, in fileIn) (string, error) {
 			if err := checkGoFile(in.FilePath); err != nil {
 				return "", err
+			}
+			abs := in.FilePath
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(w.Root, abs)
+			}
+			if rel, err := filepath.Rel(w.Root, abs); err != nil || strings.HasPrefix(rel, "..") {
+				return "", toolerr.Inputf("%s is outside the workspace (%s).", in.FilePath, w.Root)
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {

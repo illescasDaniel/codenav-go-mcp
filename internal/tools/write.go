@@ -75,8 +75,7 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	switch {
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
-			id := w.Store.Add(plan)
-			return strings.Join(append(out, "", "Not written: "+err.Error(), "Preview id: "+id), "\n"), nil
+			return strings.Join(append(out, "", "Not written: "+err.Error()), "\n"), nil
 		}
 		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
 		if err != nil {
@@ -95,14 +94,14 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 }
 
 type editIn struct {
-	FilePath          string `json:"file_path" jsonschema:"Go file, relative to the workspace root"`
-	OldString         string `json:"old_string,omitempty"`
-	NewString         string `json:"new_string,omitempty"`
-	ReplaceAll        bool   `json:"replace_all,omitempty"`
-	NewText           string `json:"new_text,omitempty" jsonschema:"complete new file content (also creates a new file)"`
-	Apply             *bool  `json:"apply,omitempty" jsonschema:"default true; false only previews"`
-	MaxNewErrors      *int   `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit"`
-	IncludeDependents *bool  `json:"include_dependents,omitempty" jsonschema:"default true: also type-check importing packages"`
+	FilePath          string  `json:"file_path" jsonschema:"Go file, relative to the workspace root"`
+	OldString         string  `json:"old_string,omitempty"`
+	NewString         *string `json:"new_string,omitempty" jsonschema:"replacement for old_string; pass \"\" to delete the text"`
+	ReplaceAll        bool    `json:"replace_all,omitempty"`
+	NewText           string  `json:"new_text,omitempty" jsonschema:"complete new file content (also creates a new file)"`
+	Apply             *bool   `json:"apply,omitempty" jsonschema:"default true; false only previews"`
+	MaxNewErrors      *int    `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit"`
+	IncludeDependents *bool   `json:"include_dependents,omitempty" jsonschema:"default true: also type-check importing packages"`
 }
 
 func flag(p *bool, def bool) bool {
@@ -162,6 +161,9 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		if !exists {
 			return nil, toolerr.Inputf("%s does not exist; pass new_text to create it.", in.FilePath)
 		}
+		if in.NewString == nil {
+			return nil, toolerr.Inputf("old_string needs new_string; pass new_string=\"\" to delete the text.")
+		}
 		n := strings.Count(old, in.OldString)
 		switch {
 		case n == 0:
@@ -173,7 +175,7 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		if in.ReplaceAll {
 			count = -1
 		}
-		next = strings.Replace(old, in.OldString, edits.MatchEOL(in.NewString, old), count)
+		next = strings.Replace(old, in.OldString, edits.MatchEOL(*in.NewString, old), count)
 	default:
 		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
 	}

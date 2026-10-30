@@ -348,3 +348,27 @@ func TestMoveMethod(t *testing.T) {
 		t.Fatal("method must leave shapes.go")
 	}
 }
+
+func TestSmallRefusals(t *testing.T) {
+	cs, _ := session(t, nil)
+	if out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "Scale"}); !strings.Contains(out, "new_string") {
+		t.Fatalf("old_string without new_string:\n%s", out)
+	}
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "../x.go"}); !strings.Contains(out, "outside the workspace") {
+		t.Fatalf("diagnostics outside:\n%s", out)
+	}
+	if out := call(t, cs, "undo_edit", map[string]any{"id": "zzz"}); !strings.Contains(out, "unknown edit id") {
+		t.Fatalf("undo unknown id:\n%s", out)
+	}
+	if out := call(t, cs, "symbol_info", map[string]any{"name": "Side"}); !strings.Contains(out, "Type.Name") {
+		t.Fatalf("field hint:\n%s", out)
+	}
+}
+
+func TestReadOnlyHasNoPreviewID(t *testing.T) {
+	cs, _ := session(t, map[string]string{EnvReadOnly: "1"})
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "unused int", "new_string": "unused int64"})
+	if !strings.Contains(out, "Not written") || strings.Contains(out, "Preview id") {
+		t.Fatalf("read-only:\n%s", out)
+	}
+}

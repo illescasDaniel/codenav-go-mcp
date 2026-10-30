@@ -19,7 +19,7 @@ type editSymbolIn struct {
 	Action            string   `json:"action" jsonschema:"replace, insert or delete"`
 	Name              string   `json:"name,omitempty" jsonschema:"symbol, e.g. Square.Area or shapes.Scale"`
 	Source            string   `json:"source,omitempty" jsonschema:"the complete new definition (replace, insert)"`
-	FilePath          string   `json:"file_path,omitempty" jsonschema:"narrows name; the target file of an insert"`
+	FilePath          string   `json:"file_path,omitempty" jsonschema:"narrows name; REQUIRED for action=insert: the file the new code goes into"`
 	Position          string   `json:"position,omitempty" jsonschema:"insert: after (default with name), before, into (struct or interface body) or end (default without name)"`
 	Imports           []string `json:"imports,omitempty" jsonschema:"imports the new code needs, e.g. \"strings\" or \"js \\\"encoding/json\\\"\""`
 	Force             bool     `json:"force,omitempty" jsonschema:"delete even when the symbol is still used"`
@@ -290,7 +290,7 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 		return nil, "", err
 	}
 	var notes []string
-	if d.Grouped && strings.Contains(l.text, "iota") {
+	if d.Grouped && strings.Contains(blockText(l.text, d.Start, d.End), "iota") {
 		notes = append(notes, "The block uses iota: the values of the constants after the deleted one shift.")
 	}
 	if len(users) > 0 {
@@ -313,4 +313,21 @@ func carveOut(l *located) (*located, error) {
 	c := *l
 	c.text, c.decl = carved, d
 	return &c, nil
+}
+
+// blockText is the parenthesised const/var/type block around a grouped spec.
+func blockText(text string, start, end int) string {
+	a := strings.LastIndex(text[:start], "\n)")
+	b := strings.LastIndex(text[:start], " (\n")
+	if a > b {
+		b = a
+	}
+	if b < 0 {
+		b = 0
+	}
+	e := strings.Index(text[end:], "\n)")
+	if e < 0 {
+		return text[b:]
+	}
+	return text[b : end+e]
 }

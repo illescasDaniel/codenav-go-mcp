@@ -44,7 +44,7 @@ func planOrder(sig *gosrc.Sig, in changeSigIn) ([]entry, error) {
 	idx := map[string]int{}
 	for i, p := range sig.Params {
 		if p.Name == "" || p.Name == "_" {
-			return nil, toolerr.Inputf("parameter %d has no usable name; name the parameters first (with edit_symbol) or pass them by position", i)
+			return nil, toolerr.Inputf("parameter %d has no usable name; name the parameters first (with edit_symbol)", i)
 		}
 		idx[p.Name] = i
 	}

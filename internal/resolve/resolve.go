@@ -112,6 +112,9 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 	switch len(cands) {
 	case 0:
 		hint := ""
+		if !strings.Contains(query, ".") {
+			hint = " (struct fields and methods are named Type.Name)"
+		}
 		if strings.Contains(query, ".") {
 			hint = " (methods promoted through embedding are not declared symbols; query the embedded type's method instead)"
 		}
