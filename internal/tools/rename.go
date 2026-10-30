@@ -185,9 +185,12 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 
 	if in.Parameter == "" {
-		if d, derr := gosrc.FindDeclAt(root.path, text, edits.Offset(text, root.line, root.col)); derr == nil {
+		if d, derr := gosrc.FindDeclAt(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)); derr == nil {
 			if sp := specialFunc(d, gosrc.PackageName(text)); sp != "" {
 				return nil, toolerr.Inputf("%s is the %s function; renaming it would break the program (go build %s).", oldName, sp, map[string]string{"main": "finds no entry point", "init": "no longer runs it at start-up"}[sp])
+			}
+			if strings.HasSuffix(root.path, "_test.go") && d.Keyword == "func" && !d.Method && isTestFunc(oldName) && !isTestFunc(in.NewName) {
+				return nil, toolerr.Inputf("%s is a test function; %s is not a valid test name, so go test would stop running it (keep the Test/Benchmark/Fuzz/Example prefix followed by an upper-case letter or digit).", oldName, in.NewName)
 			}
 			if in.NewName == "init" && d.Keyword == "func" && !d.Method {
 				return nil, toolerr.Inputf("a top-level func named init is run by the runtime and cannot be called; pick another name.")

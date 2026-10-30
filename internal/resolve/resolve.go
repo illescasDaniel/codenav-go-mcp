@@ -4,6 +4,7 @@ package resolve
 import (
 	"context"
 	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
@@ -49,9 +50,37 @@ func matches(s *lsp.Symbol, q string) int {
 	return best
 }
 
-func matchesFile(s *lsp.Symbol, root, file string) bool {
+// fileTarget turns file_path (relative, ./relative or absolute) into a clean workspace-relative path
+// when it lies inside root; ok reports whether it did.
+func fileTarget(root, file string) (target string, ok bool) {
+	file = strings.ReplaceAll(file, "\\", "/")
+	if filepath.IsAbs(file) {
+		for _, r := range [][2]string{{root, file}, {evalLink(root), evalLink(file)}} {
+			if rel, err := filepath.Rel(r[0], r[1]); err == nil && rel != ".." && !strings.HasPrefix(rel, "../") {
+				return filepath.ToSlash(rel), true
+			}
+		}
+		return path.Clean(file), false
+	}
+	return path.Clean(file), true
+}
+
+func evalLink(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+// matchesFile compares a symbol's file with file_path. exact is true for a path that names the
+// file from the workspace root ("main.go" is the root's main.go, not every main.go); otherwise it
+// accepts a trailing part of the path ("tool/main.go").
+func matchesFile(s *lsp.Symbol, root, file string, exact bool) bool {
 	rel := format.Relative(s.Location.URI, root)
-	target := path.Clean(strings.ReplaceAll(file, "\\", "/"))
+	target, inside := fileTarget(root, file)
+	if exact {
+		return inside && rel == target
+	}
 	return rel == target || strings.HasSuffix(rel, "/"+target) || strings.HasSuffix(target, "/"+rel)
 }
 
@@ -99,9 +128,14 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 	}
 	if file != "" {
 		var narrowed []*lsp.Symbol
-		for _, s := range cands {
-			if matchesFile(s, root, file) {
-				narrowed = append(narrowed, s)
+		for _, exact := range []bool{true, false} {
+			for _, s := range cands {
+				if matchesFile(s, root, file, exact) {
+					narrowed = append(narrowed, s)
+				}
+			}
+			if len(narrowed) > 0 {
+				break
 			}
 		}
 		if len(cands) > 0 && len(narrowed) == 0 {

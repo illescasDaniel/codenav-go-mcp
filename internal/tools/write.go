@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
@@ -154,6 +155,13 @@ func readOnlyDesc(desc string, readOnly bool) string {
 // addWrite registers a tool that may change files.
 func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
+	if readOnly {
+		// Nothing can be applied, so the `apply` switch is not offered either.
+		if sch, err := jsonschema.For[In](nil); err == nil && sch.Properties["apply"] != nil {
+			delete(sch.Properties, "apply")
+			t.InputSchema = sch
+		}
+	}
 	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
 		w, err := h.Acquire(ctx, req.Session)
 		var out string

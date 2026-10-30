@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -852,6 +853,11 @@ func TestReadOnlyHidesApplyAndUndo(t *testing.T) {
 		if tl.Name == "edit" && (strings.Contains(tl.Description, "apply_edit") || strings.Contains(tl.Description, "undo_edit")) {
 			t.Errorf("edit description mentions apply_edit/undo_edit in read-only mode: %s", tl.Description)
 		}
+		if tl.Name == "edit" {
+			if b, _ := json.Marshal(tl.InputSchema); strings.Contains(string(b), `"apply"`) {
+				t.Errorf("read-only edit schema offers apply: %s", b)
+			}
+		}
 	}
 	if names["apply_edit"] || names["undo_edit"] || !names["edit"] || !names["verify_changes"] {
 		t.Errorf("read-only tool list: %v", names)
@@ -864,5 +870,152 @@ func TestReadOnlyHidesApplyAndUndo(t *testing.T) {
 	}
 	if !found {
 		t.Error("a writable server must list apply_edit")
+	}
+}
+
+func TestMainGuardAnyPositionInIdentifier(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package main\n\nfunc main() {}\n\nfunc init() {}\n"
+	writeFile(t, root, "cmd/main.go", src)
+	for _, pos := range []map[string]any{{"line": 3, "column": 6}, {"line": 3, "column": 8}, {"line": 3, "column": 9}, {"line": 5, "column": 8}, {"line": 5, "column": 9}} {
+		args := map[string]any{"file_path": "cmd/main.go", "new_name": "start"}
+		for k, v := range pos {
+			args[k] = v
+		}
+		out := call(t, cs, "rename_symbol", args)
+		if strings.Contains(out, "rename main -> start") || strings.Contains(out, "rename init -> start") || strings.Contains(out, "Applied") ||
+			!(strings.Contains(out, "main function") || strings.Contains(out, "init function")) {
+			t.Errorf("position %v inside main/init must be refused:\n%s", pos, out)
+		}
+	}
+	if readFile(t, root, "cmd/main.go") != src {
+		t.Error("file changed")
+	}
+}
+
+func TestFilePathNarrowsMainAcrossPackages(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "main.go", "package main\n\nfunc main() {}\n")
+	writeFile(t, root, "cmd/a/main.go", "package main\n\nfunc main() { helperA() }\n\nfunc helperA() {}\n")
+	writeFile(t, root, "cmd/tool/main.go", "package main\n\nfunc main() { helperT() }\n\nfunc helperT() {}\n")
+	for _, fp := range []string{"cmd/tool/main.go", "./cmd/tool/main.go", filepath.Join(root, "cmd/tool/main.go"), "main.go", "./main.go", filepath.Join(root, "main.go")} {
+		want := strings.TrimPrefix(strings.TrimPrefix(fp, root+"/"), "./")
+		out := call(t, cs, "symbol_info", map[string]any{"name": "main", "file_path": fp})
+		if strings.Contains(out, "symbols match") || strings.Contains(out, "No symbol") || !strings.Contains(out, want) {
+			t.Errorf("symbol_info file_path=%s:\n%s", fp, out)
+		}
+		out = call(t, cs, "rename_symbol", map[string]any{"name": "main", "file_path": fp, "new_name": "start", "apply": false})
+		if strings.Contains(out, "symbols match") || strings.Contains(out, "No symbol") || !strings.Contains(out, "main function") {
+			t.Errorf("rename_symbol file_path=%s:\n%s", fp, out)
+		}
+		out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "main", "file_path": fp, "source": "func main() { println(1) }", "apply": false})
+		if strings.Contains(out, "symbols match") || strings.Contains(out, "No symbol") || !strings.Contains(out, want) {
+			t.Errorf("edit_symbol file_path=%s:\n%s", fp, out)
+		}
+	}
+	out := call(t, cs, "callers", map[string]any{"name": "main", "file_path": "cmd/tool/main.go"})
+	if strings.Contains(out, "symbols match") {
+		t.Errorf("callers:\n%s", out)
+	}
+}
+
+func TestMoveFuncKeepsTrailingComment(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/g.go", "package shapes\n\nfunc G() int { return 1 } // trailing G\n\nfunc H() int { return 2 }\n")
+	out := call(t, cs, "move", map[string]any{"name": "G", "to_file": "shapes/g2.go"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "shapes/g2.go"), "// trailing G") || strings.Contains(readFile(t, root, "shapes/g.go"), "trailing G") {
+		t.Fatalf("same-package move:\n%s\n%s\n%s", out, readFile(t, root, "shapes/g2.go"), readFile(t, root, "shapes/g.go"))
+	}
+	out = call(t, cs, "move", map[string]any{"name": "G", "to_file": "util/g.go"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "util/g.go"), "// trailing G") || strings.Contains(readFile(t, root, "shapes/g2.go"), "trailing G") {
+		t.Fatalf("cross-package move:\n%s\n%s", out, readFile(t, root, "util/g.go"))
+	}
+	writeFile(t, root, "shapes/k.go", "package shapes\n\nfunc K() int { return 1 } // trailing K\n\nfunc L() int { return 2 } // trailing L\n")
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "K", "source": "func K() int { return 3 }"})
+	if k := readFile(t, root, "shapes/k.go"); !strings.Contains(out, "Applied") || strings.Contains(k, "trailing K") || !strings.Contains(k, "trailing L") || !strings.Contains(k, "return 3") {
+		t.Fatalf("replace:\n%s\n%s", out, k)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "L"})
+	if k := readFile(t, root, "shapes/k.go"); !strings.Contains(out, "Applied") || strings.Contains(k, "trailing L") || strings.Contains(k, "func L") {
+		t.Fatalf("delete:\n%s\n%s", out, k)
+	}
+}
+
+func TestMoveRewritesDotImports(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "dot/dot.go", "package dot\n\nimport . \"example.com/fx/shapes\"\n\nfunc Make() Square { return Square{Side: 1} }\n")
+	writeFile(t, root, "dot/both.go", "package dot\n\nimport . \"example.com/fx/shapes\"\n\nfunc Both(s Shape) Square { return Square{Side: s.Area()} }\n")
+	out := call(t, cs, "move", map[string]any{"name": "Square", "to_file": "geom/square.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	d := readFile(t, root, "dot/dot.go")
+	if !strings.Contains(d, `. "example.com/fx/geom"`) || strings.Contains(d, "example.com/fx/shapes") {
+		t.Errorf("dot.go:\n%s", d)
+	}
+	b := readFile(t, root, "dot/both.go")
+	if !strings.Contains(b, `. "example.com/fx/geom"`) || !strings.Contains(b, `. "example.com/fx/shapes"`) {
+		t.Errorf("both.go:\n%s", b)
+	}
+}
+
+func TestQuickFixUnresolvableImportMessage(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/bad.go", "package shapes\n\nimport _ \"example.com/nope/missing\"\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/bad.go"})
+	if strings.Contains(out, "for: .") || !strings.Contains(out, "could not import") {
+		t.Errorf("message must name the diagnostic:\n%s", out)
+	}
+}
+
+func TestRenameTestFuncToNonTestName(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package shapes\n\nimport \"testing\"\n\nfunc TestScale(t *testing.T) {}\n"
+	writeFile(t, root, "shapes/shapes_test.go", src)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "TestScale", "new_name": "checkScale"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "go test would stop running it") || readFile(t, root, "shapes/shapes_test.go") != src {
+		t.Fatalf("want refusal:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "TestScale", "new_name": "TestScaleAll"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("valid test rename:\n%s", out)
+	}
+}
+
+func TestImplementationsHidesForeignUnexportedInterfaces(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/circle.go", "package shapes\n\ntype Circle struct{}\n\nfunc (Circle) String() string { return \"c\" }\n")
+	out := call(t, cs, "implementations", map[string]any{"name": "Circle.String"})
+	if strings.Contains(out, "stringer") || !strings.Contains(out, "Stringer") {
+		t.Errorf("want only fmt.Stringer:\n%s", out)
+	}
+}
+
+func TestNavFriendlyKindErrors(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "callers", map[string]any{"name": "Square"})
+	if strings.Contains(out, "LSP error") || !strings.Contains(out, "Square is a type, not a function") {
+		t.Errorf("callers on a type:\n%s", out)
+	}
+	out = call(t, cs, "implementations", map[string]any{"name": "Scale"})
+	if strings.Contains(out, "LSP error") || !strings.Contains(out, "implementations needs an interface") {
+		t.Errorf("implementations on a func:\n%s", out)
+	}
+}
+
+func TestInsertAtEndPreviewDiffIsClean(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "insert", "file_path": "shapes/shapes.go", "source": "func Zed() {}", "apply": false})
+	if strings.Contains(out, "-func Scale") || strings.Contains(out, "-}") || !strings.Contains(out, "+func Zed() {}") {
+		t.Errorf("preview diff touches the old last line:\n%s", out)
+	}
+}
+
+func TestDiagnosticsDedupesSameMessageOnLine(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/dup.go", "package shapes\n\nfunc Dup() int {\n\tx := 1\n\tx := 2\n\treturn x\n}\n")
+	out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/dup.go"})
+	if n := strings.Count(out, "no new variables"); n > 1 {
+		t.Errorf("same problem listed %d times:\n%s", n, out)
 	}
 }

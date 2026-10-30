@@ -293,7 +293,10 @@ func splitLines(s *string) []string {
 	if s == nil || *s == "" {
 		return nil
 	}
-	return strings.SplitAfter(strings.TrimSuffix(*s, "\n"), "\n")
+	// Every line, the last included, ends in "\n": otherwise the last line of a file that gains lines
+	// after it would show as changed (-}/+}) only because it now has a line terminator.
+	parts := strings.SplitAfter(strings.TrimSuffix(*s, "\n")+"\n", "\n")
+	return parts[:len(parts)-1]
 }
 
 type op struct {

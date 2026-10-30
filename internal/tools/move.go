@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -331,7 +332,14 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 					if fd.Doc != nil {
 						start = fd.Doc.Pos()
 					}
-					spans = append(spans, span{file: name, start: off(start), end: off(fd.End()), snippet: len(spans)})
+					end := off(fd.End())
+					for _, cg := range f.Comments { // a trailing comment on the closing line travels with the method
+						if cg.Pos() >= fd.End() && fset.Position(cg.Pos()).Line == fset.Position(fd.End()).Line {
+							end = off(cg.End())
+							break
+						}
+					}
+					spans = append(spans, span{file: name, start: off(start), end: end, snippet: len(spans)})
 				}
 			}
 		}
@@ -364,8 +372,10 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	}
 	fileEdits := map[string][]tedit{}
 	addImport := map[string][]string{}
-	needA := map[int]bool{} // spans that now refer to package A by qualifier
-	usesM := false          // code left in A refers to the moved declaration
+	needA := map[int]bool{}       // spans that now refer to package A by qualifier
+	usesM := false                // code left in A refers to the moved declaration
+	dotMoved := map[string]bool{} // files that dot-import A and use the moved declaration
+	dotOther := map[string]bool{} // files that dot-import A and still use something else from it
 	done := map[string]bool{}
 	where := func(file string, o int) string {
 		t, _, _ := read(file)
@@ -382,6 +392,12 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 			}
 			done[fname] = true
 			handled := map[*ast.Ident]bool{}
+			dotA := false
+			for _, im := range f.Imports {
+				if ip, _ := strconv.Unquote(im.Path.Value); im.Name != nil && im.Name.Name == "." && ip == A.PkgPath {
+					dotA = true
+				}
+			}
 			ast.Inspect(f, func(n ast.Node) bool {
 				switch n := n.(type) {
 				case *ast.SelectorExpr:
@@ -423,6 +439,18 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 						return true
 					}
 					o := off(n.Pos())
+					if dotA && !isA && inSpan(fname, o) < 0 && pkgLevel(obj) {
+						// import . "A": the name is used unqualified, so the file needs the destination instead.
+						if inM(obj.Pos()) {
+							dotMoved[fname] = true
+							if !isB {
+								addImport[fname] = append(addImport[fname], ". "+strconv.Quote(bPath))
+							}
+						} else {
+							dotOther[fname] = true
+						}
+						return true
+					}
 					if sp := inSpan(fname, o); sp >= 0 {
 						switch {
 						case inM(obj.Pos()):
@@ -483,6 +511,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	for f := range fileEdits {
 		files[f] = true
 	}
+	for f := range dotMoved {
+		files[f] = true
+	}
 	for f := range files {
 		text, bom, err := read(f)
 		if err != nil {
@@ -529,6 +560,11 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		next, err := gosrc.EditImports(f, r.next, r.old, addImport[f], true)
 		if err != nil {
 			return nil, err
+		}
+		if dotMoved[f] && !dotOther[f] {
+			if next, err = gosrc.DropImport(f, next, ".", A.PkgPath); err != nil {
+				return nil, err
+			}
 		}
 		old := r.old
 		if f == l.path {

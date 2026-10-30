@@ -208,6 +208,16 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 					hint = " For unused imports use organize_imports=true."
 				}
 			}
+			if len(unfixable) == 0 {
+				// The fixes gopls offered changed nothing (e.g. an import that does not resolve).
+				for i, d := range wanted {
+					if i == 6 {
+						break
+					}
+					unfixable = append(unfixable, fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0]))
+				}
+				return fmt.Sprintf("gopls offers no quick fix that changes anything for the %d diagnostic(s): %s.%s", len(wanted), strings.Join(unfixable, "; "), hint), nil
+			}
 			return "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint, nil
 		}
 	}

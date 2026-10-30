@@ -62,7 +62,15 @@ func FindDeclAt(filename, src string, off int) (*Decl, error) {
 			if d.Recv != nil && len(d.Recv.List) == 1 {
 				recv = recvName(d.Recv.List[0].Type)
 			}
-			return &Decl{Name: d.Name.Name, Keyword: "func", Method: d.Recv != nil, Recv: recv, Start: s, End: at(d.End()), HasDoc: doc, Closing: -1}, nil
+			end := at(d.End())
+			// A func has no trailing-comment field: a comment starting on the line where it ends belongs to it.
+			for _, cg := range f.Comments {
+				if cg.Pos() >= d.End() && fset.Position(cg.Pos()).Line == fset.Position(d.End()).Line {
+					end = at(cg.End())
+					break
+				}
+			}
+			return &Decl{Name: d.Name.Name, Keyword: "func", Method: d.Recv != nil, Recv: recv, Start: s, End: end, HasDoc: doc, Closing: -1}, nil
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				continue
@@ -327,6 +335,23 @@ func EditImports(filename, src, oldSrc string, add []string, prune bool) (string
 		}
 	}
 	if !changed {
+		return src, nil
+	}
+	collapseSingleImports(f)
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, f); err != nil {
+		return "", toolerr.Inputf("cannot print the file after editing imports: %v", err)
+	}
+	return buf.String(), nil
+}
+
+// DropImport removes the import `name "path"` (name "" for a plain import, "." for a dot import).
+func DropImport(filename, src, name, path string) (string, error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return "", err
+	}
+	if !astutil.DeleteNamedImport(fset, f, name, path) {
 		return src, nil
 	}
 	collapseSingleImports(f)

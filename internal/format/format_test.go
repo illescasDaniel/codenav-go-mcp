@@ -30,3 +30,13 @@ func TestCamelInitialsMatch(t *testing.T) {
 		t.Fatal("initials must match")
 	}
 }
+
+func TestFormatDiagnosticsDedupesKeepingError(t *testing.T) {
+	mk := func(sev, col int) lsp.Diagnostic {
+		return lsp.Diagnostic{Range: lsp.Range{Start: lsp.Position{Line: 10, Character: col}}, Severity: sev, Message: "no new variables on left side of :="}
+	}
+	out := FormatDiagnostics([]lsp.Diagnostic{mk(2, 3), mk(1, 1)}, 10)
+	if strings.Count(out, "no new variables") != 1 || !strings.Contains(out, "[error") {
+		t.Errorf("got %q", out)
+	}
+}

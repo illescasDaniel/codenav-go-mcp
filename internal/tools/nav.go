@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -305,6 +310,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			items, err := w.Client.PrepareCallHierarchy(ctx, sym.Rel(w.Root), sym.Line+1, sym.Column+1)
 			if err != nil {
+				if strings.Contains(err.Error(), "is not a function") {
+					return "", toolerr.Inputf("%s is %snot a function; callers needs a function or method.", sym.Name, kindPhrase(sym.Kind))
+				}
 				return "", err
 			}
 			if len(items) == 0 {
@@ -329,13 +337,81 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			locs, err := w.Client.Implementation(ctx, sym.Rel(w.Root), sym.Line+1, sym.Column+1)
 			if err != nil {
+				if strings.Contains(err.Error(), "is a function, not a method") {
+					return "", toolerr.Inputf("%s is a function; implementations needs an interface, a type or an interface method.", sym.Name)
+				}
 				return "", err
 			}
 			if len(locs) == 0 {
 				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
 			}
-			return splitTests(locs, w.Root), nil
+			return splitTests(dropForeignUnexported(locs, w.Root), w.Root), nil
 		})
+}
+
+// dropForeignUnexported removes interfaces declared outside the workspace under an unexported name
+// (the stdlib's `stringer` copies in context or runtime): nobody can name them. It keeps everything
+// when nothing else would remain.
+func dropForeignUnexported(locs []lsp.Location, root string) []lsp.Location {
+	var kept []lsp.Location
+	for _, l := range locs {
+		p := lsp.URIToPath(l.URI)
+		if rel, err := filepath.Rel(root, p); err == nil && !strings.HasPrefix(rel, "..") {
+			kept = append(kept, l)
+			continue
+		}
+		text, _, err := edits.ReadSource(p)
+		if err != nil {
+			kept = append(kept, l)
+			continue
+		}
+		if name := enclosingTypeName(p, text, edits.Offset(text, l.Range.Start.Line, l.Range.Start.Character)); name != "" {
+			if r, _ := utf8.DecodeRuneInString(name); unicode.IsLower(r) || r == '_' {
+				continue
+			}
+		}
+		kept = append(kept, l)
+	}
+	if len(kept) == 0 {
+		return locs
+	}
+	return kept
+}
+
+// enclosingTypeName is the name of the top-level type declaration containing byte offset off ("" if none).
+func enclosingTypeName(filename, src string, off int) string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
+	if err != nil {
+		return ""
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, sp := range g.Specs {
+			if ts, ok := sp.(*ast.TypeSpec); ok && fset.Position(ts.Pos()).Offset <= off && off < fset.Position(ts.End()).Offset {
+				return ts.Name.Name
+			}
+		}
+	}
+	return ""
+}
+
+// kindPhrase describes an LSP symbol kind for "X is a type, not a function".
+func kindPhrase(kind int) string {
+	switch kind {
+	case 5, 11, 23, 26: // class, interface, struct, type parameter
+		return "a type, "
+	case 13:
+		return "a variable, "
+	case 14:
+		return "a constant, "
+	case 8:
+		return "a field, "
+	}
+	return ""
 }
 
 func splitTests(locs []lsp.Location, root string) string {
