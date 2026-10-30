@@ -183,8 +183,8 @@ func TestPlanStore(t *testing.T) {
 func TestPlanStoreAppliedID(t *testing.T) {
 	s := NewPlanStore()
 	id := s.Add(edits.NewPlan("x", nil))
-	s.MarkApplied(id)
-	if _, err := s.Get(id); err == nil || !strings.Contains(err.Error(), "already applied") || !strings.Contains(err.Error(), "undo_edit") {
+	s.MarkApplied(id, "e1")
+	if _, err := s.Get(id); err == nil || !strings.Contains(err.Error(), "already applied") || !strings.Contains(err.Error(), `undo_edit(id="e1")`) {
 		t.Errorf("want an already-applied error, got %v", err)
 	}
 }

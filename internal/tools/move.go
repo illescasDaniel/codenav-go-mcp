@@ -16,6 +16,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
@@ -81,6 +82,35 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 	}
 	if d.Method && filepath.Dir(dest) != filepath.Dir(l.path) {
 		return "", toolerr.Inputf("%s is a method of %s; Go methods must stay in their type's package. Move %s (its methods follow) or pick a file in the same directory.", in.Name, d.Recv, d.Recv)
+	}
+	if sp := specialFunc(d, gosrc.PackageName(l.text)); sp != "" && filepath.Dir(dest) != filepath.Dir(l.path) {
+		return "", toolerr.Inputf("%s is the %s function and must stay in its package; pick a file in the same directory.", in.Name, sp)
+	}
+	srcT, dstT := strings.HasSuffix(l.path, "_test.go"), strings.HasSuffix(dest, "_test.go")
+	if srcT && !dstT && d.Keyword == "func" && !d.Method && isTestFunc(d.Name) {
+		return "", toolerr.Inputf("%s is a test function (Test/Benchmark/Fuzz/Example) and go test only finds those in _test.go files; pick a _test.go destination.", in.Name)
+	}
+	if !srcT && dstT {
+		locs, err := w.Client.References(ctx, l.path, l.sym.Line+1, l.sym.Column+1, false)
+		if err != nil {
+			return "", err
+		}
+		var prod []string
+		for _, r := range locs {
+			p := lsp.URIToPath(r.URI)
+			if strings.HasSuffix(p, "_test.go") {
+				continue
+			}
+			if p == l.path {
+				if off := edits.Offset(l.text, r.Range.Start.Line, r.Range.Start.Character); off >= d.Start && off < d.End {
+					continue // the declaration referring to itself
+				}
+			}
+			prod = append(prod, fmt.Sprintf("%s:%d", edits.RelativeName(p, w.Root), r.Range.Start.Line+1))
+		}
+		if len(prod) > 0 {
+			return "", toolerr.Inputf("%s is used by production code: %s; code in a _test.go file is not part of the normal build.", in.Name, strings.Join(prod[:min(len(prod), 5)], ", "))
+		}
 	}
 	var notes []string
 	if d.Grouped || d.MultiName {
@@ -158,6 +188,9 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 		dc, err = fileChange(dest, destText, &old, destBOM)
 	} else {
 		dc, err = fileChange(dest, destText, nil, false)
+		if err == nil {
+			dc.New = edits.Str(edits.MatchEOL(*dc.New, l.orig)) // a new file takes the line endings of the file it came from
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -540,6 +573,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		dc, err = fileChange(dest, next, &destText, destBOM)
 	} else {
 		dc, err = fileChange(dest, next, nil, false)
+		if err == nil {
+			dc.New = edits.Str(edits.MatchEOL(*dc.New, l.orig))
+		}
 	}
 	if err != nil {
 		return nil, err

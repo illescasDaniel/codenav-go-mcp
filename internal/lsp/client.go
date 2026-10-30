@@ -210,8 +210,13 @@ func (c *Client) Start(ctx context.Context) error {
 				"callHierarchy":      map[string]any{},
 				"typeHierarchy":      map[string]any{},
 				"rename":             map[string]any{"prepareSupport": true},
-				"codeAction": map[string]any{"codeActionLiteralSupport": map[string]any{
-					"codeActionKind": map[string]any{"valueSet": []string{"", "quickfix", "refactor", "source"}}}},
+				// dataSupport + resolveSupport make gopls send lazy fixes as resolvable actions
+				// (edit filled in by codeAction/resolve) instead of command-only ones.
+				"codeAction": map[string]any{
+					"codeActionLiteralSupport": map[string]any{
+						"codeActionKind": map[string]any{"valueSet": []string{"", "quickfix", "refactor", "source"}}},
+					"dataSupport":    true,
+					"resolveSupport": map[string]any{"properties": []string{"edit"}}},
 			},
 			"workspace": map[string]any{"workspaceFolders": true,
 				"didChangeWatchedFiles": map[string]any{"dynamicRegistration": true},

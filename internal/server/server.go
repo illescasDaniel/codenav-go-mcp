@@ -127,13 +127,18 @@ func (m *Manager) Close() {
 // New builds the MCP server with all tools registered.
 func New(version string) (*mcp.Server, *Manager) {
 	m := NewManager()
-	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{
-		Instructions: "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics. " +
-			"Edit it with edit, edit_symbol, rename_symbol, change_signature, move, quick_fix: each type-checks the change in memory first and writes only if it adds no new errors " +
-			"(apply=false previews; apply_edit applies a preview, undo_edit reverts, verify_changes re-checks the workspace).",
-	})
+	readOnly := readOnlyFromEnv()
+	instructions := "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics. " +
+		"Edit it with edit, edit_symbol, rename_symbol, change_signature, move, quick_fix: each type-checks the change in memory first and writes only if it adds no new errors " +
+		"(apply=false previews; apply_edit applies a preview, undo_edit reverts, verify_changes re-checks the workspace)."
+	if readOnly {
+		instructions = "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics. " +
+			"The edit tools (edit, edit_symbol, rename_symbol, change_signature, move, quick_fix) only preview here: this server is read-only, so they type-check the change in memory and show the diff and the new errors, but write nothing. " +
+			"verify_changes re-checks the workspace."
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{Instructions: instructions})
 	tools.RegisterNav(s, m)
-	tools.RegisterWrite(s, m)
+	tools.RegisterWrite(s, m, readOnly)
 	return s, m
 }
 
@@ -148,12 +153,17 @@ func goEnv(name string) string {
 	return strings.TrimSpace(string(out))
 }
 
-func guardFor(root string) txn.WriteGuard {
-	g := txn.WriteGuard{Root: root, MaxFiles: txn.DefaultMaxFiles, Extra: tools.GoGuardRule}
+// readOnlyFromEnv reports whether CODENAV_GO_MCP_READ_ONLY asks for a server that never writes.
+func readOnlyFromEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvReadOnly))) {
 	case "1", "true", "yes", "on":
-		g.ReadOnly = true
+		return true
 	}
+	return false
+}
+
+func guardFor(root string) txn.WriteGuard {
+	g := txn.WriteGuard{Root: root, MaxFiles: txn.DefaultMaxFiles, Extra: tools.GoGuardRule, ReadOnly: readOnlyFromEnv()}
 	for _, d := range []string{goEnv("GOROOT"), goEnv("GOMODCACHE")} {
 		if d != "" {
 			g.NeverWrite = append(g.NeverWrite, d)

@@ -593,8 +593,276 @@ func TestApplyEditTwice(t *testing.T) {
 	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": scaleSig, "new_string": "func Scale(s Shape, k float64)"})
 	id := out[strings.Index(out, `apply_edit(id="`)+len(`apply_edit(id="`):]
 	id = id[:strings.Index(id, `"`)]
-	call(t, cs, "apply_edit", map[string]any{"id": id})
-	if out := call(t, cs, "apply_edit", map[string]any{"id": id}); !strings.Contains(out, "already applied") {
-		t.Errorf("want already-applied message:\n%s", out)
+	applied := call(t, cs, "apply_edit", map[string]any{"id": id})
+	i := strings.Index(applied, "edit id ")
+	if i < 0 {
+		t.Fatalf("not applied:\n%s", applied)
+	}
+	editID := applied[i+len("edit id "):]
+	editID = editID[:strings.Index(editID, ")")]
+	out = call(t, cs, "apply_edit", map[string]any{"id": id})
+	if !strings.Contains(out, "already applied as edit "+editID) || !strings.Contains(out, `undo_edit(id="`+editID+`")`) {
+		t.Errorf("want already-applied message naming the edit id:\n%s", out)
+	}
+}
+
+func writeFile(t *testing.T, root, rel, content string) {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func previewID(t *testing.T, out string) string {
+	t.Helper()
+	i := strings.Index(out, `apply_edit(id="`)
+	if i < 0 {
+		t.Fatalf("no preview id:\n%s", out)
+	}
+	id := out[i+len(`apply_edit(id="`):]
+	return id[:strings.Index(id, `"`)]
+}
+
+func TestRenameKeepsCRLF(t *testing.T) {
+	const crlf = "package shapes\r\n\r\nfunc crlfUse() float64 { return Scale(Square{1}, 2, 0) }\r\n"
+	check := func(t *testing.T, s string) {
+		t.Helper()
+		if strings.Count(s, "\n") != strings.Count(s, "\r\n") || !strings.Contains(s, "Resize") {
+			t.Fatalf("want CRLF kept and renamed:\n%q", s)
+		}
+	}
+	t.Run("apply", func(t *testing.T) {
+		cs, root := session(t, nil)
+		writeFile(t, root, "shapes/crlf.go", crlf)
+		out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "new_name": "Resize"})
+		if !strings.Contains(out, "Applied") {
+			t.Fatal(out)
+		}
+		check(t, readFile(t, root, "shapes/crlf.go"))
+	})
+	t.Run("preview", func(t *testing.T) {
+		cs, root := session(t, nil)
+		writeFile(t, root, "shapes/crlf.go", crlf)
+		out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "new_name": "Resize", "apply": false})
+		call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)})
+		check(t, readFile(t, root, "shapes/crlf.go"))
+	})
+}
+
+func TestRenameInterfaceMethodWithStdlibLookalikes(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/namer.go", "package shapes\n\nimport \"os\"\n\nvar _ = os.Getpid\n\ntype Namer interface{ Name() string }\n\ntype Pt struct{}\n\nfunc (Pt) Name() string { return \"\" }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Namer.Name", "new_name": "Label"})
+	if !strings.Contains(out, "Applied") || strings.Contains(out, "would break that relationship") {
+		t.Fatalf("rename:\n%s", out)
+	}
+	if !strings.Contains(out, "outside the workspace also have") {
+		t.Errorf("want skipped note:\n%s", out)
+	}
+	if s := readFile(t, root, "shapes/namer.go"); strings.Count(s, "Label") != 2 {
+		t.Errorf("want both renamed:\n%s", s)
+	}
+}
+
+func TestRenameForeignInterfaceStillBlocks(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/v.go", "package shapes\n\nimport \"fmt\"\n\ntype V struct{}\n\nfunc (V) String() string { return \"\" }\n\nvar _ fmt.Stringer = V{}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "V.String", "new_name": "Text"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "outside the workspace") {
+		t.Fatalf("want refusal:\n%s", out)
+	}
+}
+
+func TestMainAndInitAreProtected(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package main\n\nfunc main() {}\n\nfunc init() {}\n"
+	writeFile(t, root, "cmd/main.go", src)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "main", "file_path": "cmd/main.go", "new_name": "run"})
+	if strings.Contains(out, "Applied") || readFile(t, root, "cmd/main.go") != src {
+		t.Fatalf("rename main must be refused:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "main", "file_path": "cmd/main.go"})
+	if strings.Contains(out, "Applied") || readFile(t, root, "cmd/main.go") != src {
+		t.Fatalf("delete main must be refused:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "main", "file_path": "cmd/main.go", "source": "func run() {}"})
+	if strings.Contains(out, "Applied") || readFile(t, root, "cmd/main.go") != src {
+		t.Fatalf("replace main with another name must be refused:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "init", "file_path": "cmd/main.go"})
+	if !strings.Contains(out, "Applied") || strings.Contains(readFile(t, root, "cmd/main.go"), "init") {
+		t.Fatalf("delete init must work:\n%s", out)
+	}
+}
+
+func TestDeltaIgnoresAnalyzerNoiseInBrokenPackage(t *testing.T) {
+	cs, root := session(t, nil)
+	src := readFile(t, root, "shapes/consts.go")
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/consts.go", "new_text": src + "\nvar _ int = \"x\"\n", "apply": false})
+	if !strings.Contains(out, "1 new error") {
+		t.Fatalf("want 1 new error:\n%s", out)
+	}
+	for _, sec := range []string{"New:", "Fixed:"} {
+		if i := strings.Index(out, sec); i >= 0 {
+			rest := out[i:]
+			if j := strings.Index(rest, "\n\n"); j >= 0 {
+				rest = rest[:j]
+			}
+			if strings.Contains(rest, "unused") {
+				t.Errorf("%s lists a spurious 'unused' entry:\n%s", sec, out)
+			}
+		}
+	}
+}
+
+func TestBuildConstrainedDuplicates(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/os_a.go", "//go:build linux\n\npackage shapes\n\nfunc OSName() string { return \"l\" }\n")
+	writeFile(t, root, "shapes/os_b.go", "//go:build !linux\n\npackage shapes\n\nfunc OSName() string { return \"o\" }\n")
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "OSName", "source": "func OSName() string { return \"x\" }"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "os_a.go") || !strings.Contains(out, "os_b.go") || !strings.Contains(out, "file_path") {
+		t.Fatalf("want a refusal listing both files:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "OSName", "file_path": "shapes/os_b.go", "source": "x"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "action=replace") {
+		t.Fatalf("delete with source must be refused:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "OSName", "file_path": "shapes/os_b.go", "source": "func OSName() string { return \"x\" }"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "shapes/os_b.go"), `"x"`) || !strings.Contains(readFile(t, root, "shapes/os_a.go"), `"l"`) {
+		t.Fatalf("replace in the unbuilt file:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "OSName", "file_path": "shapes/os_b.go"})
+	if !strings.Contains(out, "Applied") || strings.Contains(readFile(t, root, "shapes/os_b.go"), "OSName") {
+		t.Fatalf("delete in the unbuilt file:\n%s", out)
+	}
+}
+
+func TestChangeSignatureRefusesTestFunc(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package shapes\n\nimport \"testing\"\n\nfunc TestScale(t *testing.T) {}\n"
+	writeFile(t, root, "shapes/shapes_test.go", src)
+	out := call(t, cs, "change_signature", map[string]any{"name": "TestScale", "add": []map[string]any{{"name": "x", "type": "int", "value": "0"}}})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "fixed signature") || readFile(t, root, "shapes/shapes_test.go") != src {
+		t.Fatalf("want refusal:\n%s", out)
+	}
+}
+
+func TestInsertSourceWithPackageClause(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "insert", "file_path": "shapes/extra.go", "source": "package shapes\n\nfunc Extra() int { return 1 }"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "shapes/extra.go"), "func Extra()") {
+		t.Fatalf("new file:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "insert", "file_path": "shapes/extra.go", "source": "package shapes\n\nimport \"strings\"\n\nfunc Up(s string) string { return strings.ToUpper(s) }"})
+	got := readFile(t, root, "shapes/extra.go")
+	if !strings.Contains(out, "Applied") || !strings.Contains(got, `"strings"`) || strings.Count(got, "package ") != 1 {
+		t.Fatalf("existing file:\n%s\n%s", out, got)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "insert", "file_path": "shapes/other.go", "source": "package other\n\nfunc O() {}"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "package other") {
+		t.Fatalf("mismatch must be refused:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "shapes/other.go")); err == nil {
+		t.Fatal("other.go written")
+	}
+}
+
+func TestQuickFixMergesImports(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/imp.go", "package shapes\n\nfunc imp() string { return strings.ToUpper(fmt.Sprint(1)) }\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/imp.go"})
+	got := readFile(t, root, "shapes/imp.go")
+	if !strings.Contains(out, "Applied") || strings.Count(got, "import") != 1 || !strings.Contains(got, `"fmt"`) || !strings.Contains(got, `"strings"`) {
+		t.Fatalf("want one import block with fmt and strings:\n%s\n%s", out, got)
+	}
+}
+
+func TestQuickFixDeclareMissingMethod(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/stub.go", "package shapes\n\ntype Stub struct{}\n\nvar _ Shape = Stub{}\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/stub.go"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "shapes/stub.go"), "Area()") {
+		t.Fatalf("want the stub method declared (resolvable code action):\n%s", out)
+	}
+}
+
+func TestMoveToNewFileKeepsCRLF(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/crlf.go", "package shapes\r\n\r\nfunc Helper() int { return 1 }\r\n")
+	out := call(t, cs, "move", map[string]any{"name": "Helper", "to_file": "shapes/helper.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatal(out)
+	}
+	s := readFile(t, root, "shapes/helper.go")
+	if !strings.Contains(s, "Helper") || strings.Count(s, "\n") != strings.Count(s, "\r\n") {
+		t.Fatalf("new file must be CRLF:\n%q", s)
+	}
+}
+
+func TestMoveTestSemantics(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package shapes\n\nimport \"testing\"\n\nfunc TestScale(t *testing.T) {}\n"
+	writeFile(t, root, "shapes/shapes_test.go", src)
+	out := call(t, cs, "move", map[string]any{"name": "TestScale", "to_file": "shapes/x.go"})
+	if strings.Contains(out, "Applied") || readFile(t, root, "shapes/shapes_test.go") != src {
+		t.Fatalf("test func to non-test file must be refused:\n%s", out)
+	}
+	out = call(t, cs, "move", map[string]any{"name": "Scale", "to_file": "shapes/scale_test.go"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "production code") || !strings.Contains(out, "app/app.go") {
+		t.Fatalf("symbol used by production code into _test.go must be refused:\n%s", out)
+	}
+}
+
+func TestRenamePackageClausePosition(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "shapes/shapes.go", "line": 1, "column": 9, "new_name": "x"})
+	if !strings.Contains(out, "is a package") || !strings.Contains(out, "file_path=shapes") {
+		t.Errorf("want package explanation:\n%s", out)
+	}
+}
+
+func TestEditRefusesSymlinkedDirectory(t *testing.T) {
+	cs, root := session(t, nil)
+	if err := os.Symlink(filepath.Join(root, "shapes"), filepath.Join(root, "shapes_alias")); err != nil {
+		t.Skip(err)
+	}
+	before := readFile(t, root, "shapes/shapes.go")
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes_alias/shapes.go", "old_string": "Side float64", "new_string": "Side float32"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "shapes/shapes.go") || !strings.Contains(out, "symlinked directory") {
+		t.Errorf("want refusal naming the real path:\n%s", out)
+	}
+	if readFile(t, root, "shapes/shapes.go") != before {
+		t.Error("the real file was written")
+	}
+}
+
+func TestReadOnlyHidesApplyAndUndo(t *testing.T) {
+	cs, _ := session(t, map[string]string{EnvReadOnly: "1"})
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, tl := range res.Tools {
+		names[tl.Name] = true
+		if tl.Name == "edit" && (strings.Contains(tl.Description, "apply_edit") || strings.Contains(tl.Description, "undo_edit")) {
+			t.Errorf("edit description mentions apply_edit/undo_edit in read-only mode: %s", tl.Description)
+		}
+	}
+	if names["apply_edit"] || names["undo_edit"] || !names["edit"] || !names["verify_changes"] {
+		t.Errorf("read-only tool list: %v", names)
+	}
+	cs2, _ := session(t, nil)
+	res, _ = cs2.ListTools(context.Background(), nil)
+	found := false
+	for _, tl := range res.Tools {
+		found = found || tl.Name == "apply_edit"
+	}
+	if !found {
+		t.Error("a writable server must list apply_edit")
 	}
 }

@@ -47,10 +47,13 @@ func collect(ctx context.Context, w *Workspace, overlays map[string]string, path
 	return entries, unchecked
 }
 
-func dropHints(es []diagdelta.Entry) []diagdelta.Entry {
+// keepDiagnostics drops the noise from a diagnostics list: info and hints entirely, and warnings
+// (gopls' analyzers, e.g. "unused parameter") in a directory where either side has an error, because
+// gopls does not run analyzers in a package that fails to type-check, so they would flip in and out.
+func keepDiagnostics(es []diagdelta.Entry, errDirs map[string]bool) []diagdelta.Entry {
 	out := es[:0:0]
 	for _, e := range es {
-		if e.Severity != diagdelta.HintSeverity {
+		if e.IsError() || (e.Severity == diagdelta.WarningSeverity && !errDirs[filepath.Dir(e.Path)]) {
 			out = append(out, e)
 		}
 	}
@@ -78,7 +81,15 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 	if err := run(after, skipAfter, &ae, &ua); err != nil {
 		return diagdelta.Delta{}, err
 	}
-	d := diagdelta.Diff(dropHints(be), dropHints(ae))
+	errDirs := map[string]bool{}
+	for _, es := range [][]diagdelta.Entry{be, ae} {
+		for _, e := range es {
+			if e.IsError() {
+				errDirs[filepath.Dir(e.Path)] = true
+			}
+		}
+	}
+	d := diagdelta.Diff(keepDiagnostics(be, errDirs), keepDiagnostics(ae, errDirs))
 	d.FilesChecked = len(check)
 	seen := map[string]bool{}
 	for _, u := range append(ub, ua...) {

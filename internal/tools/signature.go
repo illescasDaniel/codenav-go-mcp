@@ -222,9 +222,22 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		return "", toolerr.Inputf("%s is a %s, not a function or method.", in.Name, lsp.SymbolKindNames[sym.Kind])
 	}
 	root := member{lsp.URIToPath(sym.URI), sym.Line, sym.Column}
+	if sym.Kind == 12 {
+		if text, _, rerr := edits.ReadSource(root.path); rerr == nil {
+			if d, derr := gosrc.FindDeclAt(root.path, text, edits.Offset(text, root.line, root.col)); derr == nil {
+				if strings.HasSuffix(root.path, "_test.go") && !d.Method && isTestFunc(d.Name) {
+					return "", toolerr.Inputf("%s is a test function: go test requires its fixed signature.", in.Name)
+				}
+				if sp := specialFunc(d, gosrc.PackageName(text)); sp != "" {
+					return "", toolerr.Inputf("%s is the %s function: the Go toolchain requires it to take no parameters.", in.Name, sp)
+				}
+			}
+		}
+	}
 	members := []member{root}
+	skipped := 0
 	if sym.Kind == methodKind && flag(in.IncludeOverrides, true) {
-		if members, err = linkedMembers(ctx, w, root, sym.Name, "changing its signature"); err != nil {
+		if members, skipped, err = linkedMembers(ctx, w, root, sym.Name, "changing its signature"); err != nil {
 			return "", err
 		}
 	}
@@ -380,6 +393,9 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	notes = append(notes, importNotes...)
 	if len(members) > 1 {
 		notes = append(notes, fmt.Sprintf("Changed %d interface/implementing method declarations together.", len(members)))
+	}
+	if n := skippedNote(skipped, sym.Name); n != "" {
+		notes = append(notes, n)
 	}
 	if dropped > 0 && len(in.Remove) > 0 {
 		notes = append(notes, fmt.Sprintf("%d argument expression(s) were dropped; check they had no side effects.", dropped))

@@ -110,6 +110,11 @@ func packageDir(root, name string) string {
 	return found
 }
 
+func packageRenameError(w *Workspace, pkg, file string) error {
+	dir := edits.RelativeName(filepath.Dir(file), w.Root)
+	return toolerr.Inputf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", pkg, dir)
+}
+
 // planRename renames the member and, when linked, everything gopls' rename leaves behind that
 // would break the program: implementations of an interface method, and the interface methods a
 // concrete method satisfies, followed transitively.
@@ -136,6 +141,13 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			return nil, err
 		}
 		root = member{abs, in.Line - 1, in.Column - 1}
+		if src, _, rerr := edits.ReadSource(abs); rerr == nil && in.Parameter == "" {
+			if a, b, ok := gosrc.PackageNameRange(src); ok {
+				if off := edits.Offset(src, root.line, root.col); off >= a && off <= b {
+					return nil, packageRenameError(w, src[a:b], abs)
+				}
+			}
+		}
 		if syms, err := w.Client.DocumentSymbol(ctx, abs); err == nil {
 			kind = kindAt(syms, root.line, root.col)
 		}
@@ -153,6 +165,11 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 
 	rng, err := w.Client.PrepareRename(ctx, root.path, root.line+1, root.col+1)
 	if err != nil {
+		if strings.Contains(err.Error(), "can't rename package") {
+			if src, _, rerr := edits.ReadSource(root.path); rerr == nil {
+				return nil, packageRenameError(w, gosrc.PackageName(src), root.path)
+			}
+		}
 		return nil, err
 	}
 	if rng == nil {
@@ -167,12 +184,24 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		return nil, toolerr.Inputf("%s is already called %s.", oldName, in.NewName)
 	}
 
+	if in.Parameter == "" {
+		if d, derr := gosrc.FindDeclAt(root.path, text, edits.Offset(text, root.line, root.col)); derr == nil {
+			if sp := specialFunc(d, gosrc.PackageName(text)); sp != "" {
+				return nil, toolerr.Inputf("%s is the %s function; renaming it would break the program (go build %s).", oldName, sp, map[string]string{"main": "finds no entry point", "init": "no longer runs it at start-up"}[sp])
+			}
+			if in.NewName == "init" && d.Keyword == "func" && !d.Method {
+				return nil, toolerr.Inputf("a top-level func named init is run by the runtime and cannot be called; pick another name.")
+			}
+		}
+	}
+
 	// The members that must change together. gopls checks each rename on its own and refuses
 	// to break an interface relationship, so for several members the edits come from references.
 	members := []member{root}
+	skipped := 0
 	if flag(in.Linked, true) && kind == methodKind {
 		var err error
-		if members, err = linkedMembers(ctx, w, root, oldName, "renaming it"); err != nil {
+		if members, skipped, err = linkedMembers(ctx, w, root, oldName, "renaming it"); err != nil {
 			return nil, err
 		}
 	}
@@ -210,22 +239,35 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	for i := range changes {
 		if c := &changes[i]; c.New != nil && strings.HasSuffix(c.Path, ".go") {
-			if f, err := gosrc.Format(c.Path, *c.New); err == nil {
-				c.New = &f
+			if fc, err := fileChange(c.Path, *c.New, c.Old, c.OldBOM); err == nil {
+				*c = fc
 			}
 		}
 	}
 	desc := fmt.Sprintf("rename %s -> %s", oldName, in.NewName)
 	var notes []string
 	if len(linked) > 0 {
-		lines := make([]string, len(linked))
-		for i, m := range linked {
-			lines[i] = fmt.Sprintf("    %s:%d", edits.RelativeName(m.path, w.Root), m.line+1)
+		var lines []string
+		seenLine := map[string]bool{}
+		for _, m := range linked {
+			l := fmt.Sprintf("    %s:%d", edits.RelativeName(m.path, w.Root), m.line+1)
+			if !seenLine[l] {
+				seenLine[l] = true
+				lines = append(lines, l)
+			}
 		}
 		sort.Strings(lines)
-		notes = append(notes, fmt.Sprintf("Also renamed %d linked method(s) (interface methods and implementations rename together):\n%s", len(linked), strings.Join(lines, "\n")))
+		more := ""
+		if len(lines) > 10 {
+			more = fmt.Sprintf("\n    ... and %d more", len(lines)-10)
+			lines = lines[:10]
+		}
+		notes = append(notes, fmt.Sprintf("Also renamed %d linked method(s) (interface methods and implementations rename together):\n%s%s", len(linked), strings.Join(lines, "\n"), more))
 	} else if kind == methodKind && flag(in.Linked, true) {
 		notes = append(notes, "No interface relationships found for this method.")
+	}
+	if n := skippedNote(skipped, oldName); n != "" {
+		notes = append(notes, n)
 	}
 	after := map[string]string{}
 	for _, c := range changes {
@@ -242,15 +284,33 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 
 // linkedMembers returns root plus every method that has to change with it: the interface methods it
 // satisfies and the implementations of those, transitively (via textDocument/implementation).
-func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing string) ([]member, error) {
-	members := []member{root}
+//
+// A method outside the workspace cannot be changed. When the member being expanded is a concrete
+// method, what gopls returns are interface methods it satisfies: one outside the workspace (fmt.Stringer,
+// error) would break, so the operation is refused. When it is an interface method, what comes back are
+// implementers: those outside the workspace (any stdlib type with a Name() string) are not touched and
+// not expanded; their number is returned as skipped.
+func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing string) (members []member, skipped int, err error) {
+	members = []member{root}
 	seen := map[string]bool{root.key(): true}
+	texts := map[string]string{}
+	concrete := func(m member) bool {
+		text, ok := texts[m.path]
+		if !ok {
+			text, _, _ = edits.ReadSource(m.path)
+			texts[m.path] = text
+		}
+		d, err := gosrc.FindDeclAt(m.path, text, edits.Offset(text, m.line, m.col))
+		return err == nil && d.Keyword == "func" && d.Method
+	}
+	var blockers []string
 	for i := 0; i < len(members); i++ {
 		m := members[i]
 		locs, err := w.Client.Implementation(ctx, m.path, m.line+1, m.col+1)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
+		isConcrete := concrete(m)
 		for _, l := range locs {
 			n := member{lsp.URIToPath(l.URI), l.Range.Start.Line, l.Range.Start.Character}
 			if seen[n.key()] {
@@ -258,16 +318,35 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 			}
 			seen[n.key()] = true
 			if !w.inWorkspace(n.path) {
-				return nil, toolerr.Inputf("%s is also an implementation or interface method in %s, outside the workspace; %s would break that relationship. "+
-					"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, edits.RelativeName(n.path, w.Root), doing)
+				if isConcrete {
+					blockers = append(blockers, fmt.Sprintf("%s:%d", edits.RelativeName(n.path, w.Root), n.line+1))
+				} else {
+					skipped++
+				}
+				continue
 			}
 			if len(members) > maxLinked {
-				return nil, toolerr.Inputf("more than %d linked methods; pass linked=false (include_overrides=false) to change only this one.", maxLinked)
+				return nil, 0, toolerr.Inputf("more than %d linked methods; pass linked=false (include_overrides=false) to change only this one.", maxLinked)
 			}
 			members = append(members, n)
 		}
 	}
-	return members, nil
+	if len(blockers) > 0 {
+		shown := strings.Join(blockers[:min(len(blockers), 3)], ", ")
+		if len(blockers) > 3 {
+			shown += fmt.Sprintf(" and %d more", len(blockers)-3)
+		}
+		return nil, 0, toolerr.Inputf("%s is also an interface method in %s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
+			"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, shown, doing)
+	}
+	return members, skipped, nil
+}
+
+func skippedNote(n int, name string) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d type(s) outside the workspace also have a %s method; they are unaffected.", n, name)
 }
 
 // parameterOf moves root from a function's name to the name of its parameter.

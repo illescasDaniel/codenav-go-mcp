@@ -66,6 +66,12 @@ func (g WriteGuard) CheckPath(path string) error {
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return toolerr.Inputf("%s is outside the workspace %s", path, root)
 	}
+	// A symlinked directory inside the workspace would write the real file under another path
+	// than the one the language server indexes. (A symlinked component of the root itself is fine:
+	// both relative paths agree.)
+	if given, err := filepath.Rel(g.Root, filepath.Clean(path)); err == nil && !strings.HasPrefix(given, "..") && given != rel {
+		return toolerr.Inputf("%s goes through a symlinked directory; use %s", filepath.ToSlash(given), filepath.ToSlash(rel))
+	}
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	for _, p := range parts[:len(parts)-1] {
 		if exclude.IsDirName(p) {
@@ -325,11 +331,11 @@ type PlanStore struct {
 	mu    sync.Mutex
 	ids   []string
 	plans map[string]*edits.EditPlan
-	used  map[string]bool // ids already applied
+	used  map[string]string // preview ids already applied -> the edit id they became
 }
 
 func NewPlanStore() *PlanStore {
-	return &PlanStore{plans: map[string]*edits.EditPlan{}, used: map[string]bool{}}
+	return &PlanStore{plans: map[string]*edits.EditPlan{}, used: map[string]string{}}
 }
 
 func (s *PlanStore) Add(p *edits.EditPlan) string {
@@ -350,8 +356,8 @@ func (s *PlanStore) Get(id string) (*edits.EditPlan, error) {
 	defer s.mu.Unlock()
 	p, ok := s.plans[id]
 	if !ok {
-		if s.used[id] {
-			return nil, toolerr.Inputf("preview %q was already applied; use undo_edit to revert it, or run the edit again", id)
+		if eid, done := s.used[id]; done {
+			return nil, toolerr.Inputf("preview %q was already applied as edit %s; undo_edit(id=%q) reverts it", id, eid, eid)
 		}
 		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s)", id, strings.Join(s.ids, ", "))
 	}
@@ -370,16 +376,16 @@ func (s *PlanStore) Discard(id string) {
 	}
 }
 
-// MarkApplied drops the plan and remembers that its id was consumed.
-func (s *PlanStore) MarkApplied(id string) {
+// MarkApplied drops the plan and remembers that its id was consumed, and as which edit.
+func (s *PlanStore) MarkApplied(id, editID string) {
 	s.Discard(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.used[id] = true
+	s.used[id] = editID
 }
 
 func (s *PlanStore) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.plans, s.ids, s.used = map[string]*edits.EditPlan{}, nil, map[string]bool{}
+	s.plans, s.ids, s.used = map[string]*edits.EditPlan{}, nil, map[string]string{}
 }

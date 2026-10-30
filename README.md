@@ -84,7 +84,7 @@ Safety rules, enforced in code:
 - Every applied edit is undoable unless the files changed afterwards.
 - Code that does not parse is never written. CRLF and BOM are preserved.
 - Edits touching more than 40 files need `allow_large=true`.
-- `CODENAV_GO_MCP_READ_ONLY=1` turns every write into a refusal (previews still work).
+- `CODENAV_GO_MCP_READ_ONLY=1` turns every write into a refusal (previews still work); `apply_edit` and `undo_edit` are not listed.
 
 Positions are 1-indexed; `column` is a UTF-16 offset.
 

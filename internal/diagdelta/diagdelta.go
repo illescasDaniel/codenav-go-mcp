@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	ErrorSeverity = 1
-	HintSeverity  = 4
+	ErrorSeverity   = 1
+	WarningSeverity = 2
+	HintSeverity    = 4
 )
 
 var labels = map[int]string{1: "error", 2: "warning", 3: "info", 4: "hint"}
@@ -190,7 +191,7 @@ func Format(d Delta, limit int) string {
 	ne, fe := len(d.NewErrors()), len(d.FixedErrors())
 	head := fmt.Sprintf("Diagnostics: %d new error(s), %d fixed", ne, fe)
 	if other := len(d.New) - ne; other > 0 {
-		head += fmt.Sprintf(", %d new warning(s)/hint(s)", other)
+		head += fmt.Sprintf(", %d new warning(s)", other)
 	}
 	head += fmt.Sprintf(" (%d file(s) checked, %d unchanged)", d.FilesChecked, d.Unchanged)
 	lines := []string{head}

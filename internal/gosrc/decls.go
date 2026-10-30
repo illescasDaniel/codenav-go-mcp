@@ -114,6 +114,50 @@ func FindDeclAt(filename, src string, off int) (*Decl, error) {
 	return nil, toolerr.Inputf("that symbol is not a top-level func, method, type, const or var (fields and interface methods are changed with edit)")
 }
 
+// FindDeclByName returns the top-level declaration called key (Name, or Recv.Name for a method) and
+// the byte offset of its name; it needs no type information, so it also finds code that is excluded
+// from the current build.
+func FindDeclByName(filename, src, key string) (*Decl, int, error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, decl := range f.Decls {
+		var idents []*ast.Ident
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			name := d.Name.Name
+			if d.Recv != nil && len(d.Recv.List) == 1 {
+				name = recvName(d.Recv.List[0].Type) + "." + name
+			}
+			if name == key {
+				idents = append(idents, d.Name)
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				switch sp := spec.(type) {
+				case *ast.TypeSpec:
+					if sp.Name.Name == key {
+						idents = append(idents, sp.Name)
+					}
+				case *ast.ValueSpec:
+					for _, n := range sp.Names {
+						if n.Name == key {
+							idents = append(idents, n)
+						}
+					}
+				}
+			}
+		}
+		if len(idents) > 0 {
+			off := fset.Position(idents[0].Pos()).Offset
+			d, err := FindDeclAt(filename, src, off)
+			return d, off, err
+		}
+	}
+	return nil, 0, toolerr.Inputf("%s is not declared in %s", key, filename)
+}
+
 // DeclNames lists the names a source snippet declares at top level; methods are "Recv.Name".
 func DeclNames(src string) ([]string, error) {
 	_, f, err := parse("snippet.go", "package p\n"+src)
@@ -179,6 +223,42 @@ func PackageName(src string) string {
 		return ""
 	}
 	return f.Name.Name
+}
+
+// SplitFile splits a complete source file into its import specs (`"os"`, `str "strings"`) and
+// the text after the package clause and the import declarations.
+func SplitFile(filename, src string) (imports []string, body string, err error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return nil, "", err
+	}
+	end := fset.Position(f.Name.End()).Offset
+	for _, decl := range f.Decls {
+		g, ok := decl.(*ast.GenDecl)
+		if !ok || g.Tok != token.IMPORT {
+			break
+		}
+		for _, sp := range g.Specs {
+			is := sp.(*ast.ImportSpec)
+			spec := is.Path.Value
+			if is.Name != nil {
+				spec = is.Name.Name + " " + spec
+			}
+			imports = append(imports, spec)
+		}
+		end = fset.Position(g.End()).Offset
+	}
+	return imports, strings.Trim(src[end:], "\r\n"), nil
+}
+
+// PackageNameRange returns the byte range of the identifier in the package clause (ok=false when src does not parse that far).
+func PackageNameRange(src string) (start, end int, ok bool) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "x.go", src, parser.PackageClauseOnly)
+	if err != nil || f.Name == nil {
+		return 0, 0, false
+	}
+	return fset.Position(f.Name.Pos()).Offset, fset.Position(f.Name.End()).Offset, true
 }
 
 // ParseImportSpec reads `"os"`, `os`, `import "os"` or `str "strings"` into (alias, path).

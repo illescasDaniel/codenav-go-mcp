@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -70,11 +71,13 @@ func finishPlan(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply b
 	if err != nil {
 		return "", err
 	}
-	return conclude(w, plan, delta, apply, maxNew, allowLarge)
+	out, _, err := conclude(w, plan, delta, apply, maxNew, allowLarge)
+	return out, err
 }
 
-func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool) (string, error) {
+func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool) (string, string, error) {
 	var out []string
+	editID := ""
 	out = append(out, plan.Description, plan.Summary(w.Root), "", diagdelta.Format(delta, 15))
 	for _, n := range plan.Notes {
 		out = append(out, "Note: "+n)
@@ -84,12 +87,13 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	switch {
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
-			return strings.Join(append(out, "", "Not written: "+err.Error()), "\n"), nil
+			return strings.Join(append(out, "", "Not written: "+err.Error()), "\n"), "", nil
 		}
 		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
+		editID = e.ID
 		_ = w.Client.NoteWritten(planPaths(plan))
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
 	case apply && readOnly:
@@ -104,7 +108,7 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q) writes it.", id), "", plan.Diff(w.Root, 2, 200))
 	}
-	return strings.Join(out, "\n"), nil
+	return strings.Join(out, "\n"), editID, nil
 }
 
 type editIn struct {
@@ -132,9 +136,24 @@ func limit(p *int) int {
 	return *p
 }
 
+var (
+	applyIDRE  = regexp.MustCompile(` plus an id for apply_edit`)
+	undoTailRE = regexp.MustCompile(`;? undo_edit reverts\.`)
+)
+
+// readOnlyDesc rewrites the tail of a tool description for a read-only server, which has neither
+// apply_edit nor undo_edit.
+func readOnlyDesc(desc string, readOnly bool) string {
+	if !readOnly {
+		return desc
+	}
+	desc = applyIDRE.ReplaceAllString(desc, "")
+	return undoTailRE.ReplaceAllString(desc, " (read-only server: previews only).")
+}
+
 // addWrite registers a tool that may change files.
-func addWrite[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
-	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
+func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
+	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
 	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
 		w, err := h.Acquire(ctx, req.Session)
 		var out string
@@ -245,8 +264,9 @@ type verifyIn struct {
 }
 
 // RegisterWrite registers the edit tools.
-func RegisterWrite(s *mcp.Server, h Host) {
-	addWrite(s, h, "edit", "Edit text in a Go file, type-checked: edit(file_path, old_string, new_string) or edit(file_path, new_text). "+
+// With readOnly, apply_edit and undo_edit are not offered: nothing can be written or reverted.
+func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
+	addWrite(s, h, readOnly, "edit", "Edit text in a Go file, type-checked: edit(file_path, old_string, new_string) or edit(file_path, new_text). "+
 		"old_string must match exactly once unless replace_all=true. The result must parse; it is gofmt-ed. Writes when the new errors in the file and the packages importing it stay within max_new_errors (default 0); otherwise nothing is written and the result lists them plus an id for apply_edit. apply=false always previews; undo_edit reverts.",
 		func(ctx context.Context, w *Workspace, in editIn) (string, error) {
 			plan, err := planEdit(w, in)
@@ -256,14 +276,14 @@ func RegisterWrite(s *mcp.Server, h Host) {
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
 		})
 
-	addWrite(s, h, "edit_symbol", "Replace, insert or delete a top-level func, method, type, const or var by name, type-checked like edit. "+
+	addWrite(s, h, readOnly, "edit_symbol", "Replace, insert or delete a top-level func, method, type, const or var by name, type-checked like edit. "+
 		"action=replace: name + source (the complete new definition, doc comment included; one not given is dropped and the result says so). "+
 		"action=insert: source + file_path, position after/before a symbol (name), into a struct or interface (name), or end of the file (default; creates the file). "+
 		"action=delete: name only; refuses while the symbol is used (force=true deletes anyway). imports=[...] adds the imports the new code needs; imports left unused by the edit are dropped. "+
 		"Writes when the new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		editSymbol)
 
-	addWrite(s, h, "rename_symbol", "Rename a symbol everywhere it is used (gopls rename), type-checked. Give name (Square.Area, shapes.Scale; file_path narrows) or file_path+line+column (1-indexed). "+
+	addWrite(s, h, readOnly, "rename_symbol", "Rename a symbol everywhere it is used (gopls rename), type-checked. Give name (Square.Area, shapes.Scale; file_path narrows) or file_path+line+column (1-indexed). "+
 		"linked=true (default): renaming a method also renames the interface methods it satisfies and every implementation, since gopls leaves those behind and the program would stop compiling. "+
 		"The result lists the linked methods and the places still using the old name (strings, comments, docs). Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		func(ctx context.Context, w *Workspace, in renameIn) (string, error) {
@@ -274,54 +294,62 @@ func RegisterWrite(s *mcp.Server, h Host) {
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
 		})
 
-	addWrite(s, h, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (add a missing import, remove an unused variable or import, ...). Narrow with line or code. "+
-		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. organize_imports=true instead adds missing and removes unused imports, sorted. Type-checked like edit; undo_edit reverts.",
+	addWrite(s, h, readOnly, "quick_fix", "Apply gopls' quick fixes for a file's diagnostics (add a missing import, remove an unused variable or import, ...). Narrow with line or code. "+
+		"Several different fixes for one diagnostic: nothing is applied, the options are listed; repeat with choice set to part of a title. Missing imports are added together in one block. organize_imports=true instead adds missing and removes unused imports, sorted; fix_all=true applies gopls' source.fixAll to the whole file. Fixes gopls only offers as a command are reported, not applied. Type-checked like edit; undo_edit reverts.",
 		quickFix)
 
-	addWrite(s, h, "change_signature", "Add, remove or reorder a function's or method's parameters and update every call site. "+
+	addWrite(s, h, readOnly, "change_signature", "Add, remove or reorder a function's or method's parameters and update every call site. "+
 		"name: Scale, shapes.Scale or Square.Area. add=[{name,type,value,position?}] (value is the argument written at every existing call: Go has no defaults); remove=[names]; reorder=[all remaining names in the new order]; imports=[...] for the added types/values. "+
 		"Call sites come from gopls references. include_overrides (default true) changes an interface method and its implementations together. Uses as a value, f(g()) with several results and xs... to a changing variadic are listed as manual work. "+
 		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		changeSignature)
 
-	addWrite(s, h, "move", "Move a top-level func, type, const or var to another file. Same directory: the declaration and the imports only it used move; "+
+	addWrite(s, h, readOnly, "move", "Move a top-level func, type, const or var to another file. Same directory: the declaration and the imports only it used move; "+
 		"another directory (a package, created if missing): a type takes its methods along, package qualifiers are rewritten at every use (shapes.Square -> geom.Square), imports are fixed in every touched file. "+
 		"Without name, file_path is a package directory and to_file its new directory: the .go files move (with the packages below) and every import of the old path is rewritten. "+
 		"Refuses, with the reasons, when the moved code uses unexported identifiers that stay behind, when unexported members are used from outside, or when the move would create an import cycle. "+
 		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		moveSymbol)
 
-	addWrite(s, h, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
-		func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
-			plan, err := w.Store.Get(in.ID)
-			if err != nil {
-				return "", err
-			}
-			if err := w.Journal.CheckFresh(plan); err != nil {
-				return "", err
-			}
-			if err := w.Journal.Guard.CheckPlan(plan, in.AllowLarge); err != nil {
-				return "", err
-			}
-			delta, err := Simulate(ctx, w, plan, true)
-			if err != nil {
-				return "", err
-			}
-			w.Store.MarkApplied(in.ID)
-			return conclude(w, plan, delta, true, -1, in.AllowLarge)
-		})
+	if !readOnly {
+		addWrite(s, h, readOnly, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
+			func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
+				plan, err := w.Store.Get(in.ID)
+				if err != nil {
+					return "", err
+				}
+				if err := w.Journal.CheckFresh(plan); err != nil {
+					return "", err
+				}
+				if err := w.Journal.Guard.CheckPlan(plan, in.AllowLarge); err != nil {
+					return "", err
+				}
+				delta, err := Simulate(ctx, w, plan, true)
+				if err != nil {
+					return "", err
+				}
+				out, editID, err := conclude(w, plan, delta, true, -1, in.AllowLarge)
+				if err != nil {
+					return "", err
+				}
+				if editID != "" {
+					w.Store.MarkApplied(in.ID, editID)
+				}
+				return out, nil
+			})
 
-	addWrite(s, h, "undo_edit", "Revert an applied edit (the latest by default). Refuses when its files changed afterwards.",
-		func(ctx context.Context, w *Workspace, in undoIn) (string, error) {
-			e, err := w.Journal.Undo(in.ID, ReadOnlyEnv)
-			if err != nil {
-				return "", err
-			}
-			_ = w.Client.NoteWritten(planPaths(e.Plan))
-			return fmt.Sprintf("Reverted edit %s: %s\n%s", e.ID, e.Plan.Description, e.Plan.Summary(w.Root)), nil
-		})
+		addWrite(s, h, readOnly, "undo_edit", "Revert an applied edit (the latest by default). Refuses when its files changed afterwards.",
+			func(ctx context.Context, w *Workspace, in undoIn) (string, error) {
+				e, err := w.Journal.Undo(in.ID, ReadOnlyEnv)
+				if err != nil {
+					return "", err
+				}
+				_ = w.Client.NoteWritten(planPaths(e.Plan))
+				return fmt.Sprintf("Reverted edit %s: %s\n%s", e.ID, e.Plan.Description, e.Plan.Summary(w.Root)), nil
+			})
+	}
 
-	addWrite(s, h, "verify_changes", "Diagnostics delta of the uncommitted changes against git HEAD: new vs fixed errors in changed Go files and the packages importing them.",
+	addWrite(s, h, readOnly, "verify_changes", "Diagnostics delta of the uncommitted changes against git HEAD: new vs fixed errors in changed Go files and the packages importing them.",
 		func(ctx context.Context, w *Workspace, in verifyIn) (string, error) {
 			return verifyChanges(ctx, w, flag(in.IncludeDependents, true))
 		})

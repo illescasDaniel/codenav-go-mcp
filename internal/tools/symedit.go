@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
@@ -35,10 +37,72 @@ type located struct {
 	bom        bool
 	sym        resolve.Symbol
 	decl       *gosrc.Decl
+	unbuilt    bool // the file is excluded from the current build (gopls does not know it)
+}
+
+// declKeys are the forms in which a file declares name: "Scale" for shapes.Scale, "Square.Area" for a method.
+func declKeys(name, pkg string) []string {
+	parts := strings.Split(strings.TrimSpace(name), ".")
+	switch len(parts) {
+	case 1:
+		return parts
+	case 2:
+		if parts[0] == pkg {
+			return []string{parts[1], name}
+		}
+		return []string{name}
+	default:
+		return []string{strings.Join(parts[len(parts)-2:], ".")}
+	}
+}
+
+// siblingDecls lists "file:line" for every .go file next to path, of the same package, that declares name.
+// gopls only indexes the files of the current build, so build-constrained twins are invisible to Resolve.
+func siblingDecls(w *Workspace, path, text, name string) []string {
+	pkg := gosrc.PackageName(text)
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	var found []string
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".go" {
+			continue
+		}
+		p := filepath.Join(filepath.Dir(path), e.Name())
+		src := text
+		if p != path {
+			var err error
+			if src, _, err = edits.ReadSource(p); err != nil || gosrc.PackageName(src) != pkg {
+				continue
+			}
+		}
+		for _, k := range declKeys(name, pkg) {
+			if _, off, err := gosrc.FindDeclByName(p, src, k); err == nil {
+				line, _ := edits.PositionOf(src, off)
+				found = append(found, fmt.Sprintf("%s:%d", edits.RelativeName(p, w.Root), line+1))
+				break
+			}
+		}
+	}
+	return found
 }
 
 func locate(ctx context.Context, w *Workspace, name, file string) (*located, error) {
 	sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, file)
+	unbuilt := false
+	if err != nil && file != "" && strings.HasPrefix(err.Error(), "No symbol") {
+		// The file may be excluded from the current build (a build tag): gopls does not index it.
+		if abs, aerr := w.absPath(file); aerr == nil {
+			if text, _, rerr := edits.ReadSource(abs); rerr == nil {
+				for _, k := range declKeys(name, gosrc.PackageName(text)) {
+					if d, off, derr := gosrc.FindDeclByName(abs, text, k); derr == nil {
+						line, col := edits.PositionOf(text, off)
+						sym = resolve.Symbol{Name: d.Name, URI: lsp.PathToURI(abs), Line: line, Column: col}
+						err, unbuilt = nil, true
+						break
+					}
+				}
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -50,11 +114,43 @@ func locate(ctx context.Context, w *Workspace, name, file string) (*located, err
 	if err != nil {
 		return nil, err
 	}
+	if file == "" {
+		if where := siblingDecls(w, abs, text, name); len(where) > 1 {
+			return nil, toolerr.Inputf("%s is declared in %d files (build-constrained): %s; pass file_path.", name, len(where), strings.Join(where, ", "))
+		}
+	}
 	d, err := gosrc.FindDeclAt(abs, text, edits.Offset(text, sym.Line, sym.Column))
 	if err != nil {
 		return nil, err
 	}
-	return &located{path: abs, text: text, orig: text, bom: bom, sym: sym, decl: d}, nil
+	return &located{path: abs, text: text, orig: text, bom: bom, sym: sym, decl: d, unbuilt: unbuilt}, nil
+}
+
+// specialFunc names the functions the Go toolchain gives a fixed meaning: "main" for the top-level
+// func main of package main, "init" for a top-level func init, "" for anything else.
+func specialFunc(d *gosrc.Decl, pkg string) string {
+	if d == nil || d.Keyword != "func" || d.Method {
+		return ""
+	}
+	switch {
+	case d.Name == "main" && pkg == "main":
+		return "main"
+	case d.Name == "init":
+		return "init"
+	}
+	return ""
+}
+
+// isTestFunc reports whether name is one go test treats specially: Test, Benchmark, Fuzz or Example,
+// alone or followed by something that does not start with a lower-case letter.
+func isTestFunc(name string) bool {
+	for _, prefix := range []string{"Test", "Benchmark", "Fuzz", "Example"} {
+		if rest, ok := strings.CutPrefix(name, prefix); ok {
+			r, _ := utf8.DecodeRuneInString(rest)
+			return rest == "" || !unicode.IsLower(r)
+		}
+	}
+	return false
 }
 
 // stripKeyword lets a grouped-spec replacement be given as `const B = 2` or just `B = 2`.
@@ -104,6 +200,9 @@ func editSymbol(ctx context.Context, w *Workspace, in editSymbolIn) (string, err
 		if in.Name == "" {
 			return "", toolerr.Inputf(`action="delete" needs name.`)
 		}
+		if strings.TrimSpace(in.Source) != "" {
+			return "", toolerr.Inputf("delete takes no source; did you mean action=replace?")
+		}
 		var refused string
 		plan, refused, err = deleteSymbol(ctx, w, in, prune)
 		if err == nil && refused != "" {
@@ -131,6 +230,11 @@ func replaceSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source st
 	}
 	if err := checkSnippet(source, l.decl); err != nil {
 		return nil, err
+	}
+	if sp := specialFunc(l.decl, gosrc.PackageName(l.text)); sp != "" {
+		if names, nerr := gosrc.DeclNames(source); nerr == nil && len(names) == 1 && names[0] != l.decl.Name {
+			return nil, toolerr.Inputf("%s is the %s function; the replacement is called %s, which would remove it. Keep the name %s.", in.Name, sp, names[0], l.decl.Name)
+		}
 	}
 	next := l.text[:l.decl.Start] + edits.MatchEOL(source, l.text) + l.text[l.decl.End:]
 	next, err = gosrc.EditImports(l.path, next, l.text, in.Imports, prune)
@@ -181,6 +285,26 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		}
 		text = "package " + packageFor(abs) + "\n"
 	}
+	wholeFile := false
+	if pk := gosrc.PackageName(source); pk != "" {
+		want := gosrc.PackageName(text)
+		if pk != want && !(pk == want+"_test" && strings.HasSuffix(abs, "_test.go")) {
+			return nil, toolerr.Inputf("source is package %s, file is package %s.", pk, want)
+		}
+		if !exists {
+			wholeFile = true
+		} else {
+			imps, body, serr := gosrc.SplitFile("source.go", source)
+			if serr != nil {
+				return nil, serr
+			}
+			if strings.TrimSpace(body) == "" {
+				return nil, toolerr.Inputf("source has a package clause but no declaration.")
+			}
+			in.Imports = append(append([]string(nil), in.Imports...), imps...)
+			source = body
+		}
+	}
 	next := ""
 	var d *gosrc.Decl
 	if where != "end" {
@@ -193,8 +317,10 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		}
 		d = l.decl
 	}
-	switch where {
-	case "into":
+	switch {
+	case wholeFile:
+		next = edits.MatchEOL(strings.TrimRight(source, "\r\n")+"\n", text)
+	case where == "into":
 		if d.Closing < 0 {
 			return nil, toolerr.Inputf("%s is not a struct or interface type; `into` adds fields or interface methods.", in.Name)
 		}
@@ -264,8 +390,15 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	if d.MultiName {
 		return nil, "", toolerr.Inputf("%s is declared together with other names; change it with edit.", in.Name)
 	}
-	locs, err := w.Client.References(ctx, l.path, l.sym.Line+1, l.sym.Column+1, false)
-	if err != nil {
+	sp := specialFunc(d, gosrc.PackageName(l.text))
+	if sp == "main" && !in.Force {
+		return nil, "", toolerr.Inputf("%s is the program's entry point (func main in package main); deleting it breaks go build. Pass force=true to delete it anyway.", in.Name)
+	}
+	var locs []lsp.Location
+	var notes []string
+	if l.unbuilt {
+		notes = append(notes, fmt.Sprintf("%s is excluded from the current build, so uses of %s were not checked.", edits.RelativeName(l.path, w.Root), in.Name))
+	} else if locs, err = w.Client.References(ctx, l.path, l.sym.Line+1, l.sym.Column+1, false); err != nil {
 		return nil, "", err
 	}
 	var users []lsp.Location
@@ -289,9 +422,11 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	if err != nil {
 		return nil, "", err
 	}
-	var notes []string
 	if d.Grouped && strings.Contains(blockText(l.text, d.Start, d.End), "iota") {
 		notes = append(notes, "The block uses iota: the values of the constants after the deleted one shift.")
+	}
+	if sp == "init" {
+		notes = append(notes, "init functions run at program start; its side effects are gone with it.")
 	}
 	if len(users) > 0 {
 		notes = append(notes, fmt.Sprintf("Forced: %d use(s) of %s remain.", len(users), in.Name))

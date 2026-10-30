@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -18,6 +20,7 @@ type quickFixIn struct {
 	Code              string `json:"code,omitempty" jsonschema:"only diagnostics with this code"`
 	Choice            string `json:"choice,omitempty" jsonschema:"part of the title of the fix to use when several apply"`
 	OrganizeImports   bool   `json:"organize_imports,omitempty" jsonschema:"instead of diagnostic fixes: add missing and remove unused imports, sorted"`
+	FixAll            bool   `json:"fix_all,omitempty" jsonschema:"instead of diagnostic fixes: apply gopls' source.fixAll to the whole file"`
 	Apply             *bool  `json:"apply,omitempty"`
 	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
 	IncludeDependents *bool  `json:"include_dependents,omitempty"`
@@ -28,16 +31,18 @@ type codeAction struct {
 	Kind  string             `json:"kind"`
 	Edit  *lsp.WorkspaceEdit `json:"edit"`
 	Data  json.RawMessage    `json:"data"`
+	Cmd   json.RawMessage    `json:"command"`
 	raw   json.RawMessage
 }
 
 // actions asks for the code actions in a range, resolving the ones that come without their edit.
-func actions(ctx context.Context, w *Workspace, path string, rng lsp.Range, only []string, diags []lsp.Diagnostic) ([]codeAction, error) {
+// Actions that only run a server-side command (no edit, nothing to resolve) cannot be applied; their
+// titles are returned apart.
+func actions(ctx context.Context, w *Workspace, path string, rng lsp.Range, only []string, diags []lsp.Diagnostic) (out []codeAction, cmdOnly []string, err error) {
 	raws, err := w.Client.CodeActions(ctx, path, rng, only, diags)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var out []codeAction
 	for _, raw := range raws {
 		var a codeAction
 		if json.Unmarshal(raw, &a) != nil {
@@ -52,12 +57,18 @@ func actions(ctx context.Context, w *Workspace, path string, rng lsp.Range, only
 				}
 			}
 		}
-		if a.Edit != nil {
+		switch {
+		case a.Edit != nil:
 			out = append(out, a)
+		case len(a.Cmd) > 0:
+			cmdOnly = append(cmdOnly, tidy(a.Title))
 		}
 	}
-	return out, nil
+	return out, cmdOnly, nil
 }
+
+// addImportRE matches gopls' `Add import: "fmt"` and `Add import: str "strings"` titles.
+var addImportRE = regexp.MustCompile(`^Add import:\s+(?:(\w+)\s+)?"([^"]+)"`)
 
 func sameEdit(a, b codeAction) bool {
 	x, _ := json.Marshal(a.Edit)
@@ -83,14 +94,25 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 	all := map[string][]lsp.TextEdit{}
 	var titles []string
 
-	if in.OrganizeImports {
+	if in.OrganizeImports && in.FixAll {
+		return "", toolerr.Inputf("pass either organize_imports or fix_all, not both.")
+	}
+	var importSpecs []string
+	if in.OrganizeImports || in.FixAll {
+		kind, clean := "source.organizeImports", "The imports of "+rel+" are already organized."
+		if in.FixAll {
+			kind, clean = "source.fixAll", "gopls' fix-all has nothing to change in "+rel+"."
+		}
 		endLine, endCh := edits.PositionOf(text, len(text))
-		acts, err := actions(ctx, w, abs, lsp.Range{End: lsp.Position{Line: endLine, Character: endCh}}, []string{"source.organizeImports"}, nil)
+		acts, cmdOnly, err := actions(ctx, w, abs, lsp.Range{End: lsp.Position{Line: endLine, Character: endCh}}, []string{kind}, nil)
 		if err != nil {
 			return "", err
 		}
 		if len(acts) == 0 {
-			return "The imports of " + rel + " are already organized.", nil
+			if len(cmdOnly) > 0 {
+				return fmt.Sprintf("gopls offers '%s' only as a command (not supported).", cmdOnly[0]), nil
+			}
+			return clean, nil
 		}
 		by, err := edits.ParseWorkspaceEdit(acts[0].Edit)
 		if err != nil {
@@ -126,7 +148,11 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 				break
 			}
 			label := fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0])
-			acts, err := actions(ctx, w, abs, d.Range, []string{"quickfix"}, []lsp.Diagnostic{d})
+			only := []string{"quickfix"}
+			if strings.Trim(string(d.Code), `"`) == "unusedparams" {
+				only = append(only, "refactor.rewrite.removeUnusedParam")
+			}
+			acts, cmdOnly, err := actions(ctx, w, abs, d.Range, only, []lsp.Diagnostic{d})
 			if err != nil {
 				return "", err
 			}
@@ -141,6 +167,9 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			}
 			switch {
 			case len(acts) == 0:
+				if len(cmdOnly) > 0 {
+					label += fmt.Sprintf(" (gopls offers '%s' only as a command (not supported))", cmdOnly[0])
+				}
 				unfixable = append(unfixable, label)
 			case func() bool {
 				for _, o := range acts[1:] {
@@ -150,6 +179,11 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 				}
 				return true
 			}():
+				if m := addImportRE.FindStringSubmatch(acts[0].Title); m != nil {
+					importSpecs = append(importSpecs, strings.TrimSpace(m[1]+" "+strconv.Quote(m[2])))
+					titles = append(titles, "Add import "+strconv.Quote(m[2]))
+					continue
+				}
 				by, err := edits.ParseWorkspaceEdit(acts[0].Edit)
 				if err != nil {
 					return "", err
@@ -167,7 +201,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 		if len(ambiguous) > 0 {
 			return "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  "), nil
 		}
-		if len(all) == 0 {
+		if len(all) == 0 && len(importSpecs) == 0 {
 			hint := ""
 			for _, u := range unfixable {
 				if strings.Contains(u, "imported and not used") {
@@ -181,6 +215,32 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 	changes, err := edits.ChangesFromEdits(all)
 	if err != nil {
 		return "", toolerr.Inputf("the fixes could not be combined: %v", err)
+	}
+	if len(importSpecs) > 0 {
+		// Several "Add import" fixes are merged into one change so a single import block results.
+		base, old, bom := text, text, false
+		idx := -1
+		for i, c := range changes {
+			if c.Path == abs {
+				idx = i
+				base = *c.New
+			}
+		}
+		_, bom, _ = edits.ReadSource(abs)
+		next, err := gosrc.EditImports(abs, base, "", importSpecs, false)
+		if err != nil {
+			return "", err
+		}
+		c, err := fileChange(abs, next, &old, bom)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case idx >= 0:
+			changes[idx] = c
+		case !c.IsNoop():
+			changes = append(changes, c)
+		}
 	}
 	seen := map[string]bool{}
 	var uniq []string
