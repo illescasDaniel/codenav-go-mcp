@@ -172,3 +172,25 @@ func TestChangeSignature(t *testing.T) {
 		t.Fatal("declaration and call site must both change")
 	}
 }
+
+func TestMoveAcrossPackages(t *testing.T) {
+	cs, root := session(t, nil)
+	if out := call(t, cs, "move", map[string]any{"name": "Embedded", "to_file": "geom/e.go"}); !strings.Contains(out, "unexported base") {
+		t.Fatalf("a type using an unexported neighbour must be refused with the reason:\n%s", out)
+	}
+	out := call(t, cs, "move", map[string]any{"name": "Scale", "to_file": "util/scale.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	moved := readFile(t, root, "util/scale.go")
+	if !strings.Contains(moved, "package util") || !strings.Contains(moved, "shapes.Shape") || !strings.Contains(moved, `"example.com/fx/shapes"`) {
+		t.Fatalf("moved code must be qualified and import its old package:\n%s", moved)
+	}
+	app := readFile(t, root, "app/app.go")
+	if !strings.Contains(app, "util.Scale(x, 2, 0)") || !strings.Contains(app, `"example.com/fx/util"`) {
+		t.Fatalf("call site must use the new package:\n%s", app)
+	}
+	if strings.Contains(readFile(t, root, "shapes/shapes.go"), "Scale") {
+		t.Fatal("Scale must leave shapes.go")
+	}
+}

@@ -247,3 +247,38 @@ func EditImports(filename, src, oldSrc string, add []string, prune bool) (string
 	}
 	return buf.String(), nil
 }
+
+// ImportsUsed lists, as `alias "path"` specs, the imports of src that the code in snippet uses.
+func ImportsUsed(filename, src, snippet string) []string {
+	_, f, err := parse(filename, src)
+	if err != nil {
+		return nil
+	}
+	type imp struct{ path, spec string }
+	var imps []imp
+	var header strings.Builder
+	header.WriteString("package p\n")
+	for _, i := range f.Imports {
+		line := i.Path.Value
+		if i.Name != nil {
+			if i.Name.Name == "_" || i.Name.Name == "." {
+				continue
+			}
+			line = i.Name.Name + " " + line
+		}
+		p, _ := strconv.Unquote(i.Path.Value)
+		imps = append(imps, imp{p, line})
+		header.WriteString("import " + line + "\n")
+	}
+	_, sf, err := parse(filename, header.String()+snippet)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, i := range imps {
+		if astutil.UsesImport(sf, i.path) {
+			out = append(out, i.spec)
+		}
+	}
+	return out
+}

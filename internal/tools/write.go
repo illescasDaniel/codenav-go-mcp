@@ -265,6 +265,12 @@ func RegisterWrite(s *mcp.Server, h Host) {
 		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		changeSignature)
 
+	addWrite(s, h, "move", "Move a top-level func, type, const or var to another file. Same directory: the declaration and the imports only it used move; "+
+		"another directory (a package, created if missing): a type takes its methods along, package qualifiers are rewritten at every use (shapes.Square -> geom.Square), imports are fixed in every touched file. "+
+		"Refuses, with the reasons, when the moved code uses unexported identifiers that stay behind, when unexported members are used from outside, or when the move would create an import cycle. "+
+		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
+		moveSymbol)
+
 	addWrite(s, h, "apply_edit", "Write a previewed edit by id, even if it adds errors. Refuses when a file changed since the preview.",
 		func(ctx context.Context, w *Workspace, in applyIn) (string, error) {
 			plan, err := w.Store.Get(in.ID)

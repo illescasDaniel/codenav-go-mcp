@@ -1,0 +1,531 @@
+package tools
+
+import (
+	"context"
+	"fmt"
+	"go/ast"
+	"go/token"
+	"go/types"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"golang.org/x/tools/go/packages"
+
+	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
+)
+
+type moveIn struct {
+	Name              string `json:"name" jsonschema:"top-level func, type, const or var, e.g. Scale or shapes.Square"`
+	FilePath          string `json:"file_path,omitempty" jsonschema:"narrows name"`
+	ToFile            string `json:"to_file" jsonschema:"destination .go file (created if missing); another directory means another package"`
+	Apply             *bool  `json:"apply,omitempty"`
+	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
+	IncludeDependents *bool  `json:"include_dependents,omitempty"`
+	AllowLarge        bool   `json:"allow_large,omitempty"`
+}
+
+// span is a moved declaration (whole lines) in a file.
+type span struct {
+	file       string
+	start, end int
+	snippet    int // order of the snippet in the destination
+}
+
+type tedit struct {
+	start, end int
+	text       string
+}
+
+func applyEdits(text string, es []tedit) string {
+	sort.SliceStable(es, func(i, j int) bool { return es[i].start < es[j].start })
+	var b strings.Builder
+	pos := 0
+	for _, e := range es {
+		if e.start < pos {
+			continue
+		}
+		b.WriteString(text[pos:e.start])
+		b.WriteString(e.text)
+		pos = e.end
+	}
+	b.WriteString(text[pos:])
+	return b.String()
+}
+
+func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
+	if in.Name == "" || in.ToFile == "" {
+		return "", toolerr.Inputf("move needs name and to_file.")
+	}
+	l, err := locate(ctx, w, in.Name, in.FilePath)
+	if err != nil {
+		return "", err
+	}
+	d := l.decl
+	switch {
+	case d.Method:
+		return "", toolerr.Inputf("%s is a method; move its type and the methods follow it.", in.Name)
+	case d.Grouped:
+		return "", toolerr.Inputf("%s is inside a const/var/type block; take it out with edit_symbol first.", in.Name)
+	case d.MultiName:
+		return "", toolerr.Inputf("%s is declared together with other names; split the declaration with edit first.", in.Name)
+	}
+	dest, err := w.absPath(in.ToFile)
+	if err != nil {
+		return "", err
+	}
+	if filepath.Ext(dest) != ".go" {
+		return "", toolerr.Inputf("%q is not a .go file.", in.ToFile)
+	}
+	if dest == l.path {
+		return "", toolerr.Inputf("%s is already in %s.", in.Name, in.ToFile)
+	}
+	var plan *edits.EditPlan
+	if filepath.Dir(dest) == filepath.Dir(l.path) {
+		plan, err = moveWithinPackage(l, dest)
+	} else {
+		plan, err = moveAcrossPackages(ctx, w, l, dest, in.Name)
+	}
+	if err != nil {
+		return "", err
+	}
+	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
+}
+
+func wholeLines(text string, start, end int) (int, int) {
+	return lineStart(text, start), lineEnd(text, end)
+}
+
+func appendTo(destText, snippet string) string {
+	return strings.TrimRight(destText, "\r\n") + "\n\n" + snippet + "\n"
+}
+
+func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
+	d := l.decl
+	destText, destBOM, rerr := edits.ReadSource(dest)
+	exists := rerr == nil
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return nil, rerr
+	}
+	snippet := l.text[d.Start:d.End]
+	if exists {
+		if gosrc.PackageName(destText) != gosrc.PackageName(l.text) {
+			return nil, toolerr.Inputf("%s belongs to package %s, not %s.", filepath.Base(dest), gosrc.PackageName(destText), gosrc.PackageName(l.text))
+		}
+		for _, n := range gosrc.FileDeclNames(dest, destText) {
+			if n == d.Name {
+				return nil, toolerr.Inputf("%s is already declared in %s.", d.Name, filepath.Base(dest))
+			}
+		}
+		destText = appendTo(destText, snippet)
+	} else {
+		destText = "package " + gosrc.PackageName(l.text) + "\n\n" + snippet + "\n"
+	}
+	used := gosrc.ImportsUsed(l.path, l.text, snippet)
+	destText, err := gosrc.EditImports(dest, destText, "", used, false)
+	if err != nil {
+		return nil, err
+	}
+	from, to := wholeLines(l.text, d.Start, d.End)
+	srcText, err := gosrc.EditImports(l.path, l.text[:from]+l.text[to:], l.text, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	src, err := fileChange(l.path, srcText, &l.text, l.bom)
+	if err != nil {
+		return nil, err
+	}
+	var dc edits.FileChange
+	if exists {
+		old, _, _ := edits.ReadSource(dest)
+		dc, err = fileChange(dest, destText, &old, destBOM)
+	} else {
+		dc, err = fileChange(dest, destText, nil, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return edits.NewPlan("move "+d.Name+" to "+filepath.Base(dest), []edits.FileChange{src, dc}), nil
+}
+
+func goDeps(root, pkg string) map[string]bool {
+	out, err := exec.Command("go", "list", "-C", root, "-deps", "-f", "{{.ImportPath}}", pkg).Output()
+	if err != nil {
+		return nil
+	}
+	m := map[string]bool{}
+	for _, p := range strings.Fields(string(out)) {
+		m[p] = true
+	}
+	return m
+}
+
+func pkgLevel(o types.Object) bool { return o.Pkg() != nil && o.Parent() == o.Pkg().Scope() }
+
+func recvBase(e ast.Expr) string {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return recvBase(t.X)
+	case *ast.ParenExpr:
+		return recvBase(t.X)
+	case *ast.IndexExpr:
+		return recvBase(t.X)
+	case *ast.IndexListExpr:
+		return recvBase(t.X)
+	case *ast.Ident:
+		return t.Name
+	}
+	return ""
+}
+
+func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, display string) (*edits.EditPlan, error) {
+	d := l.decl
+	fset := token.NewFileSet()
+	cfg := &packages.Config{
+		Context: ctx, Dir: w.Root, Fset: fset, Tests: true,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedImports | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedModule,
+	}
+	if fl := strings.Fields(os.Getenv("CODENAV_GO_MCP_BUILD_FLAGS")); len(fl) > 0 {
+		cfg.BuildFlags = fl
+	}
+	pkgs, err := packages.Load(cfg, "./...")
+	if err != nil {
+		return nil, err
+	}
+	destDir := filepath.Dir(dest)
+	var A, B *packages.Package
+	for _, p := range pkgs {
+		if strings.HasSuffix(p.PkgPath, "_test") || strings.Contains(p.ID, " [") || strings.HasSuffix(p.ID, ".test") {
+			continue
+		}
+		for _, f := range p.GoFiles {
+			if f == l.path {
+				A = p
+			}
+			if filepath.Dir(f) == destDir {
+				B = p
+			}
+		}
+	}
+	if A == nil {
+		return nil, toolerr.Inputf("%s is not part of a package in this workspace's module.", filepath.Base(l.path))
+	}
+	if len(A.Errors) > 0 {
+		return nil, toolerr.Inputf("package %s has errors (%v); fix them before moving code out of it.", A.PkgPath, A.Errors[0])
+	}
+	bName, bPath := "", ""
+	switch {
+	case B != nil:
+		bName, bPath = B.Name, B.PkgPath
+	case A.Module != nil:
+		rel, err := filepath.Rel(A.Module.Dir, destDir)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return nil, toolerr.Inputf("%s is outside the module %s.", filepath.Base(destDir), A.Module.Path)
+		}
+		bName, bPath = packageFor(dest), A.Module.Path+"/"+filepath.ToSlash(rel)
+	default:
+		return nil, toolerr.Inputf("cannot work out the import path of %s.", destDir)
+	}
+	if B != nil && B.Types != nil && B.Types.Scope().Lookup(d.Name) != nil {
+		return nil, toolerr.Inputf("package %s already declares %s.", bPath, d.Name)
+	}
+
+	texts := map[string]*struct {
+		text string
+		bom  bool
+	}{}
+	read := func(f string) (string, bool, error) {
+		if t, ok := texts[f]; ok {
+			return t.text, t.bom, nil
+		}
+		s, b, err := edits.ReadSource(f)
+		if err != nil {
+			return "", false, err
+		}
+		texts[f] = &struct {
+			text string
+			bom  bool
+		}{s, b}
+		return s, b, nil
+	}
+	off := func(p token.Pos) int { return fset.Position(p).Offset }
+
+	// The declaration and, for a type, its methods wherever they live in the package.
+	spans := []span{{file: l.path, snippet: 0}}
+	spans[0].start, spans[0].end = d.Start, d.End // the declaration's own text; deleting it widens to whole lines
+	if d.Keyword == "type" {
+		seen := map[string]bool{}
+		for _, p := range pkgs {
+			if p.PkgPath != A.PkgPath {
+				continue
+			}
+			for _, f := range p.Syntax {
+				name := fset.Position(f.Pos()).Filename
+				if seen[name] {
+					continue
+				}
+				seen[name] = true
+				for _, decl := range f.Decls {
+					fd, ok := decl.(*ast.FuncDecl)
+					if !ok || fd.Recv == nil || len(fd.Recv.List) != 1 || recvBase(fd.Recv.List[0].Type) != d.Name {
+						continue
+					}
+					start := fd.Pos()
+					if fd.Doc != nil {
+						start = fd.Doc.Pos()
+					}
+					spans = append(spans, span{file: name, start: off(start), end: off(fd.End()), snippet: len(spans)})
+				}
+			}
+		}
+	}
+	inSpan := func(file string, o int) int {
+		for i, s := range spans {
+			if s.file == file && o >= s.start && o < s.end {
+				return i
+			}
+		}
+		return -1
+	}
+	inM := func(p token.Pos) bool {
+		if !p.IsValid() {
+			return false
+		}
+		pos := fset.Position(p)
+		return inSpan(pos.Filename, pos.Offset) >= 0
+	}
+
+	var refusals []string
+	refuse := func(format string, a ...any) {
+		m := fmt.Sprintf(format, a...)
+		for _, r := range refusals {
+			if r == m {
+				return
+			}
+		}
+		refusals = append(refusals, m)
+	}
+	fileEdits := map[string][]tedit{}
+	addImport := map[string][]string{}
+	needA := map[int]bool{} // spans that now refer to package A by qualifier
+	usesM := false          // code left in A refers to the moved declaration
+	done := map[string]bool{}
+	where := func(file string, o int) string {
+		t, _, _ := read(file)
+		line, _ := edits.PositionOf(t, o)
+		return fmt.Sprintf("%s:%d", edits.RelativeName(file, w.Root), line+1)
+	}
+	for _, p := range pkgs {
+		isA := p.PkgPath == A.PkgPath
+		isB := bPath != "" && p.PkgPath == bPath
+		for _, f := range p.Syntax {
+			fname := fset.Position(f.Pos()).Filename
+			if done[fname] || p.TypesInfo == nil {
+				continue
+			}
+			done[fname] = true
+			handled := map[*ast.Ident]bool{}
+			ast.Inspect(f, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.SelectorExpr:
+					x, ok := n.X.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					pn, ok := p.TypesInfo.Uses[x].(*types.PkgName)
+					if !ok {
+						return true
+					}
+					handled[x], handled[n.Sel] = true, true
+					obj := p.TypesInfo.Uses[n.Sel]
+					sp := inSpan(fname, off(x.Pos()))
+					path := pn.Imported().Path()
+					switch {
+					case sp < 0 && path == A.PkgPath && obj != nil && inM(obj.Pos()):
+						if pkgLevel(obj) {
+							if isB {
+								fileEdits[fname] = append(fileEdits[fname], tedit{off(x.Pos()), off(n.Sel.Pos()), ""})
+							} else {
+								fileEdits[fname] = append(fileEdits[fname], tedit{off(x.Pos()), off(x.End()), bName})
+								addImport[fname] = append(addImport[fname], bPath)
+							}
+						} else if !obj.Exported() {
+							refuse("%s uses unexported %s", where(fname, off(n.Sel.Pos())), obj.Name())
+						}
+					case sp >= 0 && path == bPath:
+						fileEdits[fname] = append(fileEdits[fname], tedit{off(x.Pos()), off(n.Sel.Pos()), ""})
+					case sp >= 0 && obj != nil && obj.Pkg() != nil && obj.Pkg().Path() == A.PkgPath && !inM(obj.Pos()) && !obj.Exported():
+						refuse("the moved code uses unexported %s of package %s (%s)", obj.Name(), A.Name, where(fname, off(n.Sel.Pos())))
+					}
+				case *ast.Ident:
+					if handled[n] {
+						return true
+					}
+					obj := p.TypesInfo.Uses[n]
+					if obj == nil || obj.Pkg() == nil || obj.Pkg().Path() != A.PkgPath {
+						return true
+					}
+					o := off(n.Pos())
+					if sp := inSpan(fname, o); sp >= 0 {
+						switch {
+						case inM(obj.Pos()):
+						case pkgLevel(obj) && !obj.Exported():
+							refuse("the moved code uses unexported %s of package %s (%s); export it or move it too", obj.Name(), A.Name, where(fname, o))
+						case pkgLevel(obj):
+							fileEdits[fname] = append(fileEdits[fname], tedit{o, o, A.Name + "."})
+							needA[sp] = true
+						case obj.Parent() == nil && !obj.Exported():
+							refuse("the moved code uses unexported %s of package %s (%s)", obj.Name(), A.Name, where(fname, o))
+						}
+					} else if inM(obj.Pos()) {
+						switch {
+						case pkgLevel(obj) && isA:
+							usesM = true
+							fileEdits[fname] = append(fileEdits[fname], tedit{o, o + len(n.Name), bName + "." + n.Name})
+							addImport[fname] = append(addImport[fname], bPath)
+						case obj.Parent() == nil && !obj.Exported():
+							refuse("%s uses unexported %s, which moves to another package", where(fname, o), obj.Name())
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	anyNeedA := len(needA) > 0
+	if B != nil || anyNeedA || usesM {
+		depsB, depsA := map[string]bool{}, goDeps(w.Root, A.PkgPath)
+		if B != nil {
+			depsB = goDeps(w.Root, bPath)
+		}
+		if (usesM && (depsB[A.PkgPath] || anyNeedA)) || (anyNeedA && depsA[bPath]) {
+			refuse("the move would create an import cycle between %s and %s", A.PkgPath, bPath)
+		}
+	}
+	if len(refusals) > 0 {
+		sort.Strings(refusals)
+		return nil, toolerr.Inputf("Cannot move %s to %s:\n  - %s", display, bPath, strings.Join(refusals[:min(len(refusals), 12)], "\n  - "))
+	}
+
+	// Cut the snippets out (with their qualifier edits applied) and delete the spans.
+	snippets := make([]string, len(spans))
+	snippetImports := map[string]bool{}
+	byFile := map[string][]int{}
+	for i, s := range spans {
+		byFile[s.file] = append(byFile[s.file], i)
+	}
+	type result struct {
+		next, old string
+		bom       bool
+	}
+	changed := map[string]*result{}
+	files := map[string]bool{}
+	for f := range byFile {
+		files[f] = true
+	}
+	for f := range fileEdits {
+		files[f] = true
+	}
+	for f := range files {
+		text, bom, err := read(f)
+		if err != nil {
+			return nil, err
+		}
+		var outer []tedit
+		inner := map[int][]tedit{}
+		for _, e := range fileEdits[f] {
+			if sp := inSpan(f, e.start); sp >= 0 {
+				inner[sp] = append(inner[sp], tedit{e.start - spans[sp].start, e.end - spans[sp].start, e.text})
+			} else {
+				outer = append(outer, e)
+			}
+		}
+		for _, i := range byFile[f] {
+			s := spans[i]
+			snippets[i] = applyEdits(text[s.start:s.end], inner[i])
+			for _, spec := range gosrc.ImportsUsed(f, text, snippets[i]) {
+				snippetImports[spec] = true
+			}
+			a, b := wholeLines(text, s.start, s.end)
+			outer = append(outer, tedit{a, b, ""})
+		}
+		changed[f] = &result{next: applyEdits(text, outer), old: text, bom: bom}
+	}
+	order := make([]int, len(spans))
+	for i := range order {
+		order[i] = i
+	}
+	var parts []string
+	for _, i := range order {
+		parts = append(parts, strings.TrimSpace(snippets[i]))
+	}
+	code := strings.Join(parts, "\n\n")
+
+	var out []edits.FileChange
+	paths := make([]string, 0, len(changed))
+	for f := range changed {
+		paths = append(paths, f)
+	}
+	sort.Strings(paths)
+	for _, f := range paths {
+		r := changed[f]
+		next, err := gosrc.EditImports(f, r.next, r.old, addImport[f], true)
+		if err != nil {
+			return nil, err
+		}
+		old := r.old
+		c, err := fileChange(f, next, &old, r.bom)
+		if err != nil {
+			return nil, err
+		}
+		if !c.IsNoop() {
+			out = append(out, c)
+		}
+	}
+
+	destText, destBOM, rerr := edits.ReadSource(dest)
+	exists := rerr == nil
+	if rerr != nil && !os.IsNotExist(rerr) {
+		return nil, rerr
+	}
+	var specs []string
+	for s := range snippetImports {
+		specs = append(specs, s)
+	}
+	sort.Strings(specs)
+	if anyNeedA {
+		specs = append(specs, A.PkgPath)
+	}
+	var next string
+	if exists {
+		if n := gosrc.PackageName(destText); n != bName {
+			return nil, toolerr.Inputf("%s belongs to package %s, not %s.", filepath.Base(dest), n, bName)
+		}
+		next = appendTo(destText, code)
+	} else {
+		next = "package " + bName + "\n\n" + code + "\n"
+	}
+	if next, err = gosrc.EditImports(dest, next, "", specs, false); err != nil {
+		return nil, err
+	}
+	var dc edits.FileChange
+	if exists {
+		dc, err = fileChange(dest, next, &destText, destBOM)
+	} else {
+		dc, err = fileChange(dest, next, nil, false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, dc)
+
+	notes := []string{fmt.Sprintf("Moved %s from package %s to %s (%d declaration(s), including methods).", display, A.PkgPath, bPath, len(spans))}
+	if n := len(fileEdits); n > 0 {
+		notes = append(notes, fmt.Sprintf("Package qualifiers were rewritten in %d file(s).", n))
+	}
+	return edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...), nil
+}
