@@ -69,14 +69,6 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 		return "", err
 	}
 	d := l.decl
-	switch {
-	case d.Method:
-		return "", toolerr.Inputf("%s is a method; move its type and the methods follow it.", in.Name)
-	case d.Grouped:
-		return "", toolerr.Inputf("%s is inside a const/var/type block; take it out with edit_symbol first.", in.Name)
-	case d.MultiName:
-		return "", toolerr.Inputf("%s is declared together with other names; split the declaration with edit first.", in.Name)
-	}
 	dest, err := w.absPath(in.ToFile)
 	if err != nil {
 		return "", err
@@ -87,6 +79,19 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 	if dest == l.path {
 		return "", toolerr.Inputf("%s is already in %s.", in.Name, in.ToFile)
 	}
+	if d.Method && filepath.Dir(dest) != filepath.Dir(l.path) {
+		return "", toolerr.Inputf("%s is a method of %s; Go methods must stay in their type's package. Move %s (its methods follow) or pick a file in the same directory.", in.Name, d.Recv, d.Recv)
+	}
+	var notes []string
+	if d.Grouped || d.MultiName {
+		if l, err = carveOut(l); err != nil {
+			return "", err
+		}
+		d = l.decl
+		if d.Keyword == "var" {
+			notes = append(notes, "Moving a var can change the order of package initialisation side effects.")
+		}
+	}
 	var plan *edits.EditPlan
 	if filepath.Dir(dest) == filepath.Dir(l.path) {
 		plan, err = moveWithinPackage(l, dest)
@@ -96,6 +101,7 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	plan.Notes = append(plan.Notes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
 }
 
@@ -119,8 +125,12 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 		if gosrc.PackageName(destText) != gosrc.PackageName(l.text) {
 			return nil, toolerr.Inputf("%s belongs to package %s, not %s.", filepath.Base(dest), gosrc.PackageName(destText), gosrc.PackageName(l.text))
 		}
+		key := d.Name
+		if d.Method {
+			key = d.Recv + "." + d.Name
+		}
 		for _, n := range gosrc.FileDeclNames(dest, destText) {
-			if n == d.Name {
+			if n == key {
 				return nil, toolerr.Inputf("%s is already declared in %s.", d.Name, filepath.Base(dest))
 			}
 		}
@@ -138,7 +148,7 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 	if err != nil {
 		return nil, err
 	}
-	src, err := fileChange(l.path, srcText, &l.text, l.bom)
+	src, err := fileChange(l.path, srcText, &l.orig, l.bom)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +204,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	}
 	if fl := strings.Fields(os.Getenv("CODENAV_GO_MCP_BUILD_FLAGS")); len(fl) > 0 {
 		cfg.BuildFlags = fl
+	}
+	if l.text != l.orig {
+		cfg.Overlay = map[string][]byte{l.path: []byte(l.text)}
 	}
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
@@ -255,6 +268,10 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		}{s, b}
 		return s, b, nil
 	}
+	texts[l.path] = &struct {
+		text string
+		bom  bool
+	}{l.text, l.bom}
 	off := func(p token.Pos) int { return fset.Position(p).Offset }
 
 	// The declaration and, for a type, its methods wherever they live in the package.
@@ -481,6 +498,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 			return nil, err
 		}
 		old := r.old
+		if f == l.path {
+			old = l.orig
+		}
 		c, err := fileChange(f, next, &old, r.bom)
 		if err != nil {
 			return nil, err

@@ -31,6 +31,7 @@ type editSymbolIn struct {
 
 type located struct {
 	path, text string
+	orig       string // the file as on disk; differs from text after carveOut
 	bom        bool
 	sym        resolve.Symbol
 	decl       *gosrc.Decl
@@ -53,7 +54,7 @@ func locate(ctx context.Context, w *Workspace, name, file string) (*located, err
 	if err != nil {
 		return nil, err
 	}
-	return &located{abs, text, bom, sym, d}, nil
+	return &located{path: abs, text: text, orig: text, bom: bom, sym: sym, decl: d}, nil
 }
 
 // stripKeyword lets a grouped-spec replacement be given as `const B = 2` or just `B = 2`.
@@ -297,4 +298,19 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	}
 	plan, err := planFile(l.path, "delete "+in.Name, next, l.text, true, l.bom, notes...)
 	return plan, "", err
+}
+
+// carveOut rewrites the located file in memory so that a grouped or multi-name symbol stands alone.
+func carveOut(l *located) (*located, error) {
+	carved, off, err := gosrc.CarveSpec(l.path, l.text, edits.Offset(l.text, l.sym.Line, l.sym.Column))
+	if err != nil {
+		return nil, err
+	}
+	d, err := gosrc.FindDeclAt(l.path, carved, off)
+	if err != nil {
+		return nil, err
+	}
+	c := *l
+	c.text, c.decl = carved, d
+	return &c, nil
 }

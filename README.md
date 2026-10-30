@@ -63,7 +63,7 @@ written until that is on the table. Output is always gofmt-ed with imports fixed
 |------|------|
 | `edit` | Type-checked text edit of a Go file: `old_string`/`new_string` or a whole `new_text` |
 | `edit_symbol` | `replace` / `insert` / `delete` a func, method, type, const or var by name; `imports=[...]` added. Delete refuses while the symbol is used |
-| `rename_symbol` | Rename across the workspace. Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs |
+| `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs |
 | `change_signature` | Add / remove / reorder parameters and rewrite every call site; linked methods follow. Uses as a value are listed as manual work |
 | `move` | With `name`: move a top-level func, type, const or var to another file, in the same or another package (qualifiers and imports rewritten; refuses unexported-use problems, import cycles and name clashes). Without `name`: move a package directory (`file_path` -> `to_file`) and rewrite every import |
 | `quick_fix` | Apply gopls's quick fixes and organize imports; ambiguous fixes are listed instead of guessed |
@@ -88,8 +88,11 @@ Safety rules, enforced in code:
 
 Positions are 1-indexed; `column` is a UTF-16 offset.
 
-Known limits: `move` does not move methods, grouped `const`/`var` specs or multi-name
-declarations; package moves refuse directories holding non-Go files; code excluded by build
+`move` also takes a spec out of a `const`/`var`/`type` block or a `var a, b = ...` line (refused
+when that would change `iota` values, or for `var a, b = f()`), and a method to another file of
+its own package (a type's methods follow it when it changes package).
+
+Known limits: package moves refuse directories holding non-Go files; code excluded by build
 constraints is invisible to the type check (the response says when an edit touches it).
 
 ## Which `gopls` runs

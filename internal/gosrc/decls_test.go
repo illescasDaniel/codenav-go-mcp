@@ -83,3 +83,37 @@ func TestDeclNames(t *testing.T) {
 		t.Errorf("got %v, %v", got, err)
 	}
 }
+
+func TestCarveSpec(t *testing.T) {
+	carve := func(src, name string) (string, error) {
+		off := strings.Index(src, name)
+		out, noff, err := CarveSpec("x.go", src, off)
+		if err == nil && out[noff:noff+len(name)] != name {
+			t.Fatalf("returned offset does not point at %s: %q", name, out[noff:])
+		}
+		return out, err
+	}
+	ok := []struct{ name, src, sym, want string }{
+		{"group", "package p\n\nconst (\n\tA = 1\n\tB = 2\n)\n", "B", "const B = 2"},
+		{"typed multi", "package p\n\nvar a, b int = 1, 2\n", "b", "var b int = 2"},
+		{"multi in group", "package p\n\nvar (\n\tx = 1\n\ta, b = 1, 2\n)\n", "b", "var b = 2"},
+		{"no values", "package p\n\nvar x, y int\n", "x", "var x int"},
+	}
+	for _, c := range ok {
+		got, err := carve(c.src, c.sym)
+		if err != nil || !strings.Contains(got, c.want) {
+			t.Errorf("%s: %v\n%s", c.name, err, got)
+		}
+	}
+	bad := []struct{ name, src, sym string }{
+		{"multi-value call", "package p\n\nvar u, v = f()\n\nfunc f() (int, int) { return 1, 2 }\n", "u"},
+		{"iota", "package p\n\nconst (\n\tA = iota\n\tB = 5\n)\n", "B"},
+		{"implicit next", "package p\n\nconst (\n\tA = 1\n\tB\n)\n", "A"},
+		{"shared line", "package p\n\nconst (\n\tA = 1; B = 2\n)\n", "B"},
+	}
+	for _, c := range bad {
+		if _, err := carve(c.src, c.sym); err == nil {
+			t.Errorf("%s must be refused", c.name)
+		}
+	}
+}

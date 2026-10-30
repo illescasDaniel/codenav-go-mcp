@@ -264,3 +264,87 @@ func TestVerifyChangesReportsNewError(t *testing.T) {
 	}
 	t.Log(out)
 }
+
+func TestMoveGroupedSpec(t *testing.T) {
+	cs, root := session(t, nil)
+	orig := readFile(t, root, "shapes/consts.go")
+	out := call(t, cs, "move", map[string]any{"name": "Unit", "to_file": "shapes/unit.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move grouped spec:\n%s", out)
+	}
+	unit := readFile(t, root, "shapes/unit.go")
+	if !strings.Contains(unit, "const Unit = 1.0") || !strings.Contains(unit, "// Unit is the side.") || !strings.Contains(unit, "// metres") {
+		t.Fatalf("spec must stand alone with its comments:\n%s", unit)
+	}
+	left := readFile(t, root, "shapes/consts.go")
+	if !strings.Contains(left, "// Sizes are defaults.") || !strings.Contains(left, "Half") || strings.Contains(left, "Unit") {
+		t.Fatalf("group must keep its doc and the other spec:\n%s", left)
+	}
+	if out := call(t, cs, "undo_edit", map[string]any{}); !strings.Contains(strings.ToLower(out), "undone") && !strings.Contains(strings.ToLower(out), "reverted") {
+		t.Fatalf("undo:\n%s", out)
+	}
+	if got := readFile(t, root, "shapes/consts.go"); got != orig {
+		t.Fatalf("undo must restore the original bytes:\n%s", got)
+	}
+	if _, err := os.Stat(filepath.Join(root, "shapes/unit.go")); err == nil {
+		t.Fatal("undo must remove the created file")
+	}
+}
+
+func TestMoveGroupedSpecAcross(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "move", map[string]any{"name": "Half", "to_file": "util/half.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	if h := readFile(t, root, "util/half.go"); !strings.Contains(h, "package util") || !strings.Contains(h, "const Half") {
+		t.Fatalf("moved file:\n%s", h)
+	}
+}
+
+func TestMoveMultiName(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "move", map[string]any{"name": "Big", "to_file": "shapes/big.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	if b := readFile(t, root, "shapes/big.go"); !strings.Contains(b, "var Big = 10.0") {
+		t.Fatalf("big.go:\n%s", b)
+	}
+	if c := readFile(t, root, "shapes/consts.go"); !strings.Contains(c, "var Small = 0.5") || strings.Contains(c, "Big") {
+		t.Fatalf("consts.go:\n%s", c)
+	}
+}
+
+func TestMoveRefusalsWriteNothing(t *testing.T) {
+	cs, root := session(t, nil)
+	orig := readFile(t, root, "shapes/consts.go")
+	if out := call(t, cs, "move", map[string]any{"name": "Q", "to_file": "shapes/q.go"}); !strings.Contains(out, "multi-value") {
+		t.Fatalf("Q:\n%s", out)
+	}
+	for _, n := range []string{"KindA", "KindB"} {
+		if out := call(t, cs, "move", map[string]any{"name": n, "to_file": "shapes/k.go"}); !strings.Contains(out, "values") {
+			t.Fatalf("%s:\n%s", n, out)
+		}
+	}
+	if readFile(t, root, "shapes/consts.go") != orig {
+		t.Fatal("a refusal must not write")
+	}
+}
+
+func TestMoveMethod(t *testing.T) {
+	cs, root := session(t, nil)
+	if out := call(t, cs, "move", map[string]any{"name": "Square.Area", "to_file": "util/a.go"}); !strings.Contains(out, "method of Square") {
+		t.Fatalf("cross-package method move must be refused:\n%s", out)
+	}
+	out := call(t, cs, "move", map[string]any{"name": "Square.Area", "to_file": "shapes/area.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move method:\n%s", out)
+	}
+	if a := readFile(t, root, "shapes/area.go"); !strings.Contains(a, "func (s Square) Area()") {
+		t.Fatalf("area.go:\n%s", a)
+	}
+	if strings.Contains(readFile(t, root, "shapes/shapes.go"), "func (s Square) Area") {
+		t.Fatal("method must leave shapes.go")
+	}
+}

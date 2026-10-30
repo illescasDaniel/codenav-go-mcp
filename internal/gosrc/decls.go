@@ -20,6 +20,7 @@ type Decl struct {
 	Name       string
 	Keyword    string // func, type, const or var
 	Method     bool
+	Recv       string // receiver type name of a method
 	Start, End int
 	Grouped    bool // one spec inside `const ( ... )`
 	MultiName  bool // `var a, b = ...`
@@ -57,7 +58,11 @@ func FindDeclAt(filename, src string, off int) (*Decl, error) {
 				continue
 			}
 			s, doc := start(d.Doc, d.Pos())
-			return &Decl{Name: d.Name.Name, Keyword: "func", Method: d.Recv != nil, Start: s, End: at(d.End()), HasDoc: doc, Closing: -1}, nil
+			recv := ""
+			if d.Recv != nil && len(d.Recv.List) == 1 {
+				recv = recvName(d.Recv.List[0].Type)
+			}
+			return &Decl{Name: d.Name.Name, Keyword: "func", Method: d.Recv != nil, Recv: recv, Start: s, End: at(d.End()), HasDoc: doc, Closing: -1}, nil
 		case *ast.GenDecl:
 			if d.Tok == token.IMPORT {
 				continue
@@ -90,6 +95,9 @@ func FindDeclAt(filename, src string, off int) (*Decl, error) {
 							out.Start, out.HasDoc = at(doc.Pos()), true
 						}
 						out.End = at(d.End())
+						if trailing != nil && at(trailing.End()) > out.End {
+							out.End = at(trailing.End())
+						}
 						return out, nil
 					}
 					out.Grouped = true
@@ -305,4 +313,144 @@ func RewriteImports(filename, src string, fn func(path string) (string, bool)) (
 	}
 	b.WriteString(src[pos:])
 	return b.String(), changed, nil
+}
+
+// CarveSpec rewrites src so that the const/var/type whose name starts at nameOff stands alone in its own
+// declaration (after the original one) instead of sharing a block or a `var a, b = ...` line. It returns
+// the new text and the new offset of the name. Cases whose meaning would change are refused.
+func CarveSpec(filename, src string, nameOff int) (string, int, error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return "", 0, err
+	}
+	at := func(p token.Pos) int { return fset.Position(p).Offset }
+	lineStart := func(o int) int { return strings.LastIndex(src[:o], "\n") + 1 }
+	lineEnd := func(o int) int {
+		if i := strings.Index(src[o:], "\n"); i >= 0 {
+			return o + i + 1
+		}
+		return len(src)
+	}
+	text := func(a, b token.Pos) string { return src[at(a):at(b)] }
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok == token.IMPORT {
+			continue
+		}
+		for si, spec := range gd.Specs {
+			var names []*ast.Ident
+			var doc, trailing *ast.CommentGroup
+			var vs *ast.ValueSpec
+			switch s := spec.(type) {
+			case *ast.TypeSpec:
+				names, doc, trailing = []*ast.Ident{s.Name}, s.Doc, s.Comment
+			case *ast.ValueSpec:
+				vs, names, doc, trailing = s, s.Names, s.Doc, s.Comment
+			}
+			idx := -1
+			for i, n := range names {
+				if at(n.Pos()) == nameOff {
+					idx = i
+				}
+			}
+			if idx < 0 {
+				continue
+			}
+			kw := gd.Tok.String()
+			grouped := gd.Lparen.IsValid() && len(gd.Specs) > 1
+			multi := len(names) > 1
+			if multi && vs != nil && len(vs.Values) == 1 {
+				return "", 0, toolerr.Inputf("%s is initialised by one multi-value expression together with other names; splitting it is not supported. Rewrite it with edit first.", names[idx].Name)
+			}
+			if gd.Tok == token.CONST && grouped {
+				iota := false
+				ast.Inspect(gd, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok && id.Name == "iota" {
+						iota = true
+					}
+					return !iota
+				})
+				implicit := len(vs.Values) == 0
+				if si+1 < len(gd.Specs) {
+					implicit = implicit || len(gd.Specs[si+1].(*ast.ValueSpec).Values) == 0
+				}
+				if iota || implicit {
+					return "", 0, toolerr.Inputf("%s is in a const block that uses iota or repeated values; removing it would change the values of the constants. Rewrite the block with explicit values first (edit).", names[idx].Name)
+				}
+			}
+			// The standalone declaration.
+			var body string
+			switch {
+			case vs == nil:
+				body = text(spec.Pos(), spec.End())
+			default:
+				body = names[idx].Name
+				if vs.Type != nil {
+					body += " " + text(vs.Type.Pos(), vs.Type.End())
+				}
+				switch {
+				case len(vs.Values) == len(names):
+					body += " = " + text(vs.Values[idx].Pos(), vs.Values[idx].End())
+				case len(vs.Values) > 0:
+					return "", 0, toolerr.Inputf("cannot split %s from its declaration.", names[idx].Name)
+				}
+			}
+			head := ""
+			if !multi {
+				if doc != nil {
+					head = text(doc.Pos(), doc.End()) + "\n"
+				}
+				if trailing != nil {
+					body += " " + text(trailing.Pos(), trailing.End())
+				}
+			}
+			standalone := head + kw + " " + body
+			nameRel := len(head) + len(kw) + 1
+
+			var a, b int // replaced range
+			var repl string
+			if multi {
+				var ns, vals []string
+				for i, n := range names {
+					if i == idx {
+						continue
+					}
+					ns = append(ns, n.Name)
+					if vs != nil && len(vs.Values) > 0 {
+						vals = append(vals, text(vs.Values[i].Pos(), vs.Values[i].End()))
+					}
+				}
+				repl = strings.Join(ns, ", ")
+				if vs != nil && vs.Type != nil {
+					repl += " " + text(vs.Type.Pos(), vs.Type.End())
+				}
+				if len(vals) > 0 {
+					repl += " = " + strings.Join(vals, ", ")
+				}
+				if vs == nil {
+					return "", 0, toolerr.Inputf("unsupported declaration.")
+				}
+				a, b = at(spec.Pos()), at(spec.End())
+			} else {
+				first, last := at(spec.Pos()), at(spec.End())
+				if doc != nil {
+					first = at(doc.Pos())
+				}
+				if trailing != nil {
+					last = at(trailing.End())
+				}
+				if strings.TrimSpace(src[lineStart(first):first]) != "" || strings.TrimSpace(src[last:lineEnd(last)]) != "" {
+					return "", 0, toolerr.Inputf("%s shares its line with other code; put each name of the block on its own line first (edit).", names[idx].Name)
+				}
+				a, b = lineStart(first), lineEnd(last)
+			}
+			ins := at(gd.End())
+			if ins < b {
+				return "", 0, toolerr.Inputf("unsupported declaration layout.")
+			}
+			out := src[:a] + repl + src[b:ins] + "\n\n" + standalone + src[ins:]
+			return out, a + len(repl) + (ins - b) + 2 + nameRel, nil
+		}
+	}
+	return "", 0, toolerr.Inputf("that symbol is not a const, var or type.")
 }
