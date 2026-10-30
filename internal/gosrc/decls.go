@@ -282,3 +282,27 @@ func ImportsUsed(filename, src, snippet string) []string {
 	}
 	return out
 }
+
+// RewriteImports replaces import paths for which fn returns (new, true); the rest of the text is untouched.
+func RewriteImports(filename, src string, fn func(path string) (string, bool)) (string, bool, error) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, parser.ImportsOnly)
+	if err != nil {
+		return src, false, toolerr.Inputf("not valid Go: %v", err)
+	}
+	var b strings.Builder
+	pos, changed := 0, false
+	for _, imp := range f.Imports {
+		p, _ := strconv.Unquote(imp.Path.Value)
+		np, ok := fn(p)
+		if !ok {
+			continue
+		}
+		start, end := fset.Position(imp.Path.Pos()).Offset, fset.Position(imp.Path.End()).Offset
+		b.WriteString(src[pos:start])
+		b.WriteString(strconv.Quote(np))
+		pos, changed = end, true
+	}
+	b.WriteString(src[pos:])
+	return b.String(), changed, nil
+}

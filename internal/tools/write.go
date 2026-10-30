@@ -267,6 +267,7 @@ func RegisterWrite(s *mcp.Server, h Host) {
 
 	addWrite(s, h, "move", "Move a top-level func, type, const or var to another file. Same directory: the declaration and the imports only it used move; "+
 		"another directory (a package, created if missing): a type takes its methods along, package qualifiers are rewritten at every use (shapes.Square -> geom.Square), imports are fixed in every touched file. "+
+		"Without name, file_path is a package directory and to_file its new directory: the .go files move (with the packages below) and every import of the old path is rewritten. "+
 		"Refuses, with the reasons, when the moved code uses unexported identifiers that stay behind, when unexported members are used from outside, or when the move would create an import cycle. "+
 		"Writes when new errors stay within max_new_errors (default 0); apply=false previews; undo_edit reverts.",
 		moveSymbol)

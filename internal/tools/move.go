@@ -20,9 +20,9 @@ import (
 )
 
 type moveIn struct {
-	Name              string `json:"name" jsonschema:"top-level func, type, const or var, e.g. Scale or shapes.Square"`
-	FilePath          string `json:"file_path,omitempty" jsonschema:"narrows name"`
-	ToFile            string `json:"to_file" jsonschema:"destination .go file (created if missing); another directory means another package"`
+	Name              string `json:"name,omitempty" jsonschema:"top-level func, type, const or var, e.g. Scale or shapes.Square; omit to move a package directory"`
+	FilePath          string `json:"file_path,omitempty" jsonschema:"narrows name; with no name: the package directory to move"`
+	ToFile            string `json:"to_file" jsonschema:"destination .go file (created if missing); another directory means another package. With no name: the destination directory of a package move"`
 	Apply             *bool  `json:"apply,omitempty"`
 	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
 	IncludeDependents *bool  `json:"include_dependents,omitempty"`
@@ -58,8 +58,11 @@ func applyEdits(text string, es []tedit) string {
 }
 
 func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
+	if in.Name == "" && in.FilePath != "" && in.ToFile != "" {
+		return moveDirectory(ctx, w, in.FilePath, in.ToFile, in)
+	}
 	if in.Name == "" || in.ToFile == "" {
-		return "", toolerr.Inputf("move needs name and to_file.")
+		return "", toolerr.Inputf("move needs name + to_file (a symbol), or file_path + to_file as directories (a package).")
 	}
 	l, err := locate(ctx, w, in.Name, in.FilePath)
 	if err != nil {

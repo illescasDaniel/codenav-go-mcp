@@ -12,6 +12,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/tools"
@@ -90,7 +91,7 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 		if warn != "" {
 			m.board.Post(warn)
 		}
-		c := lsp.New(lsp.Options{Root: sel.Root, Command: cmd, Language: "go", InitOptions: goplsSettings()})
+		c := lsp.New(lsp.Options{Root: sel.Root, Command: cmd, Language: "go", InitOptions: goplsSettings(), WatchSuffix: ".go", SkipDir: exclude.IsDirName})
 		if err := c.Start(ctx); err != nil {
 			return nil, err
 		}
@@ -127,7 +128,9 @@ func (m *Manager) Close() {
 func New(version string) (*mcp.Server, *Manager) {
 	m := NewManager()
 	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{
-		Instructions: "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics.",
+		Instructions: "Navigate Go code with gopls: symbol_info, search_symbol, definition, references, implementations, callers, outline, hover, diagnostics. " +
+				"Edit it with edit, edit_symbol, rename_symbol, change_signature, move, quick_fix: each type-checks the change in memory first and writes only if it adds no new errors " +
+				"(apply=false previews; apply_edit applies a preview, undo_edit reverts, verify_changes re-checks the workspace).",
 	})
 	tools.RegisterNav(s, m)
 	tools.RegisterWrite(s, m)

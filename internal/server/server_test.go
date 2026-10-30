@@ -194,3 +194,38 @@ func TestMoveAcrossPackages(t *testing.T) {
 		t.Fatal("Scale must leave shapes.go")
 	}
 }
+
+func TestMovePackageDirectory(t *testing.T) {
+	cs, root := session(t, nil)
+	out := call(t, cs, "move", map[string]any{"file_path": "shapes", "to_file": "geom/shapes"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move dir:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(root, "shapes")); err == nil {
+		t.Fatal("old directory must be gone")
+	}
+	if !strings.Contains(readFile(t, root, "geom/shapes/shapes.go"), "package shapes") {
+		t.Fatal("package clause must stay")
+	}
+	if app := readFile(t, root, "app/app.go"); !strings.Contains(app, `"example.com/fx/geom/shapes"`) || strings.Contains(app, `"example.com/fx/shapes"`) {
+		t.Fatalf("import not rewritten:\n%s", app)
+	}
+}
+
+func TestPickUpFilesChangedOnDisk(t *testing.T) {
+	cs, root := session(t, nil)
+	if err := os.WriteFile(filepath.Join(root, "shapes/extra.go"), []byte("package shapes\n\nfunc Extra() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := call(t, cs, "search_symbol", map[string]any{"query": "Extra"})
+	if !strings.Contains(out, "Extra") {
+		t.Fatalf("file created behind the server's back not seen:\n%s", out)
+	}
+	if err := os.Remove(filepath.Join(root, "shapes/extra.go")); err != nil {
+		t.Fatal(err)
+	}
+	out = call(t, cs, "search_symbol", map[string]any{"query": "Extra"})
+	if strings.Contains(out, "shapes/extra.go") {
+		t.Fatalf("deleted file still reported:\n%s", out)
+	}
+}

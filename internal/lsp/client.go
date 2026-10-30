@@ -68,6 +68,10 @@ type Options struct {
 	// InitOptions is sent as initializationOptions (gopls settings).
 	InitOptions map[string]any
 	OnNotice    func(string)
+	// WatchSuffix (e.g. ".go") and SkipDir enable the disk scan in Refresh: files with the suffix
+	// that appeared, changed or vanished since the last call are reported to the server.
+	WatchSuffix string
+	SkipDir     func(name string) bool
 }
 
 // Client talks LSP to one server process.
@@ -86,6 +90,7 @@ type Client struct {
 	started  bool
 	stderr   []string
 	exited   chan struct{}
+	snapshot map[string][2]int64 // watched files on disk at the last Refresh (path -> mtime, size)
 
 	writeMu sync.Mutex
 	// opMu serialises overlay() against refresh()/EnsureOpen from other tool calls.
@@ -822,18 +827,52 @@ func (c *Client) CodeActions(ctx context.Context, path string, rng Range, only [
 		map[string]any{"textDocument": map[string]any{"uri": uri}, "range": rng, "context": ctxt}))
 }
 
-// Refresh brings the server's view of already-open files up to date with the disk
-// and reports changed files via didChangeWatchedFiles.
+// scanDisk lists the watched files below the root, capped so a huge tree cannot stall a call.
+func (c *Client) scanDisk() map[string][2]int64 {
+	out := map[string][2]int64{}
+	if c.opts.WatchSuffix == "" {
+		return out
+	}
+	_ = filepath.WalkDir(c.opts.Root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != c.opts.Root && c.opts.SkipDir != nil && c.opts.SkipDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(p, c.opts.WatchSuffix) {
+			if info, ierr := d.Info(); ierr == nil {
+				out[p] = [2]int64{info.ModTime().UnixNano(), info.Size()}
+			}
+		}
+		if len(out) >= 50000 {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return out
+}
+
+// Refresh brings the server's view up to date with the disk: open files that changed are re-read,
+// and files created, changed or deleted behind its back are reported via didChangeWatchedFiles.
 func (c *Client) Refresh() error {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
+	now := c.scanDisk()
 	c.mu.Lock()
+	prev := c.snapshot
+	c.snapshot = now
 	var stale []string
 	var changes []map[string]any
+	seen := map[string]bool{}
 	for uri, f := range c.open {
 		if _, ok := c.overlays[uri]; ok {
 			continue
 		}
+		seen[URIToPath(uri)] = true
 		st, err := os.Stat(URIToPath(uri))
 		if err != nil {
 			stale = append(stale, uri)
@@ -845,13 +884,31 @@ func (c *Client) Refresh() error {
 		}
 	}
 	c.mu.Unlock()
+	if prev != nil {
+		for p, v := range now {
+			switch old, ok := prev[p]; {
+			case !ok:
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 1})
+			case old != v && !seen[p]:
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 2})
+			}
+		}
+		for p := range prev {
+			if _, ok := now[p]; !ok && !seen[p] {
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 3})
+			}
+		}
+	}
 	for _, uri := range stale {
 		_ = c.CloseDocument(uri)
 	}
-	if len(changes) > 0 {
-		for _, ch := range changes {
-			if ch["type"] == 2 {
-				uri := ch["uri"].(string)
+	if len(changes) == 0 {
+		return nil
+	}
+	for _, ch := range changes {
+		if ch["type"] == 2 {
+			uri := ch["uri"].(string)
+			if f := c.openFileFor(uri); f {
 				p := URIToPath(uri)
 				if st, err := os.Stat(p); err == nil {
 					if text, err := readDocumentText(p); err == nil {
@@ -860,7 +917,13 @@ func (c *Client) Refresh() error {
 				}
 			}
 		}
-		return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
 	}
-	return nil
+	return c.Notify("workspace/didChangeWatchedFiles", map[string]any{"changes": changes})
+}
+
+func (c *Client) openFileFor(uri string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, ok := c.open[uri]
+	return ok
 }
