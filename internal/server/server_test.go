@@ -1013,9 +1013,18 @@ func TestInsertAtEndPreviewDiffIsClean(t *testing.T) {
 
 func TestDiagnosticsDedupesSameMessageOnLine(t *testing.T) {
 	cs, root := session(t, nil)
-	writeFile(t, root, "shapes/dup.go", "package shapes\n\nfunc Dup() int {\n\tx := 1\n\tx := 2\n\treturn x\n}\n")
+	// gopls reports a redeclaring := twice: a compiler error over the whole statement (NoNewVar) and a
+	// nonewvars analyzer warning over the ":=". When the statement spans lines they start on different
+	// lines (raw: 5:2-6:12 error, 6:5-6:7 warning), so only the range overlap ties them together.
+	writeFile(t, root, "shapes/dup.go", "package shapes\n\nfunc Dup() int {\n\ta, b := 1, 2\n\ta,\n\t\tb := 3, 4\n\treturn a + b\n}\n")
 	out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/dup.go"})
-	if n := strings.Count(out, "no new variables"); n > 1 {
-		t.Errorf("same problem listed %d times:\n%s", n, out)
+	if n := strings.Count(out, "no new variables"); n != 1 || !strings.Contains(out, "5:2 [error NoNewVar]") {
+		t.Errorf("want the problem once, as the 5:2 error; listed %d times:\n%s", n, out)
+	}
+	// Same line (raw: 5:2-5:8 error, 5:4-5:6 warning).
+	writeFile(t, root, "shapes/dup2.go", "package shapes\n\nfunc Dup2() int {\n\tx := 1\n\tx := 2\n\treturn x\n}\n")
+	out = call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/dup2.go"})
+	if n := strings.Count(out, "no new variables"); n != 1 || !strings.Contains(out, "5:2 [error NoNewVar]") {
+		t.Errorf("want the problem once, as the 5:2 error; listed %d times:\n%s", n, out)
 	}
 }

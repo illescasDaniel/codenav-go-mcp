@@ -434,37 +434,8 @@ func FormatDiagnostic(d lsp.Diagnostic) string {
 	return strings.Join(out, "\n")
 }
 
-// dedupeDiagnostics merges entries with the same message on the same line (gopls sometimes reports one
-// problem as an error and again as a warning at a neighbouring column), keeping the most severe.
-func dedupeDiagnostics(items []lsp.Diagnostic) []lsp.Diagnostic {
-	type key struct {
-		line int
-		msg  string
-	}
-	rank := func(d lsp.Diagnostic) int {
-		if d.Severity == 0 {
-			return 99
-		}
-		return d.Severity
-	}
-	at := map[key]int{}
-	out := make([]lsp.Diagnostic, 0, len(items))
-	for _, d := range items {
-		k := key{d.Range.Start.Line, d.Message}
-		if i, ok := at[k]; ok {
-			if rank(d) < rank(out[i]) {
-				out[i] = d
-			}
-			continue
-		}
-		at[k] = len(out)
-		out = append(out, d)
-	}
-	return out
-}
-
 func FormatDiagnostics(items []lsp.Diagnostic, limit int) string {
-	items = dedupeDiagnostics(items)
+	items = lsp.DedupeDiagnostics(items)
 	if len(items) == 0 {
 		return "No diagnostics."
 	}

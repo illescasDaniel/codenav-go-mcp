@@ -28,6 +28,44 @@ func TestApplyTextEditsOverlap(t *testing.T) {
 	}
 }
 
+func TestUnifiedDiffInsertAtEndIsClean(t *testing.T) {
+	old := "package p\n\nfunc A() {\n}\n"
+	nw := old + "\nfunc B() {\n}\n"
+	c := FileChange{Path: "/r/x.go", Old: &old, New: &nw}
+	d := UnifiedDiff(c, "/r", 3)
+	if strings.Contains(d, "-}") || strings.Contains(d, "No newline") {
+		t.Fatalf("insert at end should not touch the old last line:\n%s", d)
+	}
+	if a, r := CountChanged(c); a != 3 || r != 0 {
+		t.Fatalf("CountChanged = +%d -%d, want +3 -0\n%s", a, r, d)
+	}
+}
+
+func TestUnifiedDiffFinalNewlineVisible(t *testing.T) {
+	withNL, withoutNL := "a\nb\n}\n", "a\nb\n}"
+	// Removing only the trailing newline.
+	c := FileChange{Path: "/r/x.go", Old: &withNL, New: &withoutNL}
+	d := UnifiedDiff(c, "/r", 3)
+	want := "-}\n+}\n" + noNewlineMarker + "\n"
+	if !strings.Contains(d, want) {
+		t.Fatalf("removing the final newline not visible, want %q in:\n%s", want, d)
+	}
+	if a, r := CountChanged(c); a != 1 || r != 1 {
+		t.Fatalf("CountChanged = +%d -%d, want +1 -1", a, r)
+	}
+	// Adding it back.
+	d = UnifiedDiff(c.Inverse(), "/r", 3)
+	if want := "-}\n" + noNewlineMarker + "\n+}\n"; !strings.Contains(d, want) {
+		t.Fatalf("adding the final newline not visible, want %q in:\n%s", want, d)
+	}
+	// Appending after a last line that had no newline: that line changes, marked like git.
+	nw := "a\nb\n}\nx\n"
+	d = UnifiedDiff(FileChange{Path: "/r/x.go", Old: &withoutNL, New: &nw}, "/r", 3)
+	if want := "-}\n" + noNewlineMarker + "\n+}\n+x\n"; !strings.Contains(d, want) {
+		t.Fatalf("want %q in:\n%s", want, d)
+	}
+}
+
 func TestUnifiedDiffAndInverse(t *testing.T) {
 	old, nw := "a\nb\nc\n", "a\nB\nc\n"
 	c := FileChange{Path: "/r/x.go", Old: &old, New: &nw}

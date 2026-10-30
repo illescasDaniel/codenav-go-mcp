@@ -293,11 +293,17 @@ func splitLines(s *string) []string {
 	if s == nil || *s == "" {
 		return nil
 	}
-	// Every line, the last included, ends in "\n": otherwise the last line of a file that gains lines
-	// after it would show as changed (-}/+}) only because it now has a line terminator.
-	parts := strings.SplitAfter(strings.TrimSuffix(*s, "\n")+"\n", "\n")
-	return parts[:len(parts)-1]
+	// Lines keep their terminator, like git: a last line without "\n" compares unequal to the same
+	// line with one, so adding or removing only the final newline still shows as a change, while a
+	// file that ends in "\n" and gains lines after it diffs cleanly (no -}/+}).
+	parts := strings.SplitAfter(*s, "\n")
+	if parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	return parts
 }
+
+const noNewlineMarker = "\\ No newline at end of file"
 
 type op struct {
 	kind byte // ' ', '-', '+'
@@ -432,6 +438,9 @@ func UnifiedDiff(c FileChange, root string, context int) string {
 			sb.WriteByte(x.kind)
 			sb.WriteString(strings.TrimSuffix(x.text, "\n"))
 			sb.WriteByte('\n')
+			if !strings.HasSuffix(x.text, "\n") {
+				sb.WriteString(noNewlineMarker + "\n")
+			}
 		}
 		i = end
 	}

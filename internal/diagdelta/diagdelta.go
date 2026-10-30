@@ -78,6 +78,7 @@ func (e Entry) Render() string {
 // FromLSP converts diagnostics of the file whose current text is text.
 func FromLSP(rel, text string, items []lsp.Diagnostic) []Entry {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	items = lsp.DedupeDiagnostics(items)
 	out := make([]Entry, 0, len(items))
 	for _, it := range items {
 		l := it.Range.Start.Line
