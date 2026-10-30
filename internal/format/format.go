@@ -127,7 +127,11 @@ func FormatWorkspaceSymbol(s *lsp.Symbol, root string) string {
 	if uri != "" {
 		rel = Relative(uri, root)
 	}
-	return fmt.Sprintf("%s  [%s]  (%s:%d:%d)", s.Name, KindLabel(s.Kind), rel, line+1, col+1)
+	out := fmt.Sprintf("%s  [%s]  (%s:%d:%d)", s.Name, KindLabel(s.Kind), rel, line+1, col+1)
+	if s.Detail != "" {
+		out += "  build: " + s.Detail // a declaration in a file with a build constraint (from the symbol index)
+	}
+	return out
 }
 
 // BaseName is the last dotted component of a gopls symbol name ("shapes.Square.Area" -> "Area").
@@ -140,8 +144,16 @@ func BaseName(name string) string {
 
 const fuzzyTier = 4
 
+// nameFor is the part of a symbol name that a query is compared with: the last dotted component, or,
+// for a dotted query ("Square.Ar"), as many trailing components as the query has.
+func nameFor(name, query string) string {
+	parts := strings.Split(name, ".")
+	keep := min(len(parts), strings.Count(query, ".")+1)
+	return strings.Join(parts[len(parts)-keep:], ".")
+}
+
 func matchTier(name, query string) int {
-	name = BaseName(name)
+	name = nameFor(name, query)
 	switch {
 	case name == query:
 		return 0
@@ -163,7 +175,7 @@ func matchTier(name, query string) int {
 // at the name's first letter and stays compact (span <= 3*len(query)), or when the query is part
 // of the name's camel-hump initials (mgr for MaxGroupRate).
 func looseSpan(name, query string) (span int, ok bool) {
-	name = BaseName(name)
+	name = nameFor(name, query)
 	n, q := []rune(strings.ToLower(name)), []rune(strings.ToLower(query))
 	if len(q) == 0 {
 		return 0, true

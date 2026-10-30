@@ -23,7 +23,7 @@ import (
 
 // resolveSymbol is resolve.Resolve with a Go-aware explanation when nothing matches.
 func resolveSymbol(ctx context.Context, w *Workspace, name, file string) (resolve.Symbol, error) {
-	sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, file)
+	sym, err := resolve.Resolve(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if errors.As(err, &nf) {
 		return sym, toolerr.Inputf("%s", notFoundMessage(ctx, w, nf.Query, false))
@@ -36,7 +36,7 @@ func resolveSymbol(ctx context.Context, w *Workspace, name, file string) (resolv
 // a scratch gopls overlay (resolve.Probe). Write tools keep to workspace symbols: their guard refuses
 // GOROOT and the module cache anyway.
 func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (resolve.Symbol, error) {
-	sym, err := resolve.Resolve(ctx, w.Client, w.Root, name, file)
+	sym, err := resolve.Resolve(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if !errors.As(err, &nf) {
 		return sym, err

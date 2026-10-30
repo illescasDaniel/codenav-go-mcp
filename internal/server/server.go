@@ -14,6 +14,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/tools"
@@ -37,6 +38,7 @@ type Manager struct {
 
 	mu      sync.Mutex
 	client  *lsp.Client
+	index   *index.Index
 	sel     workspace.Selection
 	journal *txn.Journal
 	store   *txn.PlanStore
@@ -97,6 +99,7 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 			return nil, err
 		}
 		m.client = c
+		m.index = index.New(sel.Root)
 		switch {
 		case m.journal == nil:
 			m.journal, m.store = txn.NewJournal(guardFor(sel.Root)), txn.NewPlanStore()
@@ -113,11 +116,14 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 	if err := m.client.Refresh(); err != nil {
 		return nil, err
 	}
+	if err := m.index.Refresh(); err != nil {
+		return nil, err
+	}
 	// Modules found after the start (or listed in a go.work since) join or leave the server's folders.
 	if err := m.client.SyncFolders(uncoveredDirs(m.sel.Root)); err != nil {
 		return nil, err
 	}
-	return &tools.Workspace{Client: m.client, Root: m.sel.Root, Source: m.sel.Source, Journal: m.journal, Store: m.store}, nil
+	return &tools.Workspace{Client: m.client, Index: m.index, Root: m.sel.Root, Source: m.sel.Source, Journal: m.journal, Store: m.store}, nil
 }
 
 // maxExtraFolders bounds how many uncovered nested modules become gopls workspace folders.

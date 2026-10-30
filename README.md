@@ -45,11 +45,11 @@ from your home directory. Prebuilt binaries are attached to each GitHub release.
 | `outline` | What's in this file? |
 | `callers` | Who calls this function? (call hierarchy) |
 | `implementations` | Which types implement this interface, or which interfaces does this type satisfy? |
-| `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters) |
+| `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters). Exact and prefix matches come from an own declaration index, so they are never capped or missed; gopls adds the fuzzy ones |
 | `workspace` | Which directory is being navigated, and why |
 | `hover`, `definition`, `references`, `diagnostics` | Position tools (`path:line:col`) |
 
-Names may be dotted: `Type.Method`, `Type.Field`, `pkg.Name`. `name` and `query` are
+Names may be dotted: `Type.Method`, `Type.Field`, `pkg.Name` (`pkg` is the package name or its directory's name). `name` and `query` are
 aliases; a missing parameter gets a short hint instead of a validation error.
 
 ## Write tools: type check before every write
@@ -62,11 +62,11 @@ written until that is on the table. Output is always gofmt-ed with imports fixed
 | Tool | Does |
 |------|------|
 | `edit` | Type-checked text edit of a Go file: `old_string`/`new_string` or a whole `new_text` |
-| `edit_symbol` | `replace` / `insert` / `delete` a func, method, type, const or var by name; `imports=[...]` added. Delete refuses while the symbol is used |
-| `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs |
+| `edit_symbol` | `replace` / `insert` / `delete` a func, method, type, const or var by name; `imports=[...]` added. Delete refuses while the symbol is used. Replacing a struct type notes every field whose struct tag changed or that lost its tag with the field |
+| `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs. Renaming a field that carries a struct tag notes that the tag values (`json:"user_name"`, ...) were not changed |
 | `change_signature` | Add / remove / reorder parameters and rewrite every call site; linked methods follow. Uses as a value are listed as manual work |
 | `move` | With `name`: move a top-level func, type, const or var to another file, in the same or another package (qualifiers and imports rewritten; refuses unexported-use problems, import cycles and name clashes). Without `name`: move a package directory (`file_path` -> `to_file`) and rewrite every import |
-| `quick_fix` | Apply gopls's quick fixes and organize imports; ambiguous fixes are listed instead of guessed. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
+| `quick_fix` | Apply gopls's quick fixes (plus own fixes for `declared and not used`: mark it used, or remove it) and organize imports; ambiguous fixes are listed instead of guessed. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
 | `verify_changes` | Which errors the working tree gained or lost since a git revision (default `HEAD`) |
 | `apply_edit` / `undo_edit` | Write a previewed edit by id; revert an applied one |
 
@@ -107,9 +107,19 @@ constraints is invisible to the type check (the response says when an edit touch
   resolve through a scratch file that exists only as a gopls overlay (never on disk). A short qualifier is
   matched against the imports seen in the workspace and the standard library; a full import path always
   works. A package no module provides is reported as such. Write tools refuse these symbols.
-- **Large workspaces:** gopls returns at most 100 symbols per query. An exact name hidden among more
-  fuzzy matches is still found, because a suffix query and a qualified query are retried, but `search_symbol`
-  output for broad queries is truncated.
+- **Symbol index:** next to gopls the server keeps its own index of declarations (funcs, methods, types,
+  struct fields, interface methods, vars, consts) built with `go/parser` from every `.go` file below the
+  workspace root, skipping `.git`, `vendor`, `node_modules`, `testdata`, hidden and `_` directories. It is
+  refreshed on every call (only files whose mtime or size changed are re-parsed) and does not depend on
+  the build configuration. Name lookups merge it with gopls: gopls supplies kind and position where it has
+  the symbol, and the index adds declarations gopls misses (files behind build tags, other GOOS/GOARCH
+  files, packages that are not built, a directory created a moment ago). A name declared in several files
+  is therefore reported as ambiguous, each file with its build constraint (`build: //go:build !linux`),
+  and `file_path` picks one; a declaration only in a constrained file is used as is, and write tools say
+  the type check cannot see it. `search_symbol` adds the index's exact and prefix matches to gopls's
+  (capped, fuzzy) answer, so those are never missing; the fuzzy tail is still gopls's, and the output is
+  still limited to 50 lines. Local variables and parameters are not indexed. A declaration from an
+  unsaved or non-`.go` source is not seen.
 - **New directories:** files written outside the tools are picked up on the next call. A brand-new
   package directory is loaded by opening one of its files, so the first call after creating it can
   take a moment longer.
@@ -128,10 +138,23 @@ constraints is invisible to the type check (the response says when an edit touch
   the in-memory "after" state (by a `//go:build ignore` stub when the whole directory goes), so importers
   the rewrite missed show up as errors. Only importers gopls loads under the current GOOS/GOARCH and
   `CODENAV_GO_MCP_BUILD_FLAGS` are seen.
-- **Unused local variables:** gopls offers no fix for `declared and not used`, so `quick_fix` adds its own,
-  "Mark x as used (`_ = x`)", after the declaring statement (or at the start of each body or clause for
-  `if`/`for`/`switch` initializers, range variables and type-switch bindings). Removing the variable is
-  still a job for `edit`. Unused parameters are not handled.
+- **Unused local variables:** gopls offers no fix for `declared and not used`, so `quick_fix` adds two of its
+  own, and with both on offer it lists them and waits for `choice=`:
+  "Mark x as used (`_ = x`)" adds the line after the declaring statement (or at the start of each body or
+  clause for `if`/`for`/`switch` initializers, range variables and type-switch bindings), and
+  "Remove unused variable x" deletes the declaration while keeping what its initializer does: a statement
+  with no side effects (identifiers, literals, selectors, composite literals, conversions) goes; `x := f()`
+  becomes `f()` (`_ = expr` when the call is part of a larger expression); `a, x := f()` becomes `a, _ := f()`
+  (`=` when no new variable would be left); members of a `var (...)` group leave it; initializers, range
+  variables, type-switch bindings and select receives are dropped or blanked. Parameters, results and
+  labelled statements get no fix. Removing a variable can leave the variables it was computed from unused;
+  that shows up as a new error, so nothing is written, and a second run removes them. A conversion to a
+  user-defined type that is the whole right-hand side is treated as a call (`MyInt(f())`), which the type
+  check rejects rather than writes.
+- **Struct tags:** renames change Go identifiers only. `rename_symbol` on a field that has a struct tag, and
+  `edit_symbol` `replace` of a struct type whose tags changed (or whose tagged field disappeared), say so in a
+  note; there is no note for fields without tags, and no guessing about reflection or `encoding/json` use.
+  `change_signature` and `move` have no tag-specific behaviour.
 
 ## Which `gopls` runs
 

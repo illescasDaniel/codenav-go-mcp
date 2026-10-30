@@ -87,7 +87,7 @@ func siblingDecls(w *Workspace, path, text, name string) []string {
 
 func locate(ctx context.Context, w *Workspace, name, file string) (*located, error) {
 	sym, err := resolveSymbol(ctx, w, name, file)
-	unbuilt := false
+	unbuilt := err == nil && sym.Unbuilt
 	if err != nil && file != "" && strings.HasPrefix(err.Error(), "No symbol") {
 		// The file may be excluded from the current build (a build tag): gopls does not index it.
 		if abs, aerr := w.absPath(file); aerr == nil {
@@ -248,7 +248,26 @@ func replaceSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source st
 	if names, nerr := gosrc.DeclNames(source); nerr == nil && !l.decl.Grouped && len(names) == 1 && !strings.HasSuffix("."+names[0], "."+l.decl.Name) {
 		notes = append(notes, fmt.Sprintf("The new definition is called %s, not %s; its callers are not renamed (use rename_symbol).", names[0], l.decl.Name))
 	}
+	if l.decl.Keyword == "type" {
+		for _, c := range gosrc.StructTagChanges(l.text[l.decl.Start:l.decl.End], source) {
+			notes = append(notes, tagChangeNote(c))
+		}
+	}
 	return planFile(l.path, "replace "+in.Name, next, l.text, true, l.bom, notes...)
+}
+
+// tagChangeNote describes a field whose struct tag differs between the old and the new definition.
+func tagChangeNote(c gosrc.TagChange) string {
+	show := func(tag string) string {
+		if tag == "" {
+			return "no tag"
+		}
+		return gosrc.FormatTag(tag)
+	}
+	if c.Gone {
+		return fmt.Sprintf("field %s had struct tags (%s) and is not in the new definition: serialised names change unless the field that replaces it carries the tag.", c.Field, gosrc.FormatTag(c.Old))
+	}
+	return fmt.Sprintf("struct tag changed on %s: %s -> %s; encoded names (json, db, yaml, ...) follow the new tag.", c.Field, show(c.Old), show(c.New))
 }
 
 func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source string) (*edits.EditPlan, error) {

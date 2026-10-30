@@ -18,9 +18,11 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/notices"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/params"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/txn"
 )
@@ -28,6 +30,7 @@ import (
 // Workspace is a started client plus the root it serves.
 type Workspace struct {
 	Client       *lsp.Client
+	Index        *index.Index // declarations of every .go file below Root (nil in tests)
 	Root, Source string
 	Journal      *txn.Journal
 	Store        *txn.PlanStore
@@ -62,6 +65,33 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 		}
 		return text(h.Notes().Annotate(out)), nil, nil
 	})
+}
+
+// addIndexed adds the exact and prefix matches of the symbol index to gopls's (capped, build-config
+// bound) workspace symbols, so those cannot be missing; gopls's fuzzy results stay for the rest. A
+// declaration gopls already reported (same file and line) is not added twice.
+func addIndexed(w *Workspace, q string, have []*lsp.Symbol) []*lsp.Symbol {
+	if w.Index == nil {
+		return have
+	}
+	type key struct {
+		uri  string
+		line int
+	}
+	seen := map[key]bool{}
+	for _, s := range have {
+		if uri, l, _ := format.SymbolPosition(s); uri != "" {
+			seen[key{uri, l}] = true
+		}
+	}
+	for _, e := range w.Index.Prefix(q) {
+		s := resolve.FromEntry(e)
+		if k := (key{s.Location.URI, e.Line}); !seen[k] {
+			seen[k] = true
+			have = append(have, s)
+		}
+	}
+	return have
 }
 
 func checkGoFile(p string) error {
@@ -196,16 +226,17 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			if len(syms) == 0 {
-				return fmt.Sprintf("No symbols matching %q.", q), nil
-			}
 			ptrs := make([]*lsp.Symbol, len(syms))
 			for i := range syms {
 				ptrs[i] = &syms[i]
 			}
+			ptrs = addIndexed(w, q, ptrs)
+			if len(ptrs) == 0 {
+				return fmt.Sprintf("No symbols matching %q.", q), nil
+			}
 			kept := format.FilterByKindAndPath(ptrs, w.Root, kinds, in.Path)
 			if len(kept) == 0 {
-				return fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", q, len(syms)), nil
+				return fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", q, len(ptrs)), nil
 			}
 			return format.FormatWorkspaceSymbols(kept, w.Root, q, format.DefaultSearchSymbolLimit, in.Fuzzy), nil
 		})

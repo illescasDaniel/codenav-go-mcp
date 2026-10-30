@@ -261,6 +261,11 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	if in.Parameter == "" && gosrc.IsEmbeddedFieldAt(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)) {
 		notes = append(notes, fmt.Sprintf("%s is an embedded field; renaming it also renames the type %s (and every other embedding of it).", oldName, oldName))
 	}
+	if in.Parameter == "" {
+		if n := fieldTagNote(ctx, w, root.path, text, rng, oldName); n != "" {
+			notes = append(notes, n)
+		}
+	}
 	if len(linked) > 0 {
 		var lines []string
 		seenLine := map[string]bool{}
@@ -551,4 +556,27 @@ func uniqueSorted(xs []string) []string {
 		}
 	}
 	return out[:k]
+}
+
+// fieldTagNote says that the struct field being renamed carries a struct tag: gopls renames the Go
+// identifier only, so the serialised name (json, db, yaml, xml, ...) stays as the tag has it. rng is the
+// renamed identifier in text (file path); a rename started at a use is followed to the field's declaration.
+func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp.Range, oldName string) string {
+	declPath, declText, off := path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)
+	if defs, err := w.Client.Definition(ctx, path, rng.Start.Line+1, rng.Start.Character+1); err == nil && len(defs) > 0 {
+		if p := lsp.URIToPath(defs[0].URI); p != "" {
+			if src, _, rerr := edits.ReadSource(p); rerr == nil {
+				declPath, declText, off = p, src, edits.Offset(src, defs[0].Range.Start.Line, defs[0].Range.Start.Character)
+			}
+		}
+	}
+	tag, found := gosrc.FieldTagAt(declPath, declText, off)
+	if !found || tag == "" {
+		return ""
+	}
+	extra := ""
+	if gosrc.TagNamesField(tag, oldName) {
+		extra = fmt.Sprintf(" (a tag value equals the old name %s, so it no longer matches the field)", oldName)
+	}
+	return fmt.Sprintf("field %s has struct tags (%s); the tag values were not changed - serialised names stay the same / update them if the wire format should change%s.", oldName, gosrc.FormatTag(tag), extra)
 }

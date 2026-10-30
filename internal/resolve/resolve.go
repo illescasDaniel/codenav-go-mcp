@@ -7,8 +7,10 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -20,6 +22,9 @@ type Symbol struct {
 	URI           string
 	Line, Column  int
 	ContainerName string
+	// Unbuilt: only the symbol index knows the declaration, and its file carries a build constraint, so
+	// gopls (current GOOS/GOARCH/tags) does not type-check it.
+	Unbuilt bool
 }
 
 // Rel is the workspace-relative path of the symbol's file.
@@ -92,6 +97,9 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 		if c.ContainerName != "" {
 			lines[i] += "  in " + c.ContainerName
 		}
+		if c.Detail != "" {
+			lines[i] += "  (" + c.Detail + ")"
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -155,8 +163,59 @@ func lookup(ctx context.Context, c *lsp.Client, query, last string) ([]*lsp.Symb
 	return all, nil
 }
 
-// Resolve finds the one symbol named query, optionally restricted to file (workspace-relative).
-func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symbol, error) {
+// FromEntry converts an index entry to a workspace symbol; Detail carries the build constraint.
+func FromEntry(e index.Entry) *lsp.Symbol {
+	end := e.Col
+	for _, r := range e.Name {
+		end += utf16.RuneLen(r)
+	}
+	return &lsp.Symbol{
+		Name: e.Qual(), Kind: e.Kind, ContainerName: e.Pkg, Detail: e.Constraint,
+		Location: &lsp.Location{URI: lsp.PathToURI(e.File), Range: lsp.Range{
+			Start: lsp.Position{Line: e.Line, Character: e.Col},
+			End:   lsp.Position{Line: e.Line, Character: end},
+		}},
+	}
+}
+
+// merge adds the declarations the index knows and gopls did not report to the exact and loose lists
+// (matched on file and line). Where gopls has the symbol it stays the source of kind and position; a
+// build constraint on its file is noted in Detail. onlyIndex marks the symbols that came from the index.
+func merge(ix *index.Index, query string, exact, loose []*lsp.Symbol) (ex, lo []*lsp.Symbol, onlyIndex map[*lsp.Symbol]bool) {
+	onlyIndex = map[*lsp.Symbol]bool{}
+	if ix == nil {
+		return exact, loose, onlyIndex
+	}
+	ie, il := ix.Lookup(query)
+	fold := func(have []*lsp.Symbol, entries []index.Entry) []*lsp.Symbol {
+		for _, e := range entries {
+			uri := lsp.PathToURI(e.File)
+			var hit *lsp.Symbol
+			for _, s := range have {
+				if _, l, _ := format.SymbolPosition(s); s.Location.URI == uri && l == e.Line {
+					hit = s
+					break
+				}
+			}
+			switch {
+			case hit != nil:
+				if e.Constraint != "" && hit.Detail == "" {
+					hit.Detail = e.Constraint
+				}
+			default:
+				s := FromEntry(e)
+				onlyIndex[s] = true
+				have = append(have, s)
+			}
+		}
+		return have
+	}
+	return fold(exact, ie), fold(loose, il), onlyIndex
+}
+
+// Resolve finds the one symbol named query, optionally restricted to file (workspace-relative). ix, when
+// not nil, is consulted next to gopls: it knows every declaring file, built or not.
+func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, file string) (Symbol, error) {
 	query = strings.TrimSpace(query)
 	last := query
 	if i := strings.LastIndex(query, "."); i >= 0 {
@@ -167,7 +226,7 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 		return Symbol{}, err
 	}
 	var exact, loose []*lsp.Symbol
-	for _, s := range format.Rank(all, last) {
+	for _, s := range all {
 		switch matches(s, query) {
 		case 2:
 			exact = append(exact, s)
@@ -175,6 +234,8 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 			loose = append(loose, s)
 		}
 	}
+	exact, loose, onlyIndex := merge(ix, query, exact, loose)
+	exact, loose = format.Rank(exact, last), format.Rank(loose, last)
 	// A case-exact match beats a merely case-insensitive one.
 	cands := exact
 	if len(cands) == 0 {
@@ -205,7 +266,9 @@ func Resolve(ctx context.Context, c *lsp.Client, root, query, file string) (Symb
 		}
 		return Symbol{}, &NotFoundError{Query: query, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q%s.", query, hint)}}
 	case 1:
-		return fromLSP(cands[0]), nil
+		sym := fromLSP(cands[0])
+		sym.Unbuilt = onlyIndex[cands[0]] && cands[0].Detail != ""
+		return sym, nil
 	}
 	sameFile := true
 	for _, c := range cands {

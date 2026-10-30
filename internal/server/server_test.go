@@ -1255,7 +1255,7 @@ func TestQuickFixChoiceWithoutMatch(t *testing.T) {
 func TestQuickFixUnusedVariable(t *testing.T) {
 	cs, root := session(t, nil)
 	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc unusedVar() {\n\tx := 1 // note\n\tfor i := range 3 {\n\t}\n}\n")
-	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Mark"})
 	want := "package shapes\n\nfunc unusedVar() {\n\tx := 1 // note\n\t_ = x\n\tfor i := range 3 {\n\t\t_ = i\n\t}\n}\n"
 	if got := readFile(t, root, "shapes/unused.go"); got != want || !strings.Contains(out, "Applied: Mark x as used (_ = x); Mark i as used (_ = i)") || !strings.HasSuffix(out, "Not fixed: none") {
 		t.Errorf("want _ = x and _ = i inserted and the contract lines, got:\n%s\n%s", out, got)
@@ -1265,7 +1265,7 @@ func TestQuickFixUnusedVariable(t *testing.T) {
 func TestQuickFixUnusedVariableCRLF(t *testing.T) {
 	cs, root := session(t, nil)
 	writeFile(t, root, "shapes/unused.go", "package shapes\r\n\r\nfunc unusedVar() {\r\n\tx := 1\r\n}\r\n")
-	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Mark"})
 	if got := readFile(t, root, "shapes/unused.go"); got != "package shapes\r\n\r\nfunc unusedVar() {\r\n\tx := 1\r\n\t_ = x\r\n}\r\n" {
 		t.Errorf("line endings must stay CRLF: %q", got)
 	}
@@ -1274,7 +1274,7 @@ func TestQuickFixUnusedVariableCRLF(t *testing.T) {
 func TestQuickFixShadowedVariableOnlyThatDeclaration(t *testing.T) {
 	cs, root := session(t, nil)
 	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc shadow() int {\n\tx := 1\n\tf := func() {\n\t\tx := 2\n\t}\n\tf()\n\treturn x\n}\n")
-	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Mark"})
 	want := "package shapes\n\nfunc shadow() int {\n\tx := 1\n\tf := func() {\n\t\tx := 2\n\t\t_ = x\n\t}\n\tf()\n\treturn x\n}\n"
 	if got := readFile(t, root, "shapes/unused.go"); got != want {
 		t.Errorf("only the closure's x gets the use:\n%s", got)
@@ -1296,11 +1296,11 @@ func writeMixedDiagnostics(t *testing.T, root string, withBad bool) string {
 func TestQuickFixStrictAppliesNothingWhenSomethingIsLeft(t *testing.T) {
 	cs, root := session(t, nil)
 	src := writeMixedDiagnostics(t, root, true)
-	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go", "strict": true})
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go", "choice": "Mark", "strict": true})
 	if readFile(t, root, "shapes/mixed.go") != src || !strings.Contains(out, "strict=true") || !strings.Contains(out, "Applied: nothing") || !strings.Contains(out, "Not fixed: ") || !strings.Contains(out, "(reason: ") {
 		t.Errorf("strict must apply nothing and say why:\n%s", out)
 	}
-	out = call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go"})
+	out = call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/mixed.go", "choice": "Mark"})
 	if !strings.Contains(readFile(t, root, "shapes/mixed.go"), "_ = x") || !strings.Contains(out, "reason: no fix offered") || !strings.Contains(out, "Applied: Mark x as used") {
 		t.Errorf("non-strict applies what it can and lists the rest:\n%s", out)
 	}
@@ -1587,5 +1587,155 @@ func TestCgoPackage(t *testing.T) {
 	out = call(t, cs, "edit", map[string]any{"file_path": "cg/cg.go", "old_string": "return int(C.add(C.int(a), C.int(b)))", "new_string": "return int(C.add(C.int(a), \"x\"))"})
 	if strings.Contains(out, "Applied") {
 		t.Errorf("a type error inside a cgo call must block the write:\n%s", out)
+	}
+}
+
+func TestSymbolIndexExactNameAmongManyFuzzy(t *testing.T) {
+	cs, root := session(t, nil)
+	var b strings.Builder
+	b.WriteString("package crowd\n\nfunc Handle() {}\n")
+	for i := 0; i < 180; i++ {
+		fmt.Fprintf(&b, "func Handle%d() {}\nfunc handleLower%d() {}\n", i, i)
+	}
+	writeFile(t, root, "crowd/c.go", b.String())
+	out := call(t, cs, "search_symbol", map[string]any{"query": "Handle"})
+	if first := strings.SplitN(out, "\n", 2)[0]; !strings.HasPrefix(first, "Handle  [function]  (crowd/c.go:3:6)") {
+		t.Errorf("the exact name must lead the results:\n%s", out)
+	}
+	// Every name in the crowd is found by its exact name, whatever gopls's cap and fuzzy scoring drop.
+	for _, n := range []string{"Handle0", "Handle99", "Handle179", "handleLower7"} {
+		if out := call(t, cs, "search_symbol", map[string]any{"query": n}); !strings.HasPrefix(out, n+"  [function]") {
+			t.Errorf("%s must lead its search:\n%s", n, out)
+		}
+		if out := call(t, cs, "symbol_info", map[string]any{"name": "crowd." + n, "include_references": false}); !strings.Contains(out, "crowd/c.go:") {
+			t.Errorf("crowd.%s must resolve:\n%s", n, out)
+		}
+	}
+}
+
+func TestSymbolIndexListsBuildTaggedDuplicates(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/os_a.go", "//go:build linux\n\npackage shapes\n\nfunc OSName() string { return \"l\" }\n")
+	writeFile(t, root, "shapes/os_b.go", "//go:build !linux\n\npackage shapes\n\nfunc OSName() string { return \"o\" }\n")
+	out := call(t, cs, "symbol_info", map[string]any{"name": "OSName", "include_references": false})
+	if !strings.Contains(out, "2 symbols match") || !strings.Contains(out, "shapes/os_a.go") || !strings.Contains(out, "shapes/os_b.go") || !strings.Contains(out, "//go:build !linux") {
+		t.Errorf("both declaring files must be listed, with the constraint:\n%s", out)
+	}
+	out = call(t, cs, "symbol_info", map[string]any{"name": "OSName", "file_path": "shapes/os_b.go", "include_references": false})
+	if strings.Contains(out, "symbols match") || !strings.Contains(out, "os_b.go:5:6") {
+		t.Errorf("file_path must pick the unbuilt twin:\n%s", out)
+	}
+	out = call(t, cs, "search_symbol", map[string]any{"query": "OSName"})
+	if !strings.Contains(out, "os_a.go") || !strings.Contains(out, "os_b.go") {
+		t.Errorf("search_symbol must list both:\n%s", out)
+	}
+}
+
+func TestSymbolIndexSeesNewDirectoryWithoutGopls(t *testing.T) {
+	cs, root := session(t, nil)
+	// An ignored-by-build file in a brand-new directory is never loaded by gopls; only the index has it.
+	writeFile(t, root, "fresh/z.go", "//go:build ignore\n\npackage fresh\n\ntype Zed struct{ Name string }\n\nfunc (z Zed) Hello() {}\n")
+	out := call(t, cs, "search_symbol", map[string]any{"query": "Zed"})
+	if !strings.Contains(out, "Zed  [struct]  (fresh/z.go:5:6)") {
+		t.Errorf("search_symbol must find the new directory's type at once:\n%s", out)
+	}
+	out = call(t, cs, "search_symbol", map[string]any{"query": "Zed.Hel"})
+	if !strings.Contains(out, "Zed.Hello  [method]  (fresh/z.go:7:14)") {
+		t.Errorf("a prefix of Type.Method must find the method:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "fresh.Zed.Hello", "source": "func (z Zed) Hello() { _ = z.Name }"})
+	if !strings.Contains(readFile(t, root, "fresh/z.go"), "_ = z.Name") {
+		t.Errorf("edit_symbol must reach the unbuilt declaration through the index:\n%s", out)
+	}
+}
+
+func TestQuickFixUnusedVariableOffersBothFixes(t *testing.T) {
+	cs, root := session(t, nil)
+	src := "package shapes\n\nfunc unusedVar() {\n\tx := 1\n}\n"
+	writeFile(t, root, "shapes/unused.go", src)
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go"})
+	if readFile(t, root, "shapes/unused.go") != src || !strings.Contains(out, "Mark x as used (_ = x)") || !strings.Contains(out, "Remove unused variable x") || !strings.Contains(out, "choice=") {
+		t.Errorf("two fixes must be listed, nothing applied:\n%s", out)
+	}
+}
+
+func TestQuickFixRemoveUnusedVariable(t *testing.T) {
+	const head = "package shapes\n\nimport \"strings\"\n\nfunc use(...any) {}\nfunc two() (int, error) { return 1, nil }\n\n"
+	cases := []struct{ name, body, want string }{
+		{"plain", "func a() {\n\tx := 1 // note\n\tuse()\n}\n", "func a() {\n\tuse()\n}\n"},
+		{"side effect call", "func a() {\n\tx := strings.ToUpper(\"a\")\n}\n", "func a() {\n\tstrings.ToUpper(\"a\")\n}\n"},
+		{"multi-assign", "func a() {\n\tn, x := two()\n\tuse(n)\n}\n", "func a() {\n\tn, _ := two()\n\tuse(n)\n}\n"},
+		{"multi-assign without new variable", "func a() {\n\tvar n int\n\tn, x := two()\n\tuse(n)\n}\n", "func a() {\n\tvar n int\n\tn, _ = two()\n\tuse(n)\n}\n"},
+		{"var group", "func a() {\n\tvar (\n\t\tn int\n\t\tx int\n\t)\n\tuse(n)\n}\n", "func a() {\n\tvar (\n\t\tn int\n\t)\n\tuse(n)\n}\n"},
+		{"closure shadowing", "func a() int {\n\tx := 1\n\tf := func() {\n\t\tx := 2\n\t}\n\tf()\n\treturn x\n}\n", "func a() int {\n\tx := 1\n\tf := func() {\n\t}\n\tf()\n\treturn x\n}\n"},
+		{"if init", "func a() {\n\tif x := 1; true {\n\t\tuse()\n\t}\n}\n", "func a() {\n\tif true {\n\t\tuse()\n\t}\n}\n"},
+		{"range value", "func a(xs []int) {\n\tfor i, x := range xs {\n\t\tuse(i)\n\t}\n}\n", "func a(xs []int) {\n\tfor i := range xs {\n\t\tuse(i)\n\t}\n}\n"},
+	}
+	for _, c := range cases {
+		cs, root := session(t, nil)
+		writeFile(t, root, "shapes/unused.go", head+c.body)
+		out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Remove"})
+		want := head + c.want
+		if got := readFile(t, root, "shapes/unused.go"); got != want || !strings.Contains(out, "Applied: Remove unused variable") {
+			t.Errorf("%s:\n%s\n--- got:\n%s", c.name, out, got)
+		}
+	}
+}
+
+func TestQuickFixRemoveUnusedVariableCRLF(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\r\n\r\nfunc unusedVar() {\r\n\tx := 1\r\n}\r\n")
+	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Remove"})
+	if got := readFile(t, root, "shapes/unused.go"); got != "package shapes\r\n\r\nfunc unusedVar() {\r\n}\r\n" {
+		t.Errorf("line endings must stay CRLF: %q", got)
+	}
+}
+
+func TestQuickFixRemoveTwoUnusedVariables(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc unusedVar() {\n\tx := 1\n\ty := 2\n}\n")
+	// Both variables in one run: the edits are disjoint and both go.
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Remove"})
+	if got := readFile(t, root, "shapes/unused.go"); got != "package shapes\n\nfunc unusedVar() {\n}\n" {
+		t.Errorf("both removed:\n%s\n%s", out, got)
+	}
+}
+
+func TestRenameFieldWithStructTagNote(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/user.go", "package shapes\n\ntype User struct {\n\tUserName string `json:\"user_name\" db:\"user_name\"`\n\tAge      int\n}\n\nfunc (u User) Label() string { return u.UserName }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "User.UserName", "new_name": "Login", "apply": false})
+	for _, want := range []string{`field UserName has struct tags (json:"user_name", db:"user_name")`, "tag values were not changed", "serialised names stay the same", "update them if the wire format should change"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("want %q in:\n%s", want, out)
+		}
+	}
+	if out := call(t, cs, "rename_symbol", map[string]any{"name": "User.Age", "new_name": "Years", "apply": false}); strings.Contains(out, "struct tags") {
+		t.Errorf("a field without a tag gets no tag note:\n%s", out)
+	}
+	// Renaming from a use site follows the definition.
+	out = call(t, cs, "rename_symbol", map[string]any{"file_path": "shapes/user.go", "line": 8, "column": 42, "new_name": "Login", "apply": false})
+	if !strings.Contains(out, "has struct tags") {
+		t.Errorf("rename started at a use must note the tag:\n%s", out)
+	}
+	// A tag value equal to the old name is called out.
+	writeFile(t, root, "shapes/user2.go", "package shapes\n\ntype Rec struct {\n\tName string `json:\"Name\"`\n}\n")
+	if out := call(t, cs, "rename_symbol", map[string]any{"name": "Rec.Name", "new_name": "Title", "apply": false}); !strings.Contains(out, "equals the old name") {
+		t.Errorf("tag equal to the old name:\n%s", out)
+	}
+}
+
+func TestEditSymbolReplaceStructTagNotes(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/user.go", "package shapes\n\ntype User struct {\n\tName string `json:\"name\"`\n\tAge  int    `json:\"age\"`\n}\n")
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "User", "apply": false,
+		"source": "type User struct {\n\tName string `json:\"full_name\"`\n\tAge  int\n}"})
+	if !strings.Contains(out, `struct tag changed on Name: json:"name" -> json:"full_name"`) || !strings.Contains(out, "struct tag changed on Age:") || !strings.Contains(out, "no tag") {
+		t.Errorf("tag changes must be noted:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "User", "apply": false,
+		"source": "type User struct {\n\tName string `json:\"name\"`\n\tAge  int    `json:\"age\"`\n\tExtra int\n}"})
+	if strings.Contains(out, "struct tag") {
+		t.Errorf("unchanged tags and an added field need no note:\n%s", out)
 	}
 }

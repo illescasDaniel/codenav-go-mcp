@@ -108,18 +108,27 @@ func isUnusedVar(d lsp.Diagnostic) bool {
 	return strings.Trim(string(d.Code), `"`) == "UnusedVar" || strings.Contains(d.Message, "declared and not used")
 }
 
-// markUsedAction synthesizes the fix gopls does not offer for an unused local variable: `_ = x`
-// after the declaring statement (see gosrc.MarkUsed).
-func markUsedAction(abs, text string, d lsp.Diagnostic) (codeAction, bool) {
+// unusedName is the variable a "declared and not used" diagnostic names and its byte offset in text.
+func unusedName(text string, d lsp.Diagnostic) (name string, start int, ok bool) {
 	if d.Range.Start.Line != d.Range.End.Line {
-		return codeAction{}, false
+		return "", 0, false
 	}
 	start, end := edits.Offset(text, d.Range.Start.Line, d.Range.Start.Character), edits.Offset(text, d.Range.End.Line, d.Range.End.Character)
 	if end <= start || end > len(text) {
-		return codeAction{}, false
+		return "", 0, false
 	}
-	name := text[start:end]
+	name = text[start:end]
 	if !token.IsIdentifier(name) || name == "_" {
+		return "", 0, false
+	}
+	return name, start, true
+}
+
+// markUsedAction synthesizes the fix gopls does not offer for an unused local variable: `_ = x`
+// after the declaring statement (see gosrc.MarkUsed).
+func markUsedAction(abs, text string, d lsp.Diagnostic) (codeAction, bool) {
+	name, start, ok := unusedName(text, d)
+	if !ok {
 		return codeAction{}, false
 	}
 	ins, err := gosrc.MarkUsed(text, start, name)
@@ -134,6 +143,30 @@ func markUsedAction(abs, text string, d lsp.Diagnostic) (codeAction, bool) {
 	}
 	return codeAction{
 		Title: fmt.Sprintf("Mark %s as used (_ = %s)", name, name),
+		Kind:  "quickfix",
+		Edit:  &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{lsp.PathToURI(abs): tes}},
+	}, true
+}
+
+// removeUnusedAction is the second synthesized fix for an unused local variable: delete the declaration
+// and keep whatever its initializer does (see gosrc.RemoveUnused). Parameters and results get none.
+func removeUnusedAction(abs, text string, d lsp.Diagnostic) (codeAction, bool) {
+	name, start, ok := unusedName(text, d)
+	if !ok {
+		return codeAction{}, false
+	}
+	rs, err := gosrc.RemoveUnused(text, start, name)
+	if err != nil || len(rs) == 0 {
+		return codeAction{}, false
+	}
+	tes := make([]lsp.TextEdit, len(rs))
+	for i, r := range rs {
+		sl, sc := edits.PositionOf(text, r.Start)
+		el, ec := edits.PositionOf(text, r.End)
+		tes[i] = lsp.TextEdit{Range: lsp.Range{Start: lsp.Position{Line: sl, Character: sc}, End: lsp.Position{Line: el, Character: ec}}, NewText: r.Text}
+	}
+	return codeAction{
+		Title: "Remove unused variable " + name,
 		Kind:  "quickfix",
 		Edit:  &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{lsp.PathToURI(abs): tes}},
 	}, true
@@ -256,6 +289,9 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			}
 			if isUnusedVar(d) {
 				if a, ok := markUsedAction(abs, text, d); ok {
+					acts = append(acts, a)
+				}
+				if a, ok := removeUnusedAction(abs, text, d); ok {
 					acts = append(acts, a)
 				}
 			}
