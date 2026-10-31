@@ -30,7 +30,7 @@ func readableRoots(root string) []string {
 		}
 	}
 	if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
-		if f, err := modfile.ParseLax("go.mod", data, nil); err == nil {
+		if f, err := modfile.Parse("go.mod", data, nil); err == nil {
 			for _, r := range f.Replace {
 				dirs = append(dirs, replaceDir(root, r.New.Path))
 			}

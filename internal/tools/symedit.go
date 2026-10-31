@@ -27,7 +27,7 @@ type editSymbolIn struct {
 	Force             bool     `json:"force,omitempty" jsonschema:"delete even when the symbol is still used"`
 	PruneImports      *bool    `json:"prune_imports,omitempty" jsonschema:"default true: drop imports this edit leaves unused"`
 	Apply             *bool    `json:"apply,omitempty"`
-	MaxNewErrors      *int     `json:"max_new_errors,omitempty"`
+	MaxNewErrors      *int     `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool    `json:"include_dependents,omitempty"`
 }
 

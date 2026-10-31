@@ -316,7 +316,8 @@ const maxHoverBytes = 4096
 // fileLink: the file:// URLs gopls puts into stdlib doc links; the plain path reads better.
 var fileLink = regexp.MustCompile(`file://[^\s)\]>"]+`)
 
-var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/command-line-arguments[^)\n]*\)[ \t]*`)
+// A replaced module (directory) has no version, so gopls prints `pkg.go.dev/../dir@#Name`; those go too.
+var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@)\)[ \t]*`)
 
 // tidyHover drops useless links and caps the length, keeping the head (signature and summary).
 func tidyHover(t string) string {

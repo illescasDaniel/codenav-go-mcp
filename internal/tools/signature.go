@@ -30,7 +30,7 @@ type changeSigIn struct {
 	Imports           []string   `json:"imports,omitempty" jsonschema:"imports needed by the added parameters' types or values"`
 	IncludeOverrides  *bool      `json:"include_overrides,omitempty" jsonschema:"default true: change interface methods and implementations together"`
 	Apply             *bool      `json:"apply,omitempty"`
-	MaxNewErrors      *int       `json:"max_new_errors,omitempty"`
+	MaxNewErrors      *int       `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool      `json:"include_dependents,omitempty"`
 	AllowLarge        bool       `json:"allow_large,omitempty"`
 }

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -180,7 +181,7 @@ type editIn struct {
 	ReplaceAll        bool    `json:"replace_all,omitempty"`
 	NewText           string  `json:"new_text,omitempty" jsonschema:"complete new file content (also creates a new file)"`
 	Apply             *bool   `json:"apply,omitempty" jsonschema:"default true; false only previews"`
-	MaxNewErrors      *int    `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit"`
+	MaxNewErrors      *int    `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool   `json:"include_dependents,omitempty" jsonschema:"default true: also type-check importing packages"`
 }
 
@@ -229,7 +230,9 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 		w, err := h.Acquire(ctx, req.Session)
 		var out string
 		if err == nil {
-			out, err = fn(ctx, w, in)
+			if err = checkMaxNewErrors(in); err == nil {
+				out, err = fn(ctx, w, in)
+			}
 		}
 		if err != nil {
 			t, ok := toolerr.Format(err)
@@ -240,6 +243,22 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 		}
 		return text(h.Notes().Annotate(out)), nil, nil
 	})
+}
+
+// checkMaxNewErrors refuses a max_new_errors below -1 (-1 means no limit; other negatives are
+// a mistake that would silently turn the safety check off).
+func checkMaxNewErrors(in any) error {
+	b, err := json.Marshal(in)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		Max *int `json:"max_new_errors"`
+	}
+	if json.Unmarshal(b, &f) == nil && f.Max != nil && *f.Max < -1 {
+		return toolerr.Inputf("max_new_errors=%d is invalid: use a count >= 0, or -1 for no limit.", *f.Max)
+	}
+	return nil
 }
 
 func boolPtr(b bool) *bool { return &b }

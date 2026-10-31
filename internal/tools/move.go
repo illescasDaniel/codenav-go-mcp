@@ -28,7 +28,7 @@ type moveIn struct {
 	FilePath          string `json:"file_path,omitempty" jsonschema:"narrows name; with no name: the package directory to move"`
 	ToFile            string `json:"to_file" jsonschema:"destination .go file (created if missing); another directory means another package. With no name: the destination directory of a package move"`
 	Apply             *bool  `json:"apply,omitempty"`
-	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
+	MaxNewErrors      *int   `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool  `json:"include_dependents,omitempty"`
 	AllowLarge        bool   `json:"allow_large,omitempty"`
 }

@@ -1,7 +1,9 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"reflect"
 	"regexp"
 	"strings"
@@ -51,6 +53,9 @@ var missingRE = regexp.MustCompile(`required: missing properties: \[([^\]]*)\]`)
 // names the missing parameters and shows the tool's usage, the way the name-based tools already answer.
 func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && method == "tools/call" {
+			params.Arguments = dropNulls(params.Arguments)
+		}
 		res, err := next(ctx, method, req)
 		ctr, ok := res.(*mcp.CallToolResult)
 		if method != "tools/call" || err != nil || !ok || ctr == nil || !ctr.IsError || len(ctr.Content) != 1 {
@@ -80,4 +85,29 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 		tc.Text = msg
 		return res, err
 	}
+}
+
+// dropNulls removes top-level arguments whose value is JSON null, so an explicit null counts as
+// "not given": a required parameter then gets the friendly missing-parameter answer and an optional
+// one its default, instead of a schema type error.
+func dropNulls(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	changed := false
+	for k, v := range m {
+		if string(bytes.TrimSpace(v)) == "null" {
+			delete(m, k)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }
