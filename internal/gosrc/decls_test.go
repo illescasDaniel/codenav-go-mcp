@@ -129,3 +129,22 @@ func TestEditImportsCollapsesSingleImport(t *testing.T) {
 		t.Errorf("single import should collapse:\n%s", got)
 	}
 }
+
+func TestEditImportsLeavesRestOfMessyFileAlone(t *testing.T) {
+	src := "package p\n\nimport \"os\"\n\nfunc   F( a int )  int {\n\t\t  return a+1\n}\n"
+	got, err := EditImports("p.go", src, "", []string{`"strings"`}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "package p\n\nimport (\n\t\"os\"\n\t\"strings\"\n)\n\nfunc   F( a int )  int {\n\t\t  return a+1\n}\n"; got != want {
+		t.Errorf("add:\n%s", got)
+	}
+	got, err = EditImports("p.go", "package p\n\nfunc   F( a int )  int {\n\t\t  return a+1\n}\n", "", []string{`"os"`}, false)
+	if err != nil || got != "package p\n\nimport \"os\"\n\nfunc   F( a int )  int {\n\t\t  return a+1\n}\n" {
+		t.Errorf("add to a file without imports: %v\n%s", err, got)
+	}
+	got, err = DropImport("p.go", src, "", "os")
+	if err != nil || got != "package p\n\nfunc   F( a int )  int {\n\t\t  return a+1\n}\n" {
+		t.Errorf("drop the only import: %v\n%s", err, got)
+	}
+}

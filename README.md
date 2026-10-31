@@ -84,7 +84,7 @@ Safety rules, enforced in code:
 - Every applied edit is undoable unless the files changed afterwards.
 - Code that does not parse is never written. CRLF and BOM are preserved.
 - Edits touching more than 40 files need `allow_large=true`.
-- `CODENAV_GO_MCP_READ_ONLY=1` turns every write into a refusal (previews still work); `apply_edit` and `undo_edit` are not listed.
+- `CODENAV_GO_MCP_READ_ONLY=1` turns every write into a refusal that still shows the full diff; `apply=false` previews as usual and `apply=true` is refused (`apply` stays in the schemas so clients that always send it keep working). `apply_edit` and `undo_edit` are not listed.
 
 Positions are 1-indexed; `column` is a UTF-16 offset.
 
@@ -92,7 +92,7 @@ Positions are 1-indexed; `column` is a UTF-16 offset.
 when that would change `iota` values, or for `var a, b = f()`), and a method to another file of
 its own package (a type's methods follow it when it changes package).
 
-Known limits: package moves refuse directories holding non-Go files; code excluded by build
+Known limits: `move` refuses a symbol that uses cgo (`C.xxx`) because the `import "C"` preamble must stay with it; package moves refuse directories holding non-Go files; code excluded by build
 constraints is invisible to the type check (the response says when an edit touches it).
 
 ## Limitations

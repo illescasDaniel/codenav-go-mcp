@@ -262,6 +262,11 @@ func tidyHover(t string) string {
 	return t[:cut] + fmt.Sprintf("\n\n(truncated, %d more bytes)", len(t)-cut)
 }
 
+// notCompiledErr is the refusal for a file the go tool never compiles (`_x.go`, `//go:build ignore`).
+func notCompiledErr(file string) error {
+	return toolerr.Inputf("%s is not part of any package the Go toolchain builds (build constraints / name prefix); nothing to analyse.", file)
+}
+
 // friendlyNavErr turns the language server's errors about a position or file that has no analysis into
 // plain sentences.
 func friendlyNavErr(err error, file string, line, col int) error {
@@ -271,7 +276,7 @@ func friendlyNavErr(err error, file string, line, col int) error {
 	}
 	switch {
 	case strings.Contains(re.Message, "no package metadata"):
-		return toolerr.Inputf("%s is not part of any package the Go toolchain builds (build constraints / name prefix); nothing to analyse.", file)
+		return notCompiledErr(file)
 	case strings.Contains(re.Message, "no identifier found"):
 		return toolerr.Inputf("No identifier at %s:%d:%d.", file, line, col)
 	}

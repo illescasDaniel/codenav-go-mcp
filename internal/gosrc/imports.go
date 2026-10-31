@@ -29,6 +29,36 @@ func Qualifiers(expr string) []string {
 	return out
 }
 
+// UsesCgo reports whether src imports the pseudo-package "C" and the byte range [start,end) refers
+// to it (a C.xxx selector).
+func UsesCgo(filename, src string, start, end int) bool {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return false
+	}
+	cgo := false
+	for _, i := range f.Imports {
+		if i.Path.Value == `"C"` {
+			cgo = true
+		}
+	}
+	if !cgo {
+		return false
+	}
+	used := false
+	ast.Inspect(f, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := sel.X.(*ast.Ident); ok && id.Name == "C" {
+				if off := fset.Position(id.Pos()).Offset; off >= start && off < end {
+					used = true
+				}
+			}
+		}
+		return !used
+	})
+	return used
+}
+
 var versionRE = regexp.MustCompile(`^v[0-9]+$`)
 
 // ImportName is the name an import of importPath is used under without an alias: its last

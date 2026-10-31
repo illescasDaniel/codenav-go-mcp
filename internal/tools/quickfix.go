@@ -11,6 +11,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -214,6 +215,9 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 		return qfResult{}, err
 	}
 	rel := edits.RelativeName(abs, w.Root)
+	if index.Unbuildable(abs) {
+		return qfResult{}, notCompiledErr(rel)
+	}
 	all := map[string][]lsp.TextEdit{}
 	var titles []string
 

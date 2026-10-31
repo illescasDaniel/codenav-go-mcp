@@ -133,7 +133,8 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	switch {
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
-			return strings.Join(append(out, "", "Not written: "+err.Error()), "\n"), "", nil
+			// The diff still goes with the refusal: a read-only server exists to show what would change.
+			return strings.Join(append(out, "", "Not written: "+err.Error(), "", plan.Diff(w.Root, 2, 200)), "\n"), "", nil
 		}
 		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
 		if err != nil {
@@ -216,9 +217,10 @@ func readOnlyDesc(desc string, readOnly bool) string {
 func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
 	if readOnly {
-		// Nothing can be applied, so the `apply` switch is not offered either.
+		// `apply` stays in the schema (clients that always send it must keep working): apply=false previews,
+		// apply=true is refused with the diff.
 		if sch, err := jsonschema.For[In](nil); err == nil && sch.Properties["apply"] != nil {
-			delete(sch.Properties, "apply")
+			sch.Properties["apply"].Description = "this server is read-only: apply=false previews, apply=true is refused (the preview is shown with it)"
 			t.InputSchema = sch
 		}
 	}

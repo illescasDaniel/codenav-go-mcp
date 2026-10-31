@@ -13,6 +13,7 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 )
 
@@ -37,6 +38,10 @@ func collect(ctx context.Context, w *Workspace, overlays map[string]string, path
 			text = b
 		}
 		rel := edits.RelativeName(p, w.Root)
+		if index.Unbuildable(p) {
+			unchecked = append(unchecked, rel+" (not part of any package the Go toolchain builds, so the type check cannot see it)")
+			continue
+		}
 		uri, err := w.Client.EnsureOpen(p)
 		if err == nil {
 			var items []lsp.Diagnostic

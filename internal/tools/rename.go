@@ -153,6 +153,11 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 					return nil, packageRenameError(w, src[a:b], abs)
 				}
 			}
+			if identAt(abs, root.line, root.col) == "C" {
+				if imps, _ := gosrc.ImportScope(abs, src); imps["C"] != "" {
+					return nil, toolerr.Inputf("`C` is the cgo pseudo-package and can't be renamed.")
+				}
+			}
 		}
 		if syms, err := w.Client.DocumentSymbol(ctx, abs); err == nil {
 			kind = kindAt(syms, root.line, root.col)

@@ -113,6 +113,9 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 			return "", toolerr.Inputf("%s is used by production code: %s; code in a _test.go file is not part of the normal build.", in.Name, strings.Join(prod[:min(len(prod), 5)], ", "))
 		}
 	}
+	if gosrc.UsesCgo(l.path, l.text, d.Start, d.End) {
+		return "", toolerr.Inputf("%s uses cgo (C.xxx); the import \"C\" preamble must stay with it, so it can't be moved automatically.", in.Name)
+	}
 	var notes []string
 	if d.Grouped || d.MultiName {
 		if l, err = carveOut(l); err != nil {

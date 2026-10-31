@@ -261,6 +261,21 @@ func modulePathOf(gomod string) string {
 	return ""
 }
 
+// Owner finds the module that owns dir: the nearest go.mod in dir or above it. Unlike `go list -m`,
+// it does not depend on the go.work in effect, where that command lists every module.
+func Owner(dir string) (Nested, bool) {
+	for d := filepath.Clean(dir); ; {
+		if p := modulePathOf(filepath.Join(d, "go.mod")); p != "" {
+			return Nested{Path: p, Dir: d}, true
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return Nested{}, false
+		}
+		d = parent
+	}
+}
+
 // findWork returns the go.work governing root (root or an ancestor; GOWORK overrides), "" if none.
 func findWork(root string) string {
 	switch env := os.Getenv("GOWORK"); {

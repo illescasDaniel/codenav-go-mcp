@@ -2,16 +2,15 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -19,15 +18,11 @@ import (
 type moduleInfo struct{ Path, Dir string }
 
 func moduleOf(dir string) (moduleInfo, error) {
-	out, err := exec.Command("go", "list", "-C", dir, "-m", "-json").Output()
-	if err != nil {
+	m, ok := gomod.Owner(dir)
+	if !ok {
 		return moduleInfo{}, toolerr.Inputf("%s is not inside a Go module", dir)
 	}
-	var m moduleInfo
-	if err := json.Unmarshal(out, &m); err != nil || m.Path == "" {
-		return moduleInfo{}, toolerr.Inputf("%s is not inside a Go module", dir)
-	}
-	return m, nil
+	return moduleInfo{Path: m.Path, Dir: m.Dir}, nil
 }
 
 func importPathOf(m moduleInfo, dir string) (string, error) {

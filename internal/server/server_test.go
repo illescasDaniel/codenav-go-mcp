@@ -516,6 +516,21 @@ func TestOutlineGroupsAndMethodNames(t *testing.T) {
 	}
 }
 
+func TestReadOnlyAcceptsApplyAndShowsDiff(t *testing.T) {
+	cs, root := session(t, map[string]string{EnvReadOnly: "1"})
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Scale", "new_name": "Scale2", "apply": false})
+	if strings.Contains(out, "validating") || !strings.Contains(out, "Scale2") || !strings.Contains(out, "---") && !strings.Contains(out, "@@") {
+		t.Fatalf("apply=false preview in read-only mode must work and show the diff:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Scale", "new_name": "Scale2", "apply": true})
+	if !strings.Contains(out, "Not written") || !strings.Contains(out, "Scale2") || strings.Contains(out, "validating") {
+		t.Fatalf("apply=true must be refused clearly, with the diff:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "shapes/shapes.go"), "func Scale(") {
+		t.Fatal("read-only server wrote a file")
+	}
+}
+
 func TestReadOnlyBlockedEditHasNoApplyHint(t *testing.T) {
 	cs, _ := session(t, map[string]string{EnvReadOnly: "1"})
 	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "return s.Area() * k", "new_string": "return \"x\""})
@@ -887,9 +902,9 @@ func TestReadOnlyHidesApplyAndUndo(t *testing.T) {
 		if tl.Name == "edit" && (strings.Contains(tl.Description, "apply_edit") || strings.Contains(tl.Description, "undo_edit")) {
 			t.Errorf("edit description mentions apply_edit/undo_edit in read-only mode: %s", tl.Description)
 		}
-		if tl.Name == "edit" {
-			if b, _ := json.Marshal(tl.InputSchema); strings.Contains(string(b), `"apply"`) {
-				t.Errorf("read-only edit schema offers apply: %s", b)
+		if tl.Name == "edit" || tl.Name == "rename_symbol" {
+			if b, _ := json.Marshal(tl.InputSchema); !strings.Contains(string(b), `"apply"`) {
+				t.Errorf("read-only %s schema must keep apply (clients that always send it break otherwise): %s", tl.Name, b)
 			}
 		}
 	}
@@ -1948,5 +1963,84 @@ func TestRenameFieldWhoseTagHoldsTheNewName(t *testing.T) {
 	got := readFile(t, root, "shapes/titled.go")
 	if !strings.Contains(got, "Title string `json:\"Title\" db:\"title\"`") || !strings.Contains(got, "return t.Title") {
 		t.Errorf("the tag must be left intact:\n%s", got)
+	}
+}
+
+func TestWriteToolsOnUncompiledFileSayItWasNotChecked(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/_under.go", "package shapes\n\nimport \"os\"\n\nfunc UnderZQ() int { return 1 }\n")
+	const want = "is not part of any package the Go toolchain builds"
+	for _, args := range []map[string]any{{"file_path": "shapes/_under.go"}, {"file_path": "shapes/_under.go", "organize_imports": true}} {
+		if out := call(t, cs, "quick_fix", args); !strings.Contains(out, want) || strings.Contains(out, "LSP error") || strings.Contains(out, "no package metadata") {
+			t.Errorf("quick_fix %v on an uncompiled file:\n%s", args, out)
+		}
+	}
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/_under.go", "old_string": "return 1", "new_string": "return \"x\"", "apply": false})
+	if !strings.Contains(out, "not checked: shapes/_under.go") || !strings.Contains(out, "not part of any package the Go toolchain builds") {
+		t.Errorf("edit on an uncompiled file must say it was not checked:\n%s", out)
+	}
+}
+
+const messySrc = "package util\n\nimport \"fmt\"\n\nfunc   Messy( a int )  int {\n\t\t  return a+1\n}\n\nfunc Other() string { return fmt.Sprint(1) }\n"
+
+func TestImportEditsKeepMessyFileFormatting(t *testing.T) {
+	// A file that was not gofmt-clean keeps its formatting; only the import lines may change.
+	t.Run("insert with imports", func(t *testing.T) {
+		cs, root := session(t, nil)
+		writeFile(t, root, "util/messy.go", messySrc)
+		out := call(t, cs, "edit_symbol", map[string]any{"action": "insert", "file_path": "util/messy.go", "name": "Other", "source": "func Third() string { return strings.ToUpper(\"a\") }", "imports": []string{"strings"}})
+		got := readFile(t, root, "util/messy.go")
+		if !strings.Contains(got, "func   Messy( a int )  int {\n\t\t  return a+1\n}") || !strings.Contains(got, `"strings"`) {
+			t.Fatalf("insert reformatted the file or lost the import:\n%s\n%s", out, got)
+		}
+	})
+	t.Run("delete prunes import", func(t *testing.T) {
+		cs, root := session(t, nil)
+		writeFile(t, root, "util/messy.go", messySrc)
+		out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "file_path": "util/messy.go", "name": "util.Other"})
+		got := readFile(t, root, "util/messy.go")
+		if !strings.Contains(got, "func   Messy( a int )  int {\n\t\t  return a+1\n}") || strings.Contains(got, `"fmt"`) || strings.Contains(got, "Other") {
+			t.Fatalf("delete reformatted the file or kept the import:\n%s\n%s", out, got)
+		}
+	})
+	t.Run("move across packages", func(t *testing.T) {
+		cs, root := session(t, nil)
+		orig := readFile(t, root, "shapes/shapes.go")
+		// misalign a struct field in shapes.go without touching anything else
+		src := strings.Replace(orig, "// Shape is a port.", "type Pt struct {\n\tX int\n\tLongName   string\n}\n\n// Shape is a port.", 1)
+		src = strings.Replace(src, "package shapes\n", "package shapes\n\nimport \"math\"\n", 1)
+		src = strings.Replace(src, "return s.Side * s.Side }", "return math.Abs(s.Side * s.Side) }", 1)
+		writeFile(t, root, "shapes/shapes.go", src)
+		out := call(t, cs, "move", map[string]any{"name": "shapes.Square", "to_file": "util/sq.go", "max_new_errors": -1})
+		got := readFile(t, root, "shapes/shapes.go")
+		if !strings.Contains(got, "\tX int\n\tLongName   string\n") || strings.Contains(got, "type Square") || strings.Contains(got, `"math"`) {
+			t.Fatalf("move reformatted the source file (or did not move):\n%s\n%s", out, got)
+		}
+	})
+}
+
+func TestMovePackageInMultiModuleWork(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "nested/go.mod", "module example.com/nested\n\ngo 1.24\n")
+	writeFile(t, root, "nested/n.go", "package nested\n\nfunc N() int { return 1 }\n")
+	writeFile(t, root, "go.work", "go 1.24\n\nuse .\n\nuse ./nested\n")
+	out := call(t, cs, "move", map[string]any{"file_path": "shapes", "to_file": "geo", "apply": false})
+	if strings.Contains(out, "not inside a Go module") || !strings.Contains(out, "example.com/fx/shapes -> example.com/fx/geo") {
+		t.Fatalf("package move in a multi-module go.work:\n%s", out)
+	}
+}
+
+func TestCgoMoveAndRenameRefuseFriendly(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc)
+	call(t, cs, "diagnostics", map[string]any{"file_path": "cg/cg.go"})
+	out := call(t, cs, "move", map[string]any{"name": "cg.Sum", "to_file": "cg/sum.go", "apply": false})
+	if !strings.Contains(out, "uses cgo") || strings.Contains(out, "CompiledGoFiles") || strings.Contains(out, "undefined: C") {
+		t.Errorf("moving a cgo function:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"file_path": "cg/cg.go", "line": 11, "column": 37, "new_name": "plus", "apply": false})
+	if !strings.Contains(out, "cgo pseudo-package") {
+		t.Errorf("renaming C:\n%s", out)
 	}
 }

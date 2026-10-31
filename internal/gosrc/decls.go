@@ -338,11 +338,72 @@ func EditImports(filename, src, oldSrc string, add []string, prune bool) (string
 		return src, nil
 	}
 	collapseSingleImports(f)
+	return spliceImports(filename, src, fset, f)
+}
+
+// importRegion is the byte range from the start of the first import declaration (its doc comment
+// included) to the end of the last one; both offsets are the end of the package clause's line when
+// the file has no imports.
+func importRegion(filename, src string) (start, end int, has bool, err error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok || g.Tok != token.IMPORT {
+			break
+		}
+		lo, hi := g.Pos(), g.End()
+		if g.Doc != nil {
+			lo = g.Doc.Pos()
+		}
+		if !has {
+			start, has = fset.Position(lo).Offset, true
+		}
+		end = fset.Position(hi).Offset
+	}
+	if !has {
+		start = fset.Position(f.Name.End()).Offset
+		if i := strings.IndexByte(src[start:], '\n'); i >= 0 {
+			start += i
+		} else {
+			start = len(src)
+		}
+		end = start
+	}
+	return start, end, has, nil
+}
+
+// spliceImports prints the edited f and puts only its import declarations into src, in place of the
+// original ones. The rest of the text is untouched, so a file that is not gofmt-clean keeps its
+// formatting and the diff shows the import change alone.
+func spliceImports(filename, src string, fset *token.FileSet, f *ast.File) (string, error) {
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, f); err != nil {
 		return "", toolerr.Inputf("cannot print the file after editing imports: %v", err)
 	}
-	return buf.String(), nil
+	printed := buf.String()
+	ns, ne, nhas, err := importRegion(filename, printed)
+	if err != nil {
+		return "", err
+	}
+	os_, oe, ohas, err := importRegion(filename, src)
+	if err != nil {
+		return "", err
+	}
+	region := printed[ns:ne]
+	switch {
+	case nhas:
+		if !ohas {
+			region = "\n\n" + region
+		}
+		return src[:os_] + region + src[oe:], nil
+	case ohas:
+		// every import went: leave one blank line between the package clause and the rest
+		return strings.TrimRight(src[:os_], " \t\r\n") + "\n\n" + strings.TrimLeft(src[oe:], " \t\r\n"), nil
+	}
+	return src, nil
 }
 
 // DropImport removes the import `name "path"` (name "" for a plain import, "." for a dot import).
@@ -355,11 +416,7 @@ func DropImport(filename, src, name, path string) (string, error) {
 		return src, nil
 	}
 	collapseSingleImports(f)
-	var buf bytes.Buffer
-	if err := format.Node(&buf, fset, f); err != nil {
-		return "", toolerr.Inputf("cannot print the file after editing imports: %v", err)
-	}
-	return buf.String(), nil
+	return spliceImports(filename, src, fset, f)
 }
 
 // ImportsUsed lists, as `alias "path"` specs, the imports of src that the code in snippet uses.
