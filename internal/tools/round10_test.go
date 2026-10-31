@@ -1,6 +1,9 @@
 package tools
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -51,5 +54,60 @@ func TestCheckWrappedCountsLinesFromTheSnippet(t *testing.T) {
 	}
 	if err := checkWrapped("package p\nfunc A() {}", 1); err != nil {
 		t.Errorf("valid snippet: %v", err)
+	}
+}
+
+func TestCapOutput(t *testing.T) {
+	if got := capOutput("short"); got != "short" {
+		t.Errorf("under the cap nothing changes: %q", got)
+	}
+	exact := strings.Repeat("a", maxOutputBytes)
+	if got := capOutput(exact); got != exact {
+		t.Error("exactly the cap is allowed")
+	}
+	// Lines of 99 bytes + newline: cut at the last newline before the cap, and count what was left out.
+	line := strings.Repeat("b", 99) + "\n"
+	in := strings.Repeat(line, maxOutputBytes/100+500)
+	got := capOutput(in)
+	cut := strings.LastIndex(in[:maxOutputBytes], "\n")
+	want := fmt.Sprintf("%s\n... %d more byte(s) omitted (the answer is over %d bytes; narrow the request).", in[:cut], len(in)-cut, maxOutputBytes)
+	if got != want {
+		t.Errorf("cap at a line boundary: got tail %q", got[max(0, len(got)-120):])
+	}
+	// One huge line without a newline in the second half: cut at the cap itself.
+	one := strings.Repeat("c", maxOutputBytes+1234)
+	got = capOutput(one)
+	if !strings.HasPrefix(got, one[:maxOutputBytes]) || !strings.Contains(got, "1234 more byte(s) omitted") {
+		t.Errorf("single long line: tail %q", got[max(0, len(got)-120):])
+	}
+}
+
+// N8: scrub is the one place absolute workspace paths become relative.
+func TestScrubWorkspacePaths(t *testing.T) {
+	w := &Workspace{Root: "/ws/proj"}
+	for _, c := range []struct{ in, want string }{
+		{"method T.M already declared at /ws/proj/a/b.go:3:4", "method T.M already declared at a/b.go:3:4"},
+		{"/ws/proj/x.go:1:1: a; /ws/proj/y.go:2:2: b", "x.go:1:1: a; y.go:2:2: b"},
+		{"import cycle: /ws/proj/p/p.go imports /ws/proj/q/q.go", "import cycle: p/p.go imports q/q.go"},
+		{"other /ws/proj2/x.go", "other /ws/proj2/x.go"},     // another directory sharing the prefix
+		{"in /other/ws/proj/x.go", "in /other/ws/proj/x.go"}, // not at a word boundary
+		{"no paths here", "no paths here"},
+	} {
+		if got := w.scrub(c.in); got != c.want {
+			t.Errorf("scrub(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	if got := (&Workspace{}).scrub("/ws/proj/x.go"); got != "/ws/proj/x.go" {
+		t.Errorf("no root, nothing to do: %q", got)
+	}
+	// A symlinked root: messages may carry the resolved path.
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("symlinks unavailable")
+	}
+	ws := &Workspace{Root: link}
+	if got := ws.scrub("at " + real + "/a.go:1:1 and " + link + "/b.go:2:2"); got != "at a.go:1:1 and b.go:2:2" {
+		t.Errorf("both spellings of the root: %q", got)
 	}
 }
