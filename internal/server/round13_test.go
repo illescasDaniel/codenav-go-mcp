@@ -253,3 +253,16 @@ func TestSiblingNoteOnlyForSymbolsTheSiblingUses(t *testing.T) {
 		}
 	}
 }
+
+// Item 11 (g)+(h): the refusal names the clause as written (wrong_test, not wrong) and lists the external
+// test package files apart from the plain package.
+func TestPackageClauseRefusalNamesClausesAsWritten(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "pk1/a.go", "package pk1\n\nfunc A() {}\n")
+	writeFile(t, root, "pk1/x_test.go", "package pk1_test\n\nimport \"testing\"\n\nfunc TestX(t *testing.T) {}\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "pk1/new.go", "new_text": "package wrong_test\n\nfunc N() {}\n", "apply": false})
+	mustHave(t, "refusal", out, "would declare `package wrong_test`", "declare `package pk1` (a.go) and `package pk1_test` (x_test.go)")
+	if strings.Contains(out, "(a.go, x_test.go)") || strings.Contains(out, "(x_test.go, a.go)") {
+		t.Errorf("x_test.go must not be listed under pk1:\n%s", out)
+	}
+}

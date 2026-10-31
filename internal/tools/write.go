@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -377,7 +378,7 @@ func packageClauseRefusal(w *Workspace, plan *edits.EditPlan, maxNew int) error 
 		if err != nil {
 			continue
 		}
-		others := map[string][]string{}
+		others := map[string]map[string][]string{} // package -> clause as written -> files
 		for _, e := range ents {
 			p := filepath.Join(filepath.Dir(c.Path), e.Name())
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || inPlan[p] {
@@ -388,19 +389,45 @@ func packageClauseRefusal(w *Workspace, plan *edits.EditPlan, maxNew int) error 
 				continue
 			}
 			if n := pkgOfFile(p, src); n != "" {
-				others[n] = append(others[n], e.Name())
+				if others[n] == nil {
+					others[n] = map[string][]string{}
+				}
+				written := gosrc.PackageName(src)
+				others[n][written] = append(others[n][written], e.Name())
 			}
 		}
 		if len(others) != 1 {
 			continue // a new directory, or one that already mixes packages
 		}
-		for name, files := range others {
+		for name, clauses := range others {
 			if name == next {
 				continue
 			}
 			rel := edits.RelativeName(c.Path, w.Root)
-			return toolerr.Inputf("%s would declare `package %s`, but the other files of %s declare `package %s` (%s): one directory is one package. Keep `package %s`, or change the package clause of all its files; to do that file by file pass max_new_errors=-1.",
-				rel, next, edits.RelativeName(filepath.Dir(c.Path), w.Root), name, strings.Join(files[:min(len(files), 3)], ", "), name)
+			// Each clause with the files that really declare it (an external test package is another
+			// clause of the same package), the plain one first.
+			var written []string
+			for clause := range clauses {
+				written = append(written, clause)
+			}
+			sort.Slice(written, func(i, j int) bool {
+				if (written[i] == name) != (written[j] == name) {
+					return written[i] == name
+				}
+				return written[i] < written[j]
+			})
+			var groups []string
+			for _, clause := range written {
+				files := clauses[clause]
+				sort.Strings(files)
+				more := ""
+				if len(files) > 3 {
+					more = fmt.Sprintf(", +%d more", len(files)-3)
+				}
+				groups = append(groups, fmt.Sprintf("`package %s` (%s%s)", clause, strings.Join(files[:min(len(files), 3)], ", "), more))
+			}
+			return toolerr.Inputf("%s would declare `package %s`, but the other files of %s declare %s: one directory is one package. Keep `package %s`, or change the package clause of all its files; to do that file by file pass max_new_errors=-1.",
+				rel, gosrc.PackageName(*c.New), edits.RelativeName(filepath.Dir(c.Path), w.Root), strings.Join(groups, " and "), name)
 		}
 	}
 	return nil
