@@ -1245,7 +1245,7 @@ func TestNotFoundHints(t *testing.T) {
 	writeFile(t, root, "sub/go.mod", "module example.com/sub\n\ngo 1.24\n")
 	writeFile(t, root, "sub/s.go", "package sub\n\nfunc SubOnly() {}\n")
 	out := call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() {}", "new_string": "func SubOnly() int { return 1 }"})
-	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "are not, so the error count") {
+	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "NOT rewritten") {
 		t.Errorf("an edit in a nested module must say its importers are not checked:\n%s", out)
 	}
 	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})

@@ -3,6 +3,8 @@
 package mentions
 
 import (
+	"go/ast"
+	"go/parser"
 	"go/scanner"
 	"go/token"
 	"os"
@@ -76,6 +78,11 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 	// A name this short also names type parameters and locals of unrelated generic code in other
 	// packages: their comments and strings are not about the renamed symbol.
 	outOfScope := len(name) < 3 && codeIn != nil && !codeIn(path, text)
+	// A file that cannot refer to the symbol but declares a name of its own: its comments and strings talk
+	// about that declaration ("// Map maps T to U" above another package's Map).
+	if !outOfScope && codeIn != nil && !codeIn(path, text) && declaresName(path, text, name) {
+		outOfScope = true
+	}
 	fset := token.NewFileSet()
 	file := fset.AddFile(path, fset.Base(), len(text))
 	var sc scanner.Scanner
@@ -113,6 +120,38 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 		}
 	}
 	return found
+}
+
+// declaresName: the Go file declares a top-level func, type, var or const, or a method, called name.
+func declaresName(path, text, name string) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), path, text, parser.SkipObjectResolution)
+	if f == nil || err != nil && len(f.Decls) == 0 {
+		return false
+	}
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if d.Name.Name == name {
+				return true
+			}
+		case *ast.GenDecl:
+			for _, sp := range d.Specs {
+				switch sp := sp.(type) {
+				case *ast.TypeSpec:
+					if sp.Name.Name == name {
+						return true
+					}
+				case *ast.ValueSpec:
+					for _, n := range sp.Names {
+						if n.Name == name {
+							return true
+						}
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // Find lists occurrences of name that remain once the rename is applied: Go identifiers, comments,

@@ -8,37 +8,104 @@ import (
 	"strings"
 )
 
-// DropOrphanImportComments removes, from the import blocks of after, the comments that were the
-// heading or trailing comment of an import in before and that no import owns any more (the import
-// was removed and the comment stayed behind, as organize-imports leaves it). Other comments are kept.
-// after is returned unchanged when either text does not parse.
+// DropOrphanImportComments removes, from after, the comments that belonged to an import of before that
+// no longer exists: the heading above it, a comment on its line (before or after it), the doc of an import
+// declaration that disappeared altogether, and headings left with no import under them. Comments that
+// head a kept import, or that stand apart (a blank line away) from the imports, are kept. Nothing is ever
+// glued onto another line, and blank lines left behind are tidied. after is returned unchanged when
+// either text does not parse.
 func DropOrphanImportComments(filename, before, after string) string {
-	attached := func(f *ast.File) map[string]bool {
-		m := map[string]bool{}
-		for _, d := range importDecls(f) {
-			for _, sp := range d.Specs {
-				s := sp.(*ast.ImportSpec)
-				for _, g := range []*ast.CommentGroup{s.Doc, s.Comment} {
-					if g != nil {
-						for _, c := range g.List {
-							m[c.Text] = true
-						}
-					}
-				}
-			}
-		}
-		return m
-	}
 	fset := token.NewFileSet()
 	bf, err := parser.ParseFile(fset, filename, before, parser.ParseComments)
 	if bf == nil || err != nil {
 		return after
 	}
-	was := attached(bf)
+	btf := fset.File(bf.Pos())
+	lineOf := func(p token.Pos) int { return fset.Position(p).Line }
+
+	// was: comment texts attached to an import in before.
+	was := map[string]bool{}
+	note := func(g *ast.CommentGroup) {
+		if g != nil {
+			for _, c := range g.List {
+				was[c.Text] = true
+			}
+		}
+	}
+	bowned := map[*ast.CommentGroup]bool{}
+	attachedTo := map[*ast.ImportSpec][]*ast.CommentGroup{}
+	for _, d := range importDecls(bf) {
+		note(d.Doc)
+		bowned[d.Doc] = true
+		for _, sp := range d.Specs {
+			s := sp.(*ast.ImportSpec)
+			note(s.Doc)
+			note(s.Comment)
+			bowned[s.Doc], bowned[s.Comment] = true, true
+			attachedTo[s] = []*ast.CommentGroup{s.Doc, s.Comment}
+			// a comment ending on the line the spec starts on: `/* c */ "fmt"`
+			for _, g := range bf.Comments {
+				if g.End() <= s.Pos() && lineOf(g.End()) == lineOf(s.Pos()) && g.Pos() > d.Pos() && !bowned[g] {
+					note(g)
+					attachedTo[s] = append(attachedTo[s], g)
+				}
+			}
+		}
+	}
+	// removedText / keptText: the comments attached to imports that are gone / that stay (judged after
+	// parsing the new text, below).
+	removedText, keptText := map[string]bool{}, map[string]bool{}
+	specKey := func(s *ast.ImportSpec) string {
+		n := ""
+		if s.Name != nil {
+			n = s.Name.Name
+		}
+		return n + " " + s.Path.Value
+	}
+	// Unowned comments of the old block: glued to the line above (a heading is glued to what it heads;
+	// a deliberate note is set apart by a blank line) and whether an import came after them.
+	gluedBefore, followedBefore := map[string]bool{}, map[string]bool{}
+	for _, d := range importDecls(bf) {
+		if !d.Lparen.IsValid() {
+			continue
+		}
+		for _, g := range bf.Comments {
+			if g.Pos() > d.Lparen && g.End() < d.Rparen && !bowned[g] {
+				gluedBefore[g.List[0].Text] = !blankBefore(before, btf.Offset(g.Pos()))
+				for _, sp := range d.Specs {
+					if sp.Pos() > g.End() {
+						followedBefore[g.List[0].Text] = true
+					}
+				}
+			}
+		}
+	}
+
 	fset = token.NewFileSet()
 	af, err := parser.ParseFile(fset, filename, after, parser.ParseComments)
 	if af == nil || err != nil {
 		return after
+	}
+	tf := fset.File(af.Pos())
+	have := map[string]bool{}
+	for _, sp := range af.Imports {
+		have[specKey(sp)] = true
+	}
+	for _, d := range importDecls(bf) {
+		for _, sp := range d.Specs {
+			s := sp.(*ast.ImportSpec)
+			into := keptText
+			if !have[specKey(s)] {
+				into = removedText
+			}
+			for _, g := range attachedTo[s] {
+				if g != nil {
+					for _, c := range g.List {
+						into[c.Text] = true
+					}
+				}
+			}
+		}
 	}
 	// Headings that were never attached to an import (a comment glued to the closing parenthesis, or two
 	// headings in a row) are only judged orphans when the block lost an import.
@@ -46,44 +113,38 @@ func DropOrphanImportComments(filename, before, after string) string {
 	if len(was) == 0 && !lostImport {
 		return after
 	}
-	owned := map[*ast.CommentGroup]bool{}
-	for _, d := range importDecls(af) {
-		for _, sp := range d.Specs {
-			s := sp.(*ast.ImportSpec)
-			owned[s.Doc], owned[s.Comment] = true, true
-		}
-	}
-	// Unowned comments of the old text that sat right under the line above them (no blank line): a
-	// deliberate note is set apart by a blank line, a heading is glued to what it headed.
-	gluedBefore := map[string]bool{}
-	{
-		bset := token.NewFileSet()
-		if bf2, err := parser.ParseFile(bset, filename, before, parser.ParseComments); err == nil {
-			btf := bset.File(bf2.Pos())
-			bowned := map[*ast.CommentGroup]bool{}
-			for _, d := range importDecls(bf2) {
+	owned := map[*ast.CommentGroup]bool{af.Doc: true}
+	for _, d := range af.Decls {
+		switch d := d.(type) {
+		case *ast.GenDecl:
+			owned[d.Doc] = true
+			if d.Tok == token.IMPORT {
 				for _, sp := range d.Specs {
-					bowned[sp.(*ast.ImportSpec).Doc], bowned[sp.(*ast.ImportSpec).Comment] = true, true
+					owned[sp.(*ast.ImportSpec).Doc], owned[sp.(*ast.ImportSpec).Comment] = true, true
 				}
 			}
-			for _, d := range importDecls(bf2) {
-				for _, g := range bf2.Comments {
-					if d.Lparen.IsValid() && g.Pos() > d.Lparen && g.End() < d.Rparen && !bowned[g] {
-						gluedBefore[g.List[0].Text] = !blankBefore(before, btf.Offset(g.Pos()))
-					}
-				}
-			}
+		case *ast.FuncDecl:
+			owned[d.Doc] = true
 		}
 	}
+
 	type span struct{ a, b int }
-	var cut []span
-	tf := fset.File(af.Pos())
+	var cand []span
 	for _, d := range importDecls(af) {
 		if !d.Lparen.IsValid() {
 			continue
 		}
 		for gi, g := range af.Comments {
-			if g.Pos() < d.Lparen || g.End() > d.Rparen || owned[g] {
+			if g.Pos() < d.Lparen || g.End() > d.Rparen {
+				continue
+			}
+			if owned[g] {
+				// Merged with the heading of a kept import: only the comments of removed imports go.
+				for _, c := range g.List {
+					if removedText[c.Text] && !keptText[c.Text] {
+						cand = append(cand, span{tf.Offset(c.Pos()), tf.Offset(c.End())})
+					}
+				}
 				continue
 			}
 			orphan := false
@@ -103,43 +164,99 @@ func DropOrphanImportComments(filename, before, after string) string {
 						}
 					}
 				}
-				glued := gluedBefore[g.List[0].Text]
 				// two headings in a row: the first lost its group; a comment glued to the closing
-				// parenthesis heads nothing.
-				orphan = nextComment || (!specAfter && glued)
+				// parenthesis, or a heading whose imports all went, heads nothing.
+				t := g.List[0].Text
+				orphan = nextComment || (!specAfter && (gluedBefore[t] || followedBefore[t]))
 			}
 			for _, c := range g.List {
-				if !orphan && !was[c.Text] {
-					continue
-				}
-				a, b := tf.Offset(c.Pos()), tf.Offset(c.End())
-				ls := strings.LastIndex(after[:a], "\n") + 1
-				if strings.TrimSpace(after[ls:a]) != "" {
-					continue
-				}
-				le := strings.Index(after[b:], "\n")
-				if le < 0 {
-					continue
-				}
-				le += b + 1
-				switch rest := strings.TrimSpace(after[b:le]); rest {
-				case "":
-					cut = append(cut, span{ls, le})
-				case ")":
-					// `/* heading */)`: only the comment goes, the parenthesis keeps its line.
-					cut = append(cut, span{ls, b + strings.Index(after[b:le], ")")})
+				if orphan || was[c.Text] {
+					cand = append(cand, span{tf.Offset(c.Pos()), tf.Offset(c.End())})
 				}
 			}
 		}
 	}
-	sort.Slice(cut, func(i, j int) bool { return cut[i].a > cut[j].a })
-	for _, c := range cut {
-		after = after[:c.a] + after[c.b:]
+	if lostImport {
+		// An import declaration that vanished altogether leaves its comments at file level, before the
+		// first declaration that is not an import.
+		limit := len(after)
+		for _, d := range af.Decls {
+			if g, ok := d.(*ast.GenDecl); !ok || g.Tok != token.IMPORT {
+				limit = tf.Offset(d.Pos())
+				if g, ok := d.(*ast.GenDecl); ok && g.Doc != nil {
+					limit = tf.Offset(g.Doc.Pos())
+				}
+				if f, ok := d.(*ast.FuncDecl); ok && f.Doc != nil {
+					limit = tf.Offset(f.Doc.Pos())
+				}
+				break
+			}
+		}
+		inDecl := func(g *ast.CommentGroup) bool {
+			for _, d := range importDecls(af) {
+				if g.Pos() >= d.Pos() && g.End() <= d.End() {
+					return true
+				}
+			}
+			return false
+		}
+		for _, g := range af.Comments {
+			if owned[g] || inDecl(g) || g.Pos() <= af.Name.End() || tf.Offset(g.End()) > limit {
+				continue
+			}
+			for _, c := range g.List {
+				if was[c.Text] {
+					cand = append(cand, span{tf.Offset(c.Pos()), tf.Offset(c.End())})
+				}
+			}
+		}
 	}
-	if len(cut) > 0 {
-		after = tidyImportBlanks(filename, after)
+	if len(cand) == 0 {
+		return after
 	}
-	return after
+	sort.Slice(cand, func(i, j int) bool { return cand[i].a > cand[j].a })
+	// A comment is only cut when nothing but other cut comments (and, at most, the closing parenthesis)
+	// shares its line.
+	masked := []byte(after)
+	for _, c := range cand {
+		for i := c.a; i < c.b; i++ {
+			if masked[i] != '\n' {
+				masked[i] = ' '
+			}
+		}
+	}
+	lineBounds := func(src string, off int) (int, int) {
+		ls := strings.LastIndex(src[:off], "\n") + 1
+		le := strings.Index(src[off:], "\n")
+		if le < 0 {
+			return ls, len(src)
+		}
+		return ls, off + le + 1
+	}
+	// Line ranges holding the comments; ranges that touch (comments sharing a line) merge.
+	var ranges []span
+	for i := len(cand) - 1; i >= 0; i-- { // ascending
+		ls, _ := lineBounds(string(masked), cand[i].a)
+		_, le := lineBounds(string(masked), max(cand[i].a, cand[i].b-1))
+		if n := len(ranges); n > 0 && ls < ranges[n-1].b {
+			ranges[n-1].b = max(ranges[n-1].b, le)
+			continue
+		}
+		ranges = append(ranges, span{ls, le})
+	}
+	for i := len(ranges) - 1; i >= 0; i-- {
+		r := ranges[i]
+		line := strings.TrimSpace(string(masked[r.a:r.b]))
+		if line != "" && line != ")" {
+			continue
+		}
+		keep := ""
+		if line == ")" {
+			keep = ")\n" // `/* heading */)`: only the comment goes, the parenthesis keeps its line
+		}
+		after = after[:r.a] + keep + after[r.b:]
+	}
+	return tidyImportBlanks(filename, after)
 }
 
 // blankBefore: the line above the one holding offset off is blank (or off is on the first line).

@@ -99,10 +99,19 @@ constraints is invisible to the type check (the response says when an edit touch
 
 - **Nested modules:** gopls loads only the modules that the root `go.mod` or `go.work` covers. A directory
   with its own `go.mod` outside that is added to gopls as an extra workspace folder, so its symbols are found
-  by name and its own packages are type-checked. Packages of *other* modules that import it are not seen, so
-  an edit there can break importers without the error count showing it. Tools say so when they meet one (`callers` and `symbol_info` too, when the symbol lives in such a module, for instance a
-  `replace`-d directory inside the workspace: callers in the root module are not seen);
-  `go work init . ./sub` joins the modules properly.
+  by name and its own packages are type-checked. Importers in *other* uncovered modules (a `replace`-d
+  sibling directory, with no `go.work`) are type-checked too, so breakage shows as a new error and
+  `max_new_errors` refuses the apply, but those callers are **not rewritten**: fix them by hand, or join the
+  modules with `go work init ./a ./b` so the edit rewrites them. A `move` out of an uncovered module is
+  refused with that explanation.
+- **Case-sensitive names:** write tools (`rename_symbol`, `edit_symbol`, `change_signature`, `move`) never
+  guess the case: `gen` does not resolve to `Gen` or to a package directory called `gen`; the error says
+  "Did you mean `Gen`?". Read tools still match loosely but print a note when only the case differed.
+- **Broken configuration:** when `go list -m` fails (a syntax error in `go.mod`, a `go.work` `use` of a
+  missing directory) every tool output ends with a warning naming the problem instead of silently
+  returning empty results.
+- **organize_imports** also removes the comments that belonged to a removed import (its doc and trailing
+  comment, and a heading whose imports all went); comments of kept imports are untouched.
 - **File paths** given to the read tools must lie in the workspace, GOROOT, the module cache or a
   `replace`/`use`-d directory; anything else (`../other-project/main.go`) is refused. `definition` on an
   import path lists at most 10 files (`(+K more files)`); on `C.x` it points at the cgo preamble line that
