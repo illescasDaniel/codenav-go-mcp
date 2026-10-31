@@ -38,3 +38,22 @@ func TestTidyHoverDropsBogusLinks(t *testing.T) {
 		}
 	}
 }
+
+// Round 13 (item 3): a number that overflows an int is echoed as a number only, never with the JSON that
+// follows it in the request.
+func TestFriendlyDecodeErrorOverflowEchoesNoJSONTail(t *testing.T) {
+	raw := `json: cannot unmarshal number 9223372036854776000,"file_path":... overflows into Go struct field tools.posIn.column of type int`
+	got := friendlyDecodeError(raw)
+	if want := "column must be a whole number of reasonable size (got a number too large, which does not fit)."; got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+	for _, bad := range []string{"file_path", `"`, "..."} {
+		if strings.Contains(got, bad) {
+			t.Errorf("%q leaked into %q", bad, got)
+		}
+	}
+	// A plain value is still echoed.
+	if got := friendlyDecodeError(`json: cannot unmarshal "1e+30" into Go struct field tools.posIn.column of type int`); !strings.Contains(got, `1e+30`) {
+		t.Errorf("plain values keep their echo: %q", got)
+	}
+}

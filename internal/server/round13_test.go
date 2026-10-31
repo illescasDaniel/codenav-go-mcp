@@ -77,3 +77,136 @@ func TestMixedEOLSymbolRenameAndSignatureKeepUntouchedLines(t *testing.T) {
 		t.Errorf("change_signature:\n got %q\nwant %q", got, want)
 	}
 }
+
+// Item 3: 2^63 does not fit an int; the answer names the number, never the JSON that follows it.
+func TestOverflowIntegerMessageHasNoJSONTail(t *testing.T) {
+	cs, _ := session(t, nil)
+	big := uint64(1) << 63
+	for name, c := range map[string]struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		"column":         {"hover", map[string]any{"file_path": "shapes/shapes.go", "line": 3, "column": big}, "column must be a whole number of reasonable size"},
+		"max_new_errors": {"rename_symbol", map[string]any{"name": "shapes.Scale", "new_name": "S2", "max_new_errors": big}, "max_new_errors must be a whole number of reasonable size"},
+		"edit max":       {"edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "x", "new_string": "y", "max_new_errors": big}, "max_new_errors must be a whole number of reasonable size"},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		mustHave(t, name, out, c.want, "Usage: "+c.tool+"(")
+		for _, bad := range []string{"file_path\":", "\"name\"", "...", "9223372036854776000", "overflows"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("%s: %q leaked:\n%s", name, bad, out)
+			}
+		}
+	}
+}
+
+// Item 1: cgo's synthetic callers (_cgoexp_<hash>_f, in the go build cache) are not callers anybody wrote.
+// Item 2: hover on C.x explains the C symbol instead of printing a raw LSP failure with a file:// URI.
+// Item 11 (_Ctype_int): symbol_info shows C.int.
+func TestCgoExportCallersHoverAndTypes(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "exp/exp.go", "package exp\n\n/*\n#include <stdint.h>\nextern int goCallback(int);\nstatic int callit(int x) { return goCallback(x); }\n*/\nimport \"C\"\n\n//export goCallback\nfunc goCallback(x C.int) C.int { return x * 2 }\n\nfunc Run() int { return int(C.callit(3)) }\n")
+	out := call(t, cs, "callers", map[string]any{"name": "exp.goCallback"})
+	for _, bad := range []string{"_cgoexp_", "go-build", ".cache"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("synthetic caller leaked (%q):\n%s", bad, out)
+		}
+	}
+	mustHave(t, "callers", out, "No callers found")
+	out = call(t, cs, "symbol_info", map[string]any{"name": "exp.goCallback"})
+	for _, bad := range []string{"_cgoexp_", "go-build", "_Ctype_"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("symbol_info leaked %q:\n%s", bad, out)
+		}
+	}
+	mustHave(t, "symbol_info", out, "func goCallback(x C.int) C.int")
+	out = call(t, cs, "hover", map[string]any{"file_path": "exp/exp.go", "line": 13, "column": 30})
+	for _, bad := range []string{"file://", "LSP error", "no package data"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("hover on C.callit shows raw %q:\n%s", bad, out)
+		}
+	}
+	mustHave(t, "hover", out, "C.callit is C code")
+}
+
+// Items 5 and 6: a name lookup in a workspace that loads no package, and quick_fix on a file of a broken
+// go.mod, answer in plain words: no raw LSP text, no file:// URI, no mention of the lookup's scratch directory.
+func TestNoPackageLoadedFriendlyMessages(t *testing.T) {
+	for _, c := range []struct{ name, files string }{
+		{"empty", ""},
+		{"nomod", "x.go"},
+	} {
+		root := t.TempDir()
+		if c.files != "" {
+			writeFile(t, root, c.files, "package x\n")
+		}
+		cs, _ := sessionAt(t, root)
+		for _, q := range []struct{ tool, name string }{{"symbol_info", "fmt.Println"}, {"callers", "json.Marshal"}, {"implementations", "io.Reader"}} {
+			out := call(t, cs, q.tool, map[string]any{"name": q.name})
+			mustHave(t, c.name+" "+q.tool, out, "No Go package is loaded in this workspace")
+			for _, bad := range []string{"file://", "LSP error", "codenav_probe", "no package metadata"} {
+				if strings.Contains(out, bad) {
+					t.Errorf("%s %s: %q leaked:\n%s", c.name, q.tool, bad, out)
+				}
+			}
+		}
+	}
+	root := t.TempDir()
+	writeFile(t, root, "go.mod", "this is not a go.mod\n")
+	writeFile(t, root, "x.go", "package x\n")
+	cs, _ := sessionAt(t, root)
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "x.go", "line": 1, "code": "ZZZ"})
+	mustHave(t, "quick_fix", out, "x.go is not part of any package gopls could load")
+	for _, bad := range []string{"file://", "LSP error", "no package metadata", root} {
+		if strings.Contains(out, bad) {
+			t.Errorf("quick_fix: %q leaked:\n%s", bad, out)
+		}
+	}
+}
+
+// Item 4: a root two levels below the go.work directory shows the files of the other members as
+// "../../x", for every tool (it used to print absolute paths).
+func TestRootBelowGoWorkShowsRelativePaths(t *testing.T) {
+	top := t.TempDir()
+	writeFile(t, top, "go.work", "go 1.24\n\nuse (\n\t.\n\t./deps/dep\n)\n")
+	writeFile(t, top, "go.mod", "module example.com/top\n\ngo 1.24\n")
+	writeFile(t, top, "main.go", "package main\n\nimport \"example.com/dep\"\n\nfunc main() { _ = dep.New() }\n")
+	writeFile(t, top, "deps/dep/go.mod", "module example.com/dep\n\ngo 1.24\n")
+	writeFile(t, top, "deps/dep/dep.go", "package dep\n\ntype Client struct{}\n\ntype Doer interface{ Do() }\n\nfunc (Client) Do() {}\n\nfunc New() *Client { return &Client{} }\n")
+	writeFile(t, top, "other/o.go", "package other\n\nimport \"example.com/dep\"\n\nfunc O() { _ = dep.New() }\n")
+	writeFile(t, top, "other/go.mod", "module example.com/other\n\ngo 1.24\n\nrequire example.com/dep v0.0.0\n")
+	root := top + "/deps/dep"
+	cs, _ := sessionAt(t, root)
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+		want string
+	}{
+		{"callers", map[string]any{"name": "dep.New"}, "(../../main.go:5)"},
+		{"symbol_info", map[string]any{"name": "dep.New"}, "../../main.go: L5"},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		mustHave(t, c.tool, out, c.want)
+		if strings.Contains(out, top) {
+			t.Errorf("%s: absolute path leaked:\n%s", c.tool, out)
+		}
+	}
+}
+
+// Item 8: callers is capped like references and search_symbol.
+func TestCallersAreCapped(t *testing.T) {
+	cs, root := session(t, nil)
+	var sb strings.Builder
+	sb.WriteString("package shapes\n\n")
+	for i := 0; i < 70; i++ {
+		sb.WriteString("func Caller" + strings.Repeat("A", 0) + string(rune('a'+i/26)) + string(rune('a'+i%26)) + "() float64 { return Scale(nil, 1, 0) }\n\n")
+	}
+	writeFile(t, root, "shapes/many.go", sb.String())
+	out := call(t, cs, "callers", map[string]any{"name": "shapes.Scale"})
+	mustHave(t, "callers", out, "… and 21 more caller(s)")
+	if n := strings.Count(out, "[function]"); n != 50 {
+		t.Errorf("want 50 callers listed, got %d:\n%s", n, out)
+	}
+}

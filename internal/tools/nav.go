@@ -163,6 +163,31 @@ func cgoHover(path, text string) string {
 // maxDefinitions caps the locations `definition` lists.
 const maxDefinitions = 10
 
+// cgoSelectorName moves a position on the `C` or the `.` of `C.x` onto x (gopls has no hover for the
+// qualifier of a cgo name); any other position is returned as it is.
+func cgoSelectorName(w *Workspace, in posIn) posIn {
+	abs := in.FilePath
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(w.Root, abs)
+	}
+	src, _, err := edits.ReadSource(abs)
+	if err != nil || !strings.Contains(src, `import "C"`) {
+		return in
+	}
+	off := edits.Offset(src, in.Line-1, in.Column-1)
+	switch {
+	case strings.HasPrefix(src[off:], "C."):
+		off += 2
+	case off > 0 && strings.HasPrefix(src[off-1:], "C."):
+		off++
+	default:
+		return in
+	}
+	line, col := edits.PositionOf(src, off)
+	in.Line, in.Column = line+1, col+1
+	return in
+}
+
 // cgoDefinition answers `definition` on the X of `C.X` in a file importing "C": gopls would point into
 // generated code in the build cache. It names the line of the cgo preamble that declares X, or says
 // where X must live. "" when the position is not a C.X reference.
@@ -206,8 +231,28 @@ func cgoDefinition(w *Workspace, in posIn) string {
 	return fmt.Sprintf("C.%s is a C symbol with no Go declaration; look for it in the headers included by the cgo preamble of %s (or in a .c/.h file of the package).", name, rel)
 }
 
-// generatedPrefixes start the names cgo generates (`_Cfunc_add`, `_cgo_...`).
-var generatedPrefixes = []string{"_Cfunc_", "_Ctype_", "_Cvar_", "_Cmacro_", "_Cconst_", "_cgo_", "__cgofn__"}
+// dropGeneratedLocs removes locations in files cgo generated into the build cache.
+func dropGeneratedLocs(locs []lsp.Location) []lsp.Location {
+	kept := locs[:0:0]
+	for _, l := range locs {
+		if !isCgoGenerated(lsp.URIToPath(l.URI)) {
+			kept = append(kept, l)
+		}
+	}
+	return kept
+}
+
+// dropGeneratedCalls removes callers that cgo generated (`_cgoexp_<hash>_goCallback` calls an exported
+// function from the build cache): synthetic names and go-build cache locations.
+func dropGeneratedCalls(calls []lsp.IncomingCall) []lsp.IncomingCall {
+	kept := calls[:0:0]
+	for _, c := range calls {
+		if !exclude.IsSyntheticName(c.From.Name) && !isCgoGenerated(lsp.URIToPath(c.From.URI)) {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
 
 // dropNoise removes symbols from files the go tool never compiles (`_x.go`, `//go:build ignore`) and
 // the generated ones cgo leaves in the build cache.
@@ -231,13 +276,7 @@ func dropNoise(syms []*lsp.Symbol) []*lsp.Symbol {
 				continue
 			}
 		}
-		generated := false
-		for _, pre := range generatedPrefixes {
-			if strings.HasPrefix(s.Name, pre) {
-				generated = true
-			}
-		}
-		if !generated {
+		if !exclude.IsSyntheticName(s.Name) {
 			kept = append(kept, s)
 		}
 	}
@@ -414,6 +453,10 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			raw, err := w.Client.Hover(ctx, in.FilePath, in.Line, in.Column)
 			if err != nil {
+				// gopls has nothing for C.x (no package data for the cgo file): say what C.x is, as definition does.
+				if msg := cgoDefinition(w, cgoSelectorName(w, in)); msg != "" {
+					return msg, nil
+				}
 				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
 			if t := tidyHover(hoverText(raw)); t != "" {
@@ -464,7 +507,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
-			return splitTests(locs, w.Root), nil
+			return splitTests(dropGeneratedLocs(locs), w.Root), nil
 		})
 
 	add(s, h, "search_symbol", "Search the workspace for a symbol by name. Returns positions to feed to definition/references/hover. Production code ranks before tests.",
@@ -538,7 +581,8 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", friendlyNavErr(err, rel, line, col)
 			}
-			ht := tidyHover(hoverText(raw))
+			defs = dropGeneratedLocs(defs)
+			ht := cgoHover(lsp.URIToPath(sym.URI), tidyHover(hoverText(raw)))
 			if ht == "" {
 				ht = "No hover information."
 			}
@@ -552,6 +596,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 				if err != nil {
 					return "", friendlyNavErr(err, rel, line, col)
 				}
+				refs = dropGeneratedLocs(refs)
 				prod, tests := format.SplitTests(refs)
 				parts = append(parts, "", "References:", format.FormatReferencesGrouped(prod, w.Root, format.DefaultReferenceFileLimit, false))
 				if len(tests) > 0 {
@@ -617,7 +662,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			calls, omitted := realCalls(calls)
+			calls, omitted := realCalls(dropGeneratedCalls(calls))
 			out := format.FormatCallers(calls, w.Root, callerReceivers(calls))
 			if omitted > 0 {
 				out += fmt.Sprintf("\n(%d non-call reference(s) omitted: uses as a function or method value, such as f := %s; see references)", omitted, sym.Name)
@@ -651,7 +696,10 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if len(locs) == 0 {
 				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
 			}
-			locs = dropForeignUnexported(locs, w.Root)
+			locs = dropGeneratedLocs(dropForeignUnexported(locs, w.Root))
+			if len(locs) == 0 {
+				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
+			}
 			out := implementerNames(locs) + splitTests(locs, w.Root)
 			if note := caseNote(w, name, sym); note != "" {
 				out = note + "\n" + out

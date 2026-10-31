@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"regexp"
+	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 )
@@ -52,7 +54,7 @@ func Format(err error) (text string, ok bool) {
 		if re.Code == -1 { // synthesised on server exit
 			return re.Message, true
 		}
-		return fmt.Sprintf("LSP error on %s: %s", re.Method, re.Message), true
+		return FriendlyLSP(re), true
 	case errors.As(err, &ex):
 		return ex.Msg, true
 	case errors.As(err, &ie):
@@ -67,6 +69,39 @@ func Format(err error) (text string, ok bool) {
 		return fmt.Sprintf("Cannot read %s: %v.", pe.Path, pe.Err), true
 	}
 	return "", false
+}
+
+var (
+	noPackageRE = regexp.MustCompile(`no package (?:metadata|data) for (?:file )?(file://\S+)`)
+	fileURIRE   = regexp.MustCompile(`file://[^\s"'<>)]+`)
+)
+
+// probeDir is the scratch directory name resolve.Probe uses for lookups outside the workspace; it never
+// exists on disk and users must not be told about it.
+const probeDir = ".codenav_probe"
+
+// FriendlyLSP words a language server failure for the agent: never the raw "LSP error on textDocument/x"
+// with a file:// URI. A file gopls holds no package for is "not part of any package gopls could load";
+// for the scratch file of a name lookup that means no package is loaded at all. Any other failure keeps
+// its message with URIs shown as plain paths (the caller makes them workspace-relative).
+func FriendlyLSP(re *lsp.RequestError) string {
+	if m := noPackageRE.FindStringSubmatch(re.Message); m != nil {
+		p := lsp.URIToPath(m[1])
+		if strings.Contains(p, "/"+probeDir+"/") {
+			return "No Go package is loaded in this workspace, so a name from the standard library or a dependency cannot be looked up (check go.mod/go.work)."
+		}
+		return fmt.Sprintf("%s is not part of any package gopls could load (check go.mod/go.work, build tags).", p)
+	}
+	msg := fileURIRE.ReplaceAllStringFunc(re.Message, func(u string) string {
+		if p := lsp.URIToPath(u); p != "" {
+			return p
+		}
+		return u
+	})
+	if re.Method == "" {
+		return msg
+	}
+	return fmt.Sprintf("gopls could not answer %s: %s", re.Method, msg)
 }
 
 // Text is Format that falls back to err.Error().

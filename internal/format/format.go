@@ -22,6 +22,7 @@ import (
 const (
 	DefaultSearchSymbolLimit      = 50
 	DefaultDiagnosticsLimit       = 50
+	DefaultCallersLimit           = 50
 	DefaultReferenceFileLimit     = 25
 	DefaultReferencesSnippetLimit = 8
 )
@@ -637,7 +638,11 @@ func FormatCallers(calls []lsp.IncomingCall, root string, recvs map[int]string) 
 	if len(calls) == 0 {
 		return "No callers found."
 	}
-	lines := make([]string, len(calls))
+	total := len(calls)
+	if total > DefaultCallersLimit {
+		calls = calls[:DefaultCallersLimit]
+	}
+	lines := make([]string, len(calls), len(calls)+1)
 	for i, c := range calls {
 		callerLine := c.From.SelectionRange.Start.Line + 1
 		seen := map[int]bool{}
@@ -665,6 +670,9 @@ func FormatCallers(calls []lsp.IncomingCall, root string, recvs map[int]string) 
 			kind = "var initializer"
 		}
 		lines[i] = fmt.Sprintf("%s  [%s]  (%s:%d) calls at %s", name, kind, Relative(c.From.URI, root), callerLine, site)
+	}
+	if total > len(calls) {
+		lines = append(lines, fmt.Sprintf("… and %d more caller(s)", total-len(calls)))
 	}
 	return strings.Join(lines, "\n")
 }

@@ -124,6 +124,8 @@ func friendlyTypeError(text string) string {
 // number 9223372036854775808 into Go struct field tools.refsIn.line of type int").
 var decodeErrRE = regexp.MustCompile(`json: cannot unmarshal (?:(\w+) )?(.*?) into Go struct field (?:\w+\.)*(\w+) of type (\w+)`)
 
+var numberTokenRE = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
+
 // friendlyDecodeError rewrites such a refusal into a sentence naming the parameter; "" when text is not one.
 func friendlyDecodeError(text string) string {
 	m := decodeErrRE.FindStringSubmatch(text)
@@ -133,6 +135,14 @@ func friendlyDecodeError(text string) string {
 	kind, param, goType := m[1], m[3], m[4]
 	val := strings.TrimSuffix(strings.Trim(m[2], `"`), "} overflows")
 	val = strings.TrimSuffix(val, " overflows")
+	if num := numberTokenRE.FindString(val); num != "" && num != val {
+		// The decoder echoes the rest of the JSON object after a number that overflows: keep the number
+		// only, and since it was printed rounded to a float, do not echo digits that are not the caller's.
+		val = "a number too large"
+		if kind == "number" || kind == "" {
+			return fmt.Sprintf("%s must be a whole number of reasonable size (got %s, which does not fit).", param, val)
+		}
+	}
 	if len(val) > 40 {
 		val = val[:40] + "..."
 	}

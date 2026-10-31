@@ -70,16 +70,30 @@ func isToolchainPath(p string) bool {
 	return false
 }
 
-// RelativeTo renders an absolute path the way results show it: relative to root inside it, "../x" for
-// a file next to the workspace (the parent directory's other content, e.g. a module the workspace
-// replaces), and the path itself for anything else (GOROOT, the module cache, unrelated places).
+// maxAncestors is how many directories above the root a path may share with it to be shown as "../.."
+// (a workspace two levels below the go.work that joins it sees its siblings as "../../x").
+const maxAncestors = 3
+
+// RelativeTo renders an absolute path the way results show it: relative to root inside it, "../x" (or
+// "../../x", up to maxAncestors levels) for a file that shares an ancestor directory with the workspace
+// (e.g. a module the workspace replaces, or a go.work member above it), and the path itself for anything
+// else (GOROOT, the module cache, unrelated places).
 func RelativeTo(path, root string) string {
 	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(rel)
 	}
-	if parent := filepath.Dir(root); parent != root && parent != string(filepath.Separator) && filepath.IsAbs(path) && !isToolchainPath(path) {
-		if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
-			return "../" + filepath.ToSlash(rel)
+	if filepath.IsAbs(path) && !isToolchainPath(path) {
+		up := ""
+		for dir, i := root, 0; i < maxAncestors; i++ {
+			parent := filepath.Dir(dir)
+			if parent == dir || parent == string(filepath.Separator) {
+				break
+			}
+			up += "../"
+			if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
+				return up + filepath.ToSlash(rel)
+			}
+			dir = parent
 		}
 	}
 	return filepath.ToSlash(path)
@@ -90,4 +104,17 @@ func RelativeTo(path, root string) string {
 func IsCgoGenerated(p string) bool {
 	cache := GoCache()
 	return cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) || strings.Contains(filepath.ToSlash(p), "/go-build/")
+}
+
+// syntheticPrefixes start the names cgo generates (`_Cfunc_add`, `_cgoexp_<hash>_f`, `_cgo_...`); nobody wrote them.
+var syntheticPrefixes = []string{"_cgoexp_", "_cgo_", "_Cfunc_", "_Ctype_", "_Cvar_", "_Cmacro_", "_Cconst_", "__cgofn__"}
+
+// IsSyntheticName: a symbol name cgo generated. Results never list such symbols.
+func IsSyntheticName(name string) bool {
+	for _, p := range syntheticPrefixes {
+		if strings.HasPrefix(name, p) {
+			return true
+		}
+	}
+	return false
 }
