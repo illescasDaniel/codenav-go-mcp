@@ -60,7 +60,9 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 		w, err := h.Acquire(ctx, req.Session)
 		var out string
 		if err == nil {
-			out, err = fn(ctx, w, in)
+			if err = w.checkReadable(filePathOf(in)); err == nil {
+				out, err = fn(ctx, w, in)
+			}
 		}
 		if err != nil {
 			t, ok := toolerr.Format(err)

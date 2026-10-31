@@ -2298,3 +2298,31 @@ func TestRenameFieldIgnoresOtherFieldsTags(t *testing.T) {
 		t.Errorf("another field's struct tag must not be listed:\n%s", out)
 	}
 }
+
+func TestSymbolInfoInitIgnoresOutsideWorkspace(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/initf.go", "package shapes\n\nfunc init() {}\n")
+	out := call(t, cs, "symbol_info", map[string]any{"name": "init"})
+	if strings.Contains(out, "symbols match") || !strings.Contains(out, "initf.go") {
+		t.Errorf("only the workspace's init should resolve:\n%s", out)
+	}
+}
+
+func TestReadToolsRefuseFilesOutsideTheWorkspace(t *testing.T) {
+	cs, _ := session(t, nil)
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range []string{"hover", "definition", "diagnostics", "outline"} {
+		args := map[string]any{"file_path": "../" + filepath.Base(other) + "/main.go", "line": 3, "column": 6}
+		if tool == "diagnostics" || tool == "outline" {
+			delete(args, "line")
+			delete(args, "column")
+		}
+		args["file_path"] = filepath.Join(other, "main.go")
+		if out := call(t, cs, tool, args); !strings.Contains(out, "outside the workspace") {
+			t.Errorf("%s must refuse a file outside the workspace:\n%s", tool, out)
+		}
+	}
+}

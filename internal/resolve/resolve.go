@@ -314,6 +314,18 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 	if len(cands) == 0 {
 		cands = loose
 	}
+	if query == "init" || query == "main" {
+		// Every package has its own: unless one is asked for by package, only the workspace's count.
+		var mine []*lsp.Symbol
+		for _, s := range cands {
+			if rel, err := filepath.Rel(evalLink(root), canonPath(s.Location.URI)); err == nil && !strings.HasPrefix(rel, "..") {
+				mine = append(mine, s)
+			}
+		}
+		if len(mine) > 0 {
+			cands = mine
+		}
+	}
 	if file != "" {
 		var narrowed []*lsp.Symbol
 		for _, exact := range []bool{true, false} {
