@@ -71,6 +71,9 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 				return nil, nil, err
 			}
 			out = t
+			if w != nil {
+				out = w.scrub(out)
+			}
 		}
 		return text(h.Notes().Annotate(out)), nil, nil
 	})
@@ -317,7 +320,10 @@ const maxHoverBytes = 4096
 var fileLink = regexp.MustCompile(`file://[^\s)\]>"]+`)
 
 // A replaced module (directory) has no version, so gopls prints `pkg.go.dev/../dir@#Name`; those go too.
-var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@)\)[ \t]*`)
+// So do links to a dotted import path without a version (example.com/x#Name): that is a module of the
+// workspace itself (the main module, a go.work "use", a local replace), which pkg.go.dev does not know.
+// The stdlib (no dot in the first element) and versioned module-cache dependencies keep theirs.
+var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@|[^/)\s@]*\.[^/)\s@]*(?:/[^)\s@]*)?)\)[ \t]*`)
 
 // tidyHover drops useless links and caps the length, keeping the head (signature and summary).
 func tidyHover(t string) string {
@@ -449,11 +455,11 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			ptrs = dropNoise(addIndexed(w, q, ptrs))
 			if len(ptrs) == 0 {
-				return fmt.Sprintf("No symbols matching %q.", q), nil
+				return fmt.Sprintf("No symbols matching %q.", shortQuery(q)), nil
 			}
 			kept := format.FilterByKindAndPath(ptrs, w.Root, kinds, in.Path)
 			if len(kept) == 0 {
-				return fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", q, len(ptrs)), nil
+				return fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", shortQuery(q), len(ptrs)), nil
 			}
 			return format.FormatWorkspaceSymbols(kept, w.Root, q, format.DefaultSearchSymbolLimit, in.Fuzzy), nil
 		})
@@ -468,7 +474,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 				abs = filepath.Join(w.Root, abs)
 			}
 			if rel, err := filepath.Rel(w.Root, abs); err != nil || strings.HasPrefix(rel, "..") {
-				return "", toolerr.Inputf("%s is outside the workspace (%s).", in.FilePath, w.Root)
+				return "", toolerr.Inputf("%s is outside the workspace (%s): diagnostics only cover files of the workspace's own modules. Files of the standard library, the module cache and replaced modules elsewhere can be read (outline, hover, references) but are not type-checked as part of this workspace.", in.FilePath, w.Root)
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {
@@ -811,4 +817,13 @@ func callerReceivers(calls []lsp.IncomingCall) map[int]string {
 		}
 	}
 	return recvs
+}
+
+// shortQuery cuts a long query for echoing it back.
+func shortQuery(q string) string {
+	const max = 80
+	if r := []rune(q); len(r) > max {
+		return string(r[:max]) + "..."
+	}
+	return q
 }

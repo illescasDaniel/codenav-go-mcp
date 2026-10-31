@@ -493,6 +493,9 @@ func (s *PlanStore) Get(id string) (*edits.EditPlan, error) {
 		if eid, done := s.used[id]; done {
 			return nil, toolerr.Inputf("preview %q was already applied as edit %s; undo_edit(id=%q) reverts it", id, eid, eid)
 		}
+		if len(s.ids) == 0 {
+			return nil, toolerr.Inputf("unknown or expired preview id %q (no previews are pending)", id)
+		}
 		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s)", id, strings.Join(s.ids, ", "))
 	}
 	return p, nil

@@ -156,7 +156,11 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	default:
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
-		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q%s) writes it.", id, largeArg(w, plan)), "", plan.Diff(w.Root, 2, 200))
+		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q%s) writes it.", id, largeArg(w, plan)))
+		if maxNew >= 0 && newErrs > maxNew {
+			out = append(out, fmt.Sprintf("Warning: with apply=true this edit would be refused, because its %d new error(s) exceed max_new_errors=%s; it would apply with max_new_errors=%d (or -1 for no limit). apply_edit(id=%q) writes it regardless.", newErrs, maxErrors(maxNew), newErrs, id))
+		}
+		out = append(out, "", plan.Diff(w.Root, 2, 200))
 	}
 	return strings.Join(out, "\n"), editID, nil
 }
@@ -240,6 +244,9 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 				return nil, nil, err
 			}
 			out = t
+			if w != nil {
+				out = w.scrub(out)
+			}
 		}
 		return text(h.Notes().Annotate(out)), nil, nil
 	})

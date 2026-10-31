@@ -143,7 +143,7 @@ var typeKinds = map[int]bool{5: true, 10: true, 11: true, 23: true, 26: true}
 //
 // ro is set for the read-only tools, which already tried a package-qualified name outside the workspace.
 func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool) string {
-	msg := fmt.Sprintf("No symbol found matching %q", query)
+	msg := fmt.Sprintf("No symbol found matching %q", shortQuery(query))
 	parts := strings.Split(query, ".")
 	first, last := parts[0], parts[len(parts)-1]
 	outside := "; write tools resolve only workspace symbols - symbol_info, callers and implementations also take json.Marshal or encoding/json.Decoder.Decode, and hover or definition work at a use of any symbol."
@@ -151,6 +151,8 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool) s
 		outside = "; for a standard-library or dependency symbol spell the import path (math/rand.Int, github.com/x/y.Client.Do; the module must be in go.mod)."
 	}
 	switch {
+	case strings.Trim(query, ".") == "":
+		msg += ": a symbol name is needed (Square.Area, shapes.Scale), not just dots."
 	case len(parts) > 1 && last == "":
 		msg += fmt.Sprintf(": %q ends with a dot; name the member after it (%sName), or drop the dot to look up %s itself.", query, query, strings.TrimSuffix(query, "."))
 	case len(parts) > 1 && first == "":

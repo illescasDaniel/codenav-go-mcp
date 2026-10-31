@@ -22,6 +22,8 @@ func TestTidyHoverDropsBogusLinks(t *testing.T) {
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/./x@#F)",
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x@#F)",
 		"[`main.F` on pkg.go.dev](https://pkg.go.dev/command-line-arguments#F)",
+		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x#F)",
+		"[`x` on pkg.go.dev](https://pkg.go.dev/example.com/x/sub)",
 	} {
 		if got := tidyHover("func F()\n\n---\n\n" + link); strings.Contains(got, "pkg.go.dev") {
 			t.Errorf("%s kept: %q", link, got)
@@ -30,7 +32,6 @@ func TestTidyHoverDropsBogusLinks(t *testing.T) {
 	for _, link := range []string{
 		"[`fmt.Println` on pkg.go.dev](https://pkg.go.dev/fmt#Println)",
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x@v1.2.3#F)",
-		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x#F)",
 	} {
 		if got := tidyHover("func F()\n\n---\n\n" + link); !strings.Contains(got, "pkg.go.dev") {
 			t.Errorf("%s dropped: %q", link, got)

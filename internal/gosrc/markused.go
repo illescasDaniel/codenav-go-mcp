@@ -27,7 +27,7 @@ func MarkUsed(src string, off int, name string) ([]Insertion, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", src, parser.SkipObjectResolution)
 	if err != nil {
-		return nil, toolerr.Inputf("not valid Go: %v", err)
+		return nil, toolerr.Inputf("not valid Go: %s", syntaxText(err))
 	}
 	tf := fset.File(f.Pos())
 	if off < 0 || off+len(name) > tf.Size() {

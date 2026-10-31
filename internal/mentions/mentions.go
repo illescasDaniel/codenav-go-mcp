@@ -29,6 +29,7 @@ type Mention struct {
 	Col     int    // 1-based byte column of a code mention, else 0
 	Kind    string // code | string | comment | text
 	Snippet string
+	loose   bool // found by the relaxed whole-word rule for short names (capped)
 }
 
 func snippet(lines []string, row int) string {
@@ -69,6 +70,12 @@ func codeContext(name string) *regexp.Regexp {
 func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string, codeIn func(path, text string) bool) []Mention {
 	lines := strings.Split(text, "\n")
 	var found []Mention
+	// A name of one or two letters is mostly prose elsewhere, but inside the package of the renamed symbol
+	// a whole-word mention in a string or comment is likely about it.
+	inScope := shortName(name) && codeIn != nil && codeIn(path, text)
+	// A name this short also names type parameters and locals of unrelated generic code in other
+	// packages: their comments and strings are not about the renamed symbol.
+	outOfScope := len(name) < 3 && codeIn != nil && !codeIn(path, text)
 	fset := token.NewFileSet()
 	file := fset.AddFile(path, fset.Base(), len(text))
 	var sc scanner.Scanner
@@ -84,19 +91,25 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 			if codeIn != nil && !codeIn(path, text) {
 				continue
 			}
-			found = append(found, Mention{rel, p.Line, p.Column, "code", snippet(lines, p.Line)})
-		case tok == token.COMMENT && prose.MatchString(lit):
-			found = append(found, Mention{rel, p.Line, 0, "comment", snippet(lines, p.Line)})
+			found = append(found, Mention{rel, p.Line, p.Column, "code", snippet(lines, p.Line), false})
+		case outOfScope && (tok == token.COMMENT || tok == token.STRING || tok == token.CHAR):
+			continue
+		case tok == token.COMMENT && (prose.MatchString(lit) || inScope && word.MatchString(lit)):
+			found = append(found, Mention{rel, p.Line, 0, "comment", snippet(lines, p.Line), !prose.MatchString(lit)})
 		case (tok == token.STRING || tok == token.CHAR) && word.MatchString(lit):
+			loose := false
 			if shortName(name) {
 				if v, err := strconv.Unquote(lit); err != nil || v != name {
-					continue
+					if !inScope {
+						continue
+					}
+					loose = true
 				}
 			}
 			if tagLike(lit) && !tagNames(lit, name) {
 				continue // another field's struct tag
 			}
-			found = append(found, Mention{rel, p.Line, 0, "string", snippet(lines, p.Line)})
+			found = append(found, Mention{rel, p.Line, 0, "string", snippet(lines, p.Line), loose})
 		}
 	}
 	return found
@@ -166,7 +179,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 		}
 		for i, line := range strings.Split(text, "\n") {
 			if prose.MatchString(line) {
-				found = append(found, Mention{rel, i + 1, 0, "text", snippet([]string{line}, 1)})
+				found = append(found, Mention{rel, i + 1, 0, "text", snippet([]string{line}, 1), false})
 			}
 		}
 		return nil
@@ -195,7 +208,17 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 			uniq = append(uniq, m)
 		}
 	}
-	return uniq
+	const maxLoose = 5
+	loose, kept := 0, uniq[:0:0]
+	for _, m := range uniq {
+		if m.loose {
+			if loose++; loose > maxLoose {
+				continue
+			}
+		}
+		kept = append(kept, m)
+	}
+	return kept
 }
 
 // Notes renders one note per kind: a heading plus a few example lines.

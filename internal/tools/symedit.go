@@ -291,12 +291,12 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		}
 	}
 	switch {
+	case where != "end" && where != "after" && where != "before" && where != "into":
+		return nil, toolerr.Inputf("unknown position %q: use after, before or into (relative to name), or end (append to the file; the default without name).", where)
 	case where == "end" && in.Name != "":
 		return nil, toolerr.Inputf(`position="end" appends to the file; drop name, or use after/before/into.`)
 	case where != "end" && in.Name == "":
 		return nil, toolerr.Inputf("position=%q needs name (the symbol to place it relative to).", where)
-	case where != "end" && where != "after" && where != "before" && where != "into":
-		return nil, toolerr.Inputf("unknown position %q: use after, before, into or end.", where)
 	}
 	if !exists {
 		if where != "end" {
@@ -422,6 +422,9 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	}
 	var users []lsp.Location
 	for _, r := range locs {
+		if rp := lsp.URIToPath(r.URI); rp != "" && isCgoGenerated(rp) {
+			continue // cgo's generated glue in the build cache, not code anyone wrote
+		}
 		if lsp.URIToPath(r.URI) == l.path {
 			off := edits.Offset(l.text, r.Range.Start.Line, r.Range.Start.Character)
 			if off >= d.Start && off < d.End {
@@ -429,6 +432,21 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 			}
 		}
 		users = append(users, r)
+	}
+	var exported []string
+	if !d.Method && d.Keyword == "func" {
+		exported = cgoExportSites(l.path, l.text, d.Name)
+	}
+	if len(exported) > 0 && !in.Force {
+		return nil, fmt.Sprintf("Not deleted: %s is exported to C (//export %s): C code calls it by name, so deleting it breaks the cgo build (force=true deletes it anyway). Mentioned at:\n    %s",
+			in.Name, d.Name, strings.Join(exported, "\n    ")), nil
+	}
+	if len(exported) > 0 {
+		callers := ""
+		if len(exported) > 1 {
+			callers = " (" + strings.Join(exported[1:], ", ") + ")"
+		}
+		notes = append(notes, fmt.Sprintf("Forced: %s was exported to C (//export); the C code that calls it%s no longer links.", in.Name, callers))
 	}
 	if len(users) > 0 && !in.Force {
 		return nil, fmt.Sprintf("Not deleted: %s is still used in %d place(s) (force=true deletes it anyway and shows what breaks):\n%s",

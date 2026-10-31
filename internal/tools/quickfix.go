@@ -422,7 +422,11 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			if implicit {
 				why = fmt.Sprintf("choice=%q fits only some of the diagnostics, so nothing was applied (a choice is usually aimed at one fix; pass strict=false to apply the matching ones).", in.Choice)
 			}
-			return qfResult{out: why + skipped, notFixed: left("not applied: strict")}, nil
+			hold := "its fix was not applied: strict=true and other targeted diagnostics are not fixed"
+			if implicit {
+				hold = fmt.Sprintf("its fix matches choice=%q but was held back: the choice fits only some of the diagnostics (strict=false applies the matching ones)", in.Choice)
+			}
+			return qfResult{out: why + skipped, notFixed: left(hold)}, nil
 		}
 		notFixed = left("")
 		if skipped != "" {

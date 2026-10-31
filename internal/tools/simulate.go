@@ -232,15 +232,20 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 	if len(leftOut) > 0 {
 		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
 	}
-	for _, p := range changed {
-		src, ok := after[p]
-		if !ok {
-			if b, err := os.ReadFile(p); err == nil {
-				src, ok = string(b), true
-			}
+	for _, c := range plan.Changes {
+		if filepath.Ext(c.Path) != ".go" {
+			continue
+		}
+		// The file's own text: the stub standing in for a deleted file ("//go:build ignore") is ours, not its.
+		src, ok := "", false
+		switch {
+		case c.New != nil:
+			src, ok = *c.New, true
+		case c.Old != nil:
+			src, ok = *c.Old, true
 		}
 		if ok && gomod.HasBuildConstraint(src) {
-			plan.Notes = appendUnique(plan.Notes, edits.RelativeName(p, w.Root)+" has a build constraint; diagnostics only cover the current GOOS/GOARCH/tags, so the check may not see this file's own errors.")
+			plan.Notes = appendUnique(plan.Notes, edits.RelativeName(c.Path, w.Root)+" has a build constraint; diagnostics only cover the current GOOS/GOARCH/tags, so the check may not see this file's own errors.")
 		}
 	}
 	return d, nil

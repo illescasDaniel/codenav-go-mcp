@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"regexp"
+	"strings"
 
 	"golang.org/x/tools/imports"
 
@@ -15,7 +16,7 @@ import (
 // CheckSyntax parses src; a syntax error is returned as an InputError.
 func CheckSyntax(filename string, src string) error {
 	if _, err := parser.ParseFile(token.NewFileSet(), filename, src, parser.SkipObjectResolution); err != nil {
-		return toolerr.Inputf("not valid Go: %v", err)
+		return toolerr.Inputf("not valid Go: %s", syntaxText(err))
 	}
 	return nil
 }
@@ -52,4 +53,15 @@ func IsGenerated(src string) bool {
 func GofmtClean(text string) bool {
 	f, err := format.Source([]byte(text))
 	return err == nil && string(f) == text
+}
+
+var moreErrorsRE = regexp.MustCompile(` \(and (\d+) more errors?\)$`)
+
+// syntaxText renders a parser error: the first error with its position, and how many more follow.
+func syntaxText(err error) string {
+	t := err.Error()
+	if m := moreErrorsRE.FindStringSubmatch(t); m != nil {
+		t = strings.TrimSuffix(t, m[0]) + " (+" + m[1] + " more syntax error(s))"
+	}
+	return t
 }

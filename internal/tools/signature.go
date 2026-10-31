@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"slices"
 	"sort"
 	"strconv"
@@ -94,8 +96,16 @@ func planOrder(sig *gosrc.Sig, in changeSigIn) ([]entry, error) {
 		switch {
 		case a.Name == "" || a.Type == "" || strings.TrimSpace(a.Value) == "":
 			return nil, toolerr.Inputf("every added parameter needs name, type and value (the argument for existing calls)")
+		case !token.IsIdentifier(a.Name):
+			return nil, toolerr.Inputf("%q is not a valid Go parameter name (letters, digits and _, not starting with a digit, not a keyword)", a.Name)
 		case taken[a.Name]:
 			return nil, toolerr.Inputf("parameter %q already exists", a.Name)
+		}
+		if _, perr := parser.ParseExpr(a.Type); perr != nil {
+			return nil, toolerr.Inputf("type %q of added parameter %s is not a valid Go type", a.Type, a.Name)
+		}
+		if _, perr := parser.ParseExpr(a.Value); perr != nil {
+			return nil, toolerr.Inputf("value %q of added parameter %s is not a valid Go expression (it is written at every call site)", a.Value, a.Name)
 		}
 		taken[a.Name] = true
 		pos := len(order)
@@ -219,7 +229,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		return "", err
 	}
 	if sym.Kind != methodKind && sym.Kind != 12 && sym.Kind != 9 {
-		return "", toolerr.Inputf("%s is a %s, not a function or method.", in.Name, lsp.SymbolKindNames[sym.Kind])
+		return "", toolerr.Inputf("%s is %s, not a function or method.", in.Name, withArticle(lsp.SymbolKindNames[sym.Kind]))
 	}
 	root := member{lsp.URIToPath(sym.URI), sym.Line, sym.Column}
 	if sym.Kind == 12 {
@@ -230,6 +240,11 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 				}
 				if sp := specialFunc(d, gosrc.PackageName(text)); sp != "" {
 					return "", toolerr.Inputf("%s is the %s function: the Go toolchain requires it to take no parameters.", in.Name, sp)
+				}
+				if !d.Method {
+					if where := cgoExportSites(root.path, text, d.Name); where != nil {
+						return "", toolerr.Inputf("%s is exported to C (//export %s): C code calls it with the prototype written in the cgo preamble or a header, which is not a Go declaration this tool can rewrite, so changing its signature would break the cgo build. Change it by hand, together with all of these:\n    %s", in.Name, d.Name, strings.Join(where, "\n    "))
+					}
 				}
 			}
 		}
@@ -502,4 +517,12 @@ func neededImports(w *Workspace, fs *fileState, given []string, declImports map[
 		}
 	}
 	return need, notes, nil
+}
+
+// withArticle puts "a" or "an" before word.
+func withArticle(word string) string {
+	if word != "" && strings.ContainsRune("aeiouAEIOU", rune(word[0])) {
+		return "an " + word
+	}
+	return "a " + word
 }

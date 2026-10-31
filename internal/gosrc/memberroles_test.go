@@ -1,6 +1,9 @@
 package gosrc
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestNonMemberIdents(t *testing.T) {
 	src := "package p\n\ntype T struct{ Area int }\n\nfunc (T) Area2() {}\n\nfunc Area() {}\n\nfunc g(t T) { Area(); _ = t.Area; _ = T{Area: 1} }\n"
@@ -21,5 +24,14 @@ func TestDropOrphanImportComments(t *testing.T) {
 	want := "package p\n\nimport (\n\t// Std\n\t\"fmt\"\n\t// kept note\n)\n"
 	if got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestDropOrphanImportCommentsHeadings(t *testing.T) {
+	before := "package p\n\nimport (\n\t// Std\n\t\"fmt\"\n\t\"os\"\n\t// Third party\n\t\"x/y\"\n\t// Trailing\n)\n"
+	after := "package p\n\nimport (\n\t// Std\n\t\"fmt\"\n\t// Third party\n\t\"x/y\"\n\t// Trailing\n)\n"
+	got := DropOrphanImportComments("p.go", before, after)
+	if !strings.Contains(got, "// Std") || !strings.Contains(got, "\"x/y\"") || strings.Contains(got, "Trailing") {
+		t.Errorf("trailing heading must go:\n%s", got)
 	}
 }

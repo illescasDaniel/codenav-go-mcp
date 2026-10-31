@@ -37,7 +37,7 @@ func RemoveUnused(src string, off int, name string) ([]Replacement, error) {
 	// Object resolution stays on: it tells new variables of a := from redeclared ones.
 	f, err := parser.ParseFile(fset, "x.go", src, 0)
 	if err != nil {
-		return nil, toolerr.Inputf("not valid Go: %v", err)
+		return nil, toolerr.Inputf("not valid Go: %s", syntaxText(err))
 	}
 	tf := fset.File(f.Pos())
 	if off < 0 || off+len(name) > tf.Size() {

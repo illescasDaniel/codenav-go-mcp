@@ -106,7 +106,7 @@ constraints is invisible to the type check (the response says when an edit touch
 - **File paths** given to the read tools must lie in the workspace, GOROOT, the module cache or a
   `replace`/`use`-d directory; anything else (`../other-project/main.go`) is refused. `definition` on an
   import path lists at most 10 files (`(+K more files)`); on `C.x` it points at the cgo preamble line that
-  declares `x`. Renaming a cgo-generated symbol is refused (rename the C symbol); cgo hover shows `C.x`. Hover prints a pkg.go.dev link only for real module paths (none for a `replace`-d directory).
+  declares `x`. Renaming a cgo-generated symbol is refused (rename the C symbol); cgo hover shows `C.x`. Hover prints a pkg.go.dev link only for real module paths (none for a `replace`-d directory or a module of the workspace). Modules listed in `go.work` `use` are type-checked by edit previews and handled by `move` like the root module. `change_signature` and `edit_symbol delete` refuse a `//export` func (delete accepts `force=true`); `edit_symbol replace` keeps `import "C"`. Wrongly typed or unknown arguments get a short message with the tool's usage line. An `apply=false` preview warns when its new errors exceed `max_new_errors`. `diagnostics` on a file outside the workspace's modules says so.
 - **Name lookups outside the workspace** work for the read-only tools (`symbol_info`, `callers`,
   `implementations`): `json.Marshal`, `encoding/json.Decoder.Decode` or a symbol of a required dependency
   resolve through a scratch file that exists only as a gopls overlay (never on disk). A short qualifier is

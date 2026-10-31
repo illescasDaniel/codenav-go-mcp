@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -27,25 +29,98 @@ func registerUsage[In any](name string) {
 		return
 	}
 	var req, opt []string
-	for i := 0; i < t.NumField(); i++ {
-		tag := t.Field(i).Tag.Get("json")
-		if tag == "-" {
-			continue
-		}
-		n, rest, _ := strings.Cut(tag, ",")
-		if n == "" {
-			n = t.Field(i).Name
-		}
-		if strings.Contains(rest, "omitempty") || strings.Contains(rest, "omitzero") {
-			opt = append(opt, "["+n+"]")
-		} else {
-			req = append(req, n)
+	var walk func(t reflect.Type)
+	walk = func(t reflect.Type) {
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			tag := f.Tag.Get("json")
+			if tag == "-" {
+				continue
+			}
+			n, rest, _ := strings.Cut(tag, ",")
+			if f.Anonymous && n == "" && f.Type.Kind() == reflect.Struct {
+				walk(f.Type) // an embedded struct contributes its own fields
+				continue
+			}
+			if n == "" {
+				n = f.Name
+			}
+			if strings.Contains(rest, "omitempty") || strings.Contains(rest, "omitzero") {
+				opt = append(opt, "["+n+"]")
+			} else {
+				req = append(req, n)
+			}
 		}
 	}
+	walk(t)
 	usages.Lock()
 	usages.m[name] = name + "(" + strings.Join(append(req, opt...), ", ") + ")"
 	usages.Unlock()
 }
+
+var (
+	typeErrRE   = regexp.MustCompile(`validating /properties/([^:]*): type: (.*) has type "(\w+)", want (?:one of )?(.*)$`)
+	extraPropRE = regexp.MustCompile(`(?:validating /properties/([^:]*): )?unexpected additional properties \[([^\]]*)\]`)
+	wantTypeRE  = regexp.MustCompile(`[a-z]+`)
+)
+
+var typeArticle = map[string]string{
+	"integer": "an integer", "number": "a number", "string": "a string", "boolean": "a boolean (true or false)",
+	"array": "an array", "object": "an object", "null": "null",
+}
+
+// friendlyTypeError rewrites the schema validator's type and unknown-property refusals into a sentence
+// naming the parameter ("line must be an integer (got string "5")"); "" when the text is not one.
+func friendlyTypeError(text string) string {
+	if m := typeErrRE.FindStringSubmatch(text); m != nil {
+		path := strings.Split(m[1], "/")
+		param, item := path[0], len(path) > 1 && path[len(path)-1] == "items"
+		var want []string
+		for _, w := range wantTypeRE.FindAllString(m[4], -1) {
+			if w != "null" && typeArticle[w] != "" {
+				want = append(want, typeArticle[w])
+			}
+		}
+		if len(want) == 0 {
+			return ""
+		}
+		got := m[3]
+		val := m[2]
+		desc := got
+		switch got {
+		case "string":
+			desc = "string " + strconvQuote(val)
+		case "integer", "number", "boolean":
+			desc = got + " " + val
+		}
+		subject := param
+		if item {
+			subject = "each item of " + param
+		}
+		return fmt.Sprintf("%s must be %s (got %s).", subject, strings.Join(want, " or "), desc)
+	}
+	if m := extraPropRE.FindStringSubmatch(text); m != nil {
+		var names []string
+		for _, n := range strings.Split(m[2], ",") {
+			names = append(names, strings.Trim(strings.TrimSpace(n), `"`))
+		}
+		list := strings.Join(names, ", ")
+		if m[1] != "" {
+			param := strings.Split(m[1], "/")[0]
+			msg := fmt.Sprintf("unknown field %s in an item of %s.", list, param)
+			for _, n := range names {
+				if n == "default" || n == "default_value" {
+					msg += ` Go has no default values: use "value", the argument written at each existing call.`
+				}
+			}
+			return msg
+		}
+		return fmt.Sprintf("unknown parameter(s): %s.", list)
+	}
+	return ""
+}
+
+func strconvQuote(s string) string { return strconv.Quote(s) }
 
 var missingRE = regexp.MustCompile(`required: missing properties: \[([^\]]*)\]`)
 
@@ -65,8 +140,20 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 		if !ok {
 			return res, err
 		}
+		usage := ""
+		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+			usages.Lock()
+			usage = usages.m[params.Name]
+			usages.Unlock()
+		}
 		m := missingRE.FindStringSubmatch(tc.Text)
 		if m == nil {
+			if msg := friendlyTypeError(tc.Text); msg != "" {
+				if usage != "" {
+					msg += " Usage: " + usage + " (parameters in brackets are optional)."
+				}
+				tc.Text = msg
+			}
 			return res, err
 		}
 		var names []string

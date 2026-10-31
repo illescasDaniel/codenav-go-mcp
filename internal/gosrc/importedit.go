@@ -424,6 +424,9 @@ func unusedSpecs(filename string, f, oldF *ast.File) map[string]bool {
 		if s.Name != nil && s.Name.Name == "_" {
 			continue
 		}
+		if s.Path.Value == `"C"` {
+			continue // import "C" carries the cgo preamble above it; it is never "unused"
+		}
 		os_, ok := oldBy[key(s)]
 		if !ok {
 			continue

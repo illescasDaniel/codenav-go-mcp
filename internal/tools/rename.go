@@ -688,6 +688,17 @@ func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp
 // (the cgo preamble or .c/.h files) calls it by that name, and neither the directive nor those
 // calls are Go identifiers the type checker can follow, so the rename would break the cgo build.
 func cgoExportRefusal(path, text, name string) error {
+	where := cgoExportSites(path, text, name)
+	if where == nil {
+		return nil
+	}
+	return toolerr.Inputf("%s is exported to C (//export %s): C code calls it by name, and the directive and those calls are not Go identifiers the type checker follows, so renaming it would break the cgo build. Rename it by hand, changing all of these together:\n    %s",
+		name, name, strings.Join(where, "\n    "))
+}
+
+// cgoExportSites lists where a function exported to C with `//export name` is mentioned (the directive
+// and the C code that calls it); nil when it is not exported.
+func cgoExportSites(path, text, name string) []string {
 	re := regexp.MustCompile(`(?m)^//export[ \t]+` + regexp.QuoteMeta(name) + `[ \t]*$`)
 	loc := re.FindStringIndex(text)
 	if loc == nil {
@@ -735,6 +746,5 @@ func cgoExportRefusal(path, text, name string) error {
 			}
 		}
 	}
-	return toolerr.Inputf("%s is exported to C (//export %s): C code calls it by name, and the directive and those calls are not Go identifiers the type checker follows, so renaming it would break the cgo build. Rename it by hand, changing all of these together:\n    %s",
-		name, name, strings.Join(where, "\n    "))
+	return where
 }

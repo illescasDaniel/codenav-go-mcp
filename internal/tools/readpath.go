@@ -106,3 +106,12 @@ func filePathOf(in any) string {
 	_ = json.Unmarshal(b, &f)
 	return f.FilePath
 }
+
+// scrub shows the workspace-relative form of the paths in an error message: parser and tool errors
+// carry the absolute file name.
+func (w *Workspace) scrub(msg string) string {
+	if w.Root == "" {
+		return msg
+	}
+	return strings.ReplaceAll(msg, strings.TrimRight(w.Root, "/")+"/", "")
+}

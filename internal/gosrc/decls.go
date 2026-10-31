@@ -35,7 +35,7 @@ func parse(filename, src string) (*token.FileSet, *ast.File, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, src, parser.ParseComments)
 	if err != nil {
-		return nil, nil, toolerr.Inputf("not valid Go: %v", err)
+		return nil, nil, toolerr.Inputf("not valid Go: %s", syntaxText(err))
 	}
 	return fset, f, nil
 }
@@ -501,7 +501,7 @@ func RewriteImports(filename, src string, fn func(path string) (string, bool)) (
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, filename, src, parser.ImportsOnly)
 	if err != nil {
-		return src, false, toolerr.Inputf("not valid Go: %v", err)
+		return src, false, toolerr.Inputf("not valid Go: %s", syntaxText(err))
 	}
 	var b strings.Builder
 	pos, changed := 0, false
