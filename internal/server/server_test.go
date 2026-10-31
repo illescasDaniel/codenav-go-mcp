@@ -2044,3 +2044,156 @@ func TestCgoMoveAndRenameRefuseFriendly(t *testing.T) {
 		t.Errorf("renaming C:\n%s", out)
 	}
 }
+
+func nestedWorkspace(t *testing.T, root string) {
+	t.Helper()
+	writeFile(t, root, "go.work", "go 1.24\n\nuse (\n\t.\n\t./nested\n)\n")
+	writeFile(t, root, "nested/go.mod", "module example.com/nested\n\ngo 1.24\n")
+	writeFile(t, root, "nested/keep.go", "package nested\n")
+}
+
+func TestMoveSymbolIntoNestedModuleUsesItsImportPath(t *testing.T) {
+	cs, root := session(t, nil)
+	nestedWorkspace(t, root)
+	writeFile(t, root, "util/u.go", "package util\n\nfunc F() int { return 1 }\n")
+	writeFile(t, root, "use/use.go", "package use\n\nimport \"example.com/fx/util\"\n\nfunc G() int { return util.F() }\n")
+	out := call(t, cs, "move", map[string]any{"name": "util.F", "to_file": "nested/f/f.go"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(out, "example.com/nested/f") || strings.Contains(out, "example.com/fx/nested") {
+		t.Fatalf("move into a nested module:\n%s", out)
+	}
+	if use := readFile(t, root, "use/use.go"); !strings.Contains(use, `"example.com/nested/f"`) || strings.Contains(use, "fx/nested") {
+		t.Errorf("importer must use the nested module's path:\n%s", use)
+	}
+}
+
+func TestMovePackageIntoNestedModuleUsesItsImportPath(t *testing.T) {
+	cs, root := session(t, nil)
+	nestedWorkspace(t, root)
+	out := call(t, cs, "move", map[string]any{"file_path": "shapes", "to_file": "nested/shapes"})
+	if !strings.Contains(out, "example.com/fx/shapes -> example.com/nested/shapes") {
+		t.Fatalf("package move into a nested module:\n%s", out)
+	}
+	if app := readFile(t, root, "app/app.go"); !strings.Contains(app, `"example.com/nested/shapes"`) {
+		t.Errorf("importer not rewritten with the nested path:\n%s", app)
+	}
+}
+
+func TestEditOldStringMatchesAcrossLineEndings(t *testing.T) {
+	cs, root := session(t, nil)
+	const old, repl = "func One() int {\n\treturn 1\n}", "func One() int {\n\treturn 11\n}"
+	for _, tc := range []struct{ name, src string }{
+		{"crlf", "package eol\r\n\r\nfunc One() int {\r\n\treturn 1\r\n}\r\n"},
+		{"bom crlf", "\xef\xbb\xbfpackage eol\r\n\r\nfunc One() int {\r\n\treturn 1\r\n}\r\n"},
+		{"mixed", "package eol\n\nfunc One() int {\r\n\treturn 1\r\n}\n\nfunc Two() int {\n\treturn 2\n}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			writeFile(t, root, "eol/e.go", tc.src)
+			out := call(t, cs, "edit", map[string]any{"file_path": "eol/e.go", "old_string": old, "new_string": repl})
+			if !strings.Contains(out, "Applied") {
+				t.Fatalf("edit:\n%s", out)
+			}
+			got := readFile(t, root, "eol/e.go")
+			want := strings.Replace(tc.src, "return 1", "return 11", 1)
+			if got != want {
+				t.Errorf("got %q\nwant %q", got, want)
+			}
+		})
+	}
+	// Uniqueness is checked on the normalised text.
+	writeFile(t, root, "eol/e.go", "package eol\r\n\r\nfunc A() {\r\n\tprintln(1)\r\n}\r\n\r\nfunc B() {\r\n\tprintln(1)\r\n}\r\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "eol/e.go", "old_string": "\tprintln(1)\n", "new_string": "\tprintln(2)\n"})
+	if !strings.Contains(out, "matches 2 times") {
+		t.Errorf("uniqueness on normalised text:\n%s", out)
+	}
+}
+
+const dotSrc = "package dot\n\nimport (\n\t\"fmt\"\n\t. \"math\"\n\t_ \"embed\"\n)\n\nfunc Root() float64 { return Sqrt(2) }\n\nfunc Say() { fmt.Println() }\n"
+
+func TestDeleteSymbolPrunesDotImport(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "dot/dot.go", dotSrc)
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "dot.Root"})
+	got := readFile(t, root, "dot/dot.go")
+	if !strings.Contains(out, "Applied") || strings.Contains(got, "math") || !strings.Contains(got, `_ "embed"`) || !strings.Contains(got, `"fmt"`) {
+		t.Errorf("unused dot import must go, blank import stays:\n%s\n%s", out, got)
+	}
+}
+
+func TestDeletePrunesEachDuplicateImportByLocalName(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "dup/dup.go", "package dup\n\nimport (\n\t\"fmt\" // trailing fmt\n\tf2 \"fmt\"\n)\n\nfunc A() { fmt.Println() }\n\nfunc B() { f2.Println() }\n")
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "dup.A"})
+	got := readFile(t, root, "dup/dup.go")
+	if !strings.Contains(out, "Applied") || strings.Contains(got, "trailing fmt") || !strings.Contains(got, `f2 "fmt"`) {
+		t.Errorf("only the plain import goes, with its comment:\n%s\n%s", out, got)
+	}
+}
+
+func TestMoveCarriesDotImport(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "dot/dot.go", dotSrc)
+	out := call(t, cs, "move", map[string]any{"name": "dot.Root", "to_file": "dot2/root.go"})
+	if !strings.Contains(out, "Applied") {
+		t.Fatalf("move:\n%s", out)
+	}
+	if got := readFile(t, root, "dot2/root.go"); !strings.Contains(got, `. "math"`) || !strings.Contains(got, "Sqrt(2)") {
+		t.Errorf("target must carry the dot import:\n%s", got)
+	}
+	if got := readFile(t, root, "dot/dot.go"); strings.Contains(got, "math") {
+		t.Errorf("source must lose the unused dot import:\n%s", got)
+	}
+	// and within a package
+	writeFile(t, root, "dot3/a.go", dotSrc)
+	out = call(t, cs, "move", map[string]any{"name": "dot3.Root", "to_file": "dot3/b.go"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(readFile(t, root, "dot3/b.go"), `. "math"`) || strings.Contains(readFile(t, root, "dot3/a.go"), "math") {
+		t.Errorf("same-package move:\n%s", out)
+	}
+}
+
+func TestMoveReusesExistingImportOfDestination(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "alias/a.go", "package alias\n\nimport str \"strings\"\n\nfunc Up(s string) string { return str.ToUpper(s) }\n")
+	writeFile(t, root, "alias/b.go", "package alias\n\nimport \"strings\"\n\nfunc Low(s string) string { return strings.ToLower(s) }\n")
+	out := call(t, cs, "move", map[string]any{"name": "alias.Up", "to_file": "alias/b.go"})
+	got := readFile(t, root, "alias/b.go")
+	if !strings.Contains(out, "Applied") || strings.Contains(got, "str ") || strings.Contains(got, "str.") || strings.Count(got, `"strings"`) != 1 || !strings.Contains(got, "strings.ToUpper") {
+		t.Errorf("existing import must be reused:\n%s\n%s", out, got)
+	}
+}
+
+func TestQuickFixRemoveOnGofmtCleanFileWithTwoImportDecls(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nimport \"os\"\nimport \"strings\"\n\nvar _ = os.Args\nvar _ = strings.ToUpper\n\nfunc E() { x := 1 }\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Remove"})
+	got := readFile(t, root, "shapes/unused.go")
+	if strings.Contains(out, "not gofmt-clean") || !strings.Contains(got, "func E() {}\n") || strings.Contains(got, "  ") {
+		t.Errorf("a gofmt-clean file is formatted and the note stays quiet:\n%s\n%s", out, got)
+	}
+	// Not clean: no note about the new text, minimal whitespace edit, no double space.
+	writeFile(t, root, "shapes/unused.go", "package shapes\n\nfunc   E() { x := 1 }\n")
+	out = call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/unused.go", "choice": "Remove"})
+	got = readFile(t, root, "shapes/unused.go")
+	if !strings.Contains(out, "not gofmt-clean before the edit") || !strings.Contains(got, "func   E() { }") {
+		t.Errorf("messy file keeps its formatting, one blank removed:\n%s\n%s", out, got)
+	}
+}
+
+func TestDeleteSymbolCollapsesBlankLinesAtTheSeam(t *testing.T) {
+	cs, root := session(t, nil)
+	const src = "package gap\n\nfunc   A() {}\n\n\nfunc B() {}\n\n\nfunc   C() {}\n"
+	writeFile(t, root, "gap/gap.go", src)
+	call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "gap.B"})
+	if got := readFile(t, root, "gap/gap.go"); got != "package gap\n\nfunc   A() {}\n\nfunc   C() {}\n" {
+		t.Errorf("middle:\n%q", got)
+	}
+	call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "gap.C"})
+	if got := readFile(t, root, "gap/gap.go"); got != "package gap\n\nfunc   A() {}\n" {
+		t.Errorf("last:\n%q", got)
+	}
+	// moving out of a messy file leaves the same tidy seam
+	writeFile(t, root, "gap/gap.go", src)
+	call(t, cs, "move", map[string]any{"name": "gap.C", "to_file": "gap/other.go"})
+	if got := readFile(t, root, "gap/gap.go"); got != "package gap\n\nfunc   A() {}\n\n\nfunc B() {}\n" {
+		t.Errorf("move out of the end:\n%q", got)
+	}
+}

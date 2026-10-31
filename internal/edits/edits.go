@@ -523,15 +523,23 @@ func RestoreEOL(text, like string) string {
 		oc[i] = o[0]
 	}
 	i, j := 0, 0
+	var gone []int // indexes in olds of the lines removed since the last kept line
 	for _, o := range diffLines(oc, newLines[:n]) {
 		switch o.kind {
 		case ' ':
 			ends[j] = olds[i][1]
 			i++
 			j++
+			gone = nil
 		case '-':
+			gone = append(gone, i)
 			i++
 		default:
+			// A changed line takes the ending of the line it replaces.
+			if len(gone) > 0 {
+				ends[j] = olds[gone[0]][1]
+				gone = gone[1:]
+			}
 			j++
 		}
 	}

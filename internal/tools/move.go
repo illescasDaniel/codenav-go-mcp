@@ -16,6 +16,7 @@ import (
 	"golang.org/x/tools/go/packages"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
@@ -45,20 +46,66 @@ type tedit struct {
 
 func applyEdits(text string, es []tedit) string {
 	sort.SliceStable(es, func(i, j int) bool { return es[i].start < es[j].start })
-	var b strings.Builder
+	var b []byte
 	pos := 0
 	for _, e := range es {
 		if e.start < pos {
 			continue
 		}
-		b.WriteString(text[pos:e.start])
-		b.WriteString(e.text)
+		b = append(b, text[pos:e.start]...)
+		b = append(b, e.text...)
 		pos = e.end
+		if e.text == "" && e.start < e.end && atLineStart(text, e.start) && atLineStart(text, e.end) {
+			b, pos = tidySeam(b, text, pos)
+		}
 	}
-	b.WriteString(text[pos:])
-	return b.String()
+	b = append(b, text[pos:]...)
+	return string(b)
 }
 
+func atLineStart(text string, off int) bool {
+	return off == 0 || off >= len(text) || text[off-1] == '\n'
+}
+
+// blankLen is the length of the run of blank lines at the start of s.
+func blankLen(s string) int {
+	n := 0
+	for n < len(s) {
+		i := strings.IndexByte(s[n:], '\n')
+		if i < 0 || strings.TrimSpace(s[n:n+i]) != "" {
+			break
+		}
+		n += i + 1
+	}
+	return n
+}
+
+// tidySeam runs after whole lines were cut out between b and text[pos:]: the blank lines on both sides
+// of the cut collapse to one, and a cut at the end of the file leaves no blank line behind.
+func tidySeam(b []byte, text string, pos int) ([]byte, int) {
+	post := text[pos:]
+	pre := len(b)
+	for pre > 0 {
+		i := strings.LastIndexByte(string(b[:pre-1]), '\n') + 1
+		if pre-1 < i || strings.TrimSpace(string(b[i:pre])) != "" {
+			break
+		}
+		pre = i
+	}
+	prevBlank := pre < len(b) // b ends with blank lines
+	switch {
+	case strings.TrimSpace(post) == "":
+		if prevBlank && pre > 0 {
+			b = b[:pre]
+		}
+	case prevBlank:
+		pos += blankLen(post)
+		if nl := strings.IndexByte(string(b[pre:]), '\n'); nl >= 0 && pre+nl+1 < len(b) {
+			b = b[:pre+nl+1]
+		}
+	}
+	return b, pos
+}
 func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 	if in.Name == "" && in.FilePath != "" && in.ToFile != "" {
 		return moveDirectory(ctx, w, in.FilePath, in.ToFile, in)
@@ -155,7 +202,10 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 		return nil, rerr
 	}
 	snippet := l.text[d.Start:d.End]
+	used := gosrc.ImportsUsed(l.path, l.text, snippet)
 	if exists {
+		// an import the file already has (under any local name) is reused
+		snippet, used = gosrc.AdaptImports(dest, destText, l.path, l.text, snippet)
 		if gosrc.PackageName(destText) != gosrc.PackageName(l.text) {
 			return nil, toolerr.Inputf("%s belongs to package %s, not %s.", filepath.Base(dest), gosrc.PackageName(destText), gosrc.PackageName(l.text))
 		}
@@ -172,13 +222,12 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 	} else {
 		destText = "package " + gosrc.PackageName(l.text) + "\n\n" + snippet + "\n"
 	}
-	used := gosrc.ImportsUsed(l.path, l.text, snippet)
 	destText, err := gosrc.EditImports(dest, destText, "", used, false)
 	if err != nil {
 		return nil, err
 	}
 	from, to := wholeLines(l.text, d.Start, d.End)
-	srcText, err := gosrc.EditImports(l.path, l.text[:from]+l.text[to:], l.text, nil, true)
+	srcText, err := gosrc.EditImports(l.path, applyEdits(l.text, []tedit{{from, to, ""}}), l.text, nil, true)
 	if err != nil {
 		return nil, err
 	}
@@ -251,21 +300,38 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	}
 	destDir := filepath.Dir(dest)
 	var A, B *packages.Package
-	for _, p := range pkgs {
-		if strings.HasSuffix(p.PkgPath, "_test") || strings.Contains(p.ID, " [") || strings.HasSuffix(p.ID, ".test") {
-			continue
-		}
-		for _, f := range p.GoFiles {
-			if f == l.path {
-				A = p
+	find := func() {
+		for _, p := range pkgs {
+			if strings.HasSuffix(p.PkgPath, "_test") || strings.Contains(p.ID, " [") || strings.HasSuffix(p.ID, ".test") {
+				continue
 			}
-			if filepath.Dir(f) == destDir {
-				B = p
+			for _, f := range p.GoFiles {
+				if f == l.path {
+					A = p
+				}
+				if filepath.Dir(f) == destDir {
+					B = p
+				}
 			}
 		}
 	}
+	find()
 	if A == nil {
 		return nil, toolerr.Inputf("%s is not part of a package in this workspace's module.", filepath.Base(l.path))
+	}
+	// A destination in another module (a nested go.mod) is not covered by "./..." of the root module:
+	// its import path comes from its own go.mod, and its packages are loaded separately.
+	destMod, haveDestMod := gomod.Owner(destDir)
+	crossModule := haveDestMod && A.Module != nil && destMod.Dir != A.Module.Dir
+	if crossModule && B == nil {
+		if rel, err := filepath.Rel(w.Root, destMod.Dir); err == nil && !strings.HasPrefix(rel, "..") {
+			ncfg := *cfg
+			ncfg.Dir = destMod.Dir
+			if more, err := packages.Load(&ncfg, "./..."); err == nil {
+				pkgs = append(pkgs, more...)
+				find()
+			}
+		}
 	}
 	if len(A.Errors) > 0 {
 		return nil, toolerr.Inputf("package %s has errors (%v); fix them before moving code out of it.", A.PkgPath, A.Errors[0])
@@ -274,6 +340,12 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	switch {
 	case B != nil:
 		bName, bPath = B.Name, B.PkgPath
+	case crossModule:
+		bPath, err = importPathOf(moduleInfo{Path: destMod.Path, Dir: destMod.Dir}, destDir)
+		if err != nil {
+			return nil, err
+		}
+		bName = packageFor(dest)
 	case A.Module != nil:
 		rel, err := filepath.Rel(A.Module.Dir, destDir)
 		if err != nil || strings.HasPrefix(rel, "..") {
@@ -528,6 +600,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	for i, s := range spans {
 		byFile[s.file] = append(byFile[s.file], i)
 	}
+	destPre, _, _ := edits.ReadSource(dest) // "" for a new file: its imports are the snippets' own
 	type result struct {
 		next, old string
 		bom       bool
@@ -560,7 +633,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		for _, i := range byFile[f] {
 			s := spans[i]
 			snippets[i] = applyEdits(text[s.start:s.end], inner[i])
-			for _, spec := range gosrc.ImportsUsed(f, text, snippets[i]) {
+			var used []string
+			snippets[i], used = gosrc.AdaptImports(dest, destPre, f, text, snippets[i])
+			for _, spec := range used {
 				snippetImports[spec] = true
 			}
 			a, b := wholeLines(text, s.start, s.end)
@@ -650,6 +725,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	notes := []string{fmt.Sprintf("Moved %s from package %s to %s (%d declaration(s), including methods).", display, A.PkgPath, bPath, len(spans))}
 	if n := len(fileEdits); n > 0 {
 		notes = append(notes, fmt.Sprintf("Package qualifiers were rewritten in %d file(s).", n))
+	}
+	if crossModule {
+		notes = append(notes, fmt.Sprintf("%s moved to another module (%s -> %s): packages of %s resolve %s only through a go.work that joins both modules, or a require/replace in their go.mod.", display, A.Module.Path, destMod.Path, A.Module.Path, bPath))
 	}
 	return edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...), nil
 }

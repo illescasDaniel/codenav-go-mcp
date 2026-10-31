@@ -229,6 +229,12 @@ func (r *remover) del(start, end int) Replacement {
 		}
 		return Replacement{start, e, ""}
 	}
+	// `{ x := 1 }`: take one side of the blanks so no double space is left
+	if start > 0 && (r.src[start-1] == ' ' || r.src[start-1] == '\t') {
+		for end < len(r.src) && (r.src[end] == ' ' || r.src[end] == '\t') {
+			end++
+		}
+	}
 	return Replacement{start, end, ""}
 }
 

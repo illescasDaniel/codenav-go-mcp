@@ -66,7 +66,12 @@ func moveDirectory(ctx context.Context, w *Workspace, from, to string, in moveIn
 	if err != nil {
 		return "", err
 	}
-	newPath, err := importPathOf(mod, dst)
+	// The destination may sit in another module (a nested go.mod): its import path comes from there.
+	dstMod, err := moduleOf(dst)
+	if err != nil {
+		return "", err
+	}
+	newPath, err := importPathOf(dstMod, dst)
 	if err != nil {
 		return "", err
 	}
@@ -155,6 +160,9 @@ func moveDirectory(ctx context.Context, w *Workspace, from, to string, in moveIn
 	notes := []string{fmt.Sprintf("Import path %s -> %s rewritten in %d file(s); %d file(s) moved.", oldPath, newPath, imports, len(moved))}
 	if filepath.Base(src) != filepath.Base(dst) {
 		notes = append(notes, "The package clause was not renamed; callers keep using the old package name (rename it with edit if you want the new directory name).")
+	}
+	if dstMod.Dir != mod.Dir {
+		notes = append(notes, fmt.Sprintf("Moved to another module (%s -> %s): packages of %s resolve %s only through a go.work that joins both modules, or a require/replace in their go.mod.", mod.Path, dstMod.Path, mod.Path, newPath))
 	}
 	plan := edits.NewPlan("move directory "+from+" to "+to, changes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)

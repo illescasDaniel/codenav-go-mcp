@@ -6,6 +6,8 @@ import (
 	"go/format"
 	"go/parser"
 	"go/token"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -291,36 +293,30 @@ func ParseImportSpec(s string) (alias, path string, err error) {
 }
 
 // EditImports adds the given imports and, when prune is set, drops the imports that were
-// used in oldSrc but are no longer used in src. It returns src unchanged when nothing applies.
+// used in oldSrc but are no longer used in src (each spec by its own local name, dot imports
+// included; blank imports stay). It returns src unchanged when nothing applies. The imports are
+// edited as text: untouched ones keep their order, a removed spec takes its comments with it.
 func EditImports(filename, src, oldSrc string, add []string, prune bool) (string, error) {
 	if len(add) == 0 && !prune {
 		return src, nil
 	}
-	fset, f, err := parse(filename, src)
-	if err != nil {
+	if _, _, err := parse(filename, src); err != nil {
 		return "", err
 	}
-	changed := false
+	out := src
 	if prune && oldSrc != "" {
 		if _, of, oerr := parse(filename, oldSrc); oerr == nil {
-			var drop []*ast.ImportSpec
-			for _, imp := range f.Imports {
-				p, _ := strconv.Unquote(imp.Path.Value)
-				if imp.Name != nil && (imp.Name.Name == "_" || imp.Name.Name == ".") {
-					continue
-				}
-				if astutil.UsesImport(of, p) && !astutil.UsesImport(f, p) {
-					drop = append(drop, imp)
-				}
+			_, f, _ := parse(filename, out)
+			drop := unusedSpecs(filename, f, of)
+			var keys []string
+			for k := range drop {
+				keys = append(keys, k)
 			}
-			for _, imp := range drop {
-				p, _ := strconv.Unquote(imp.Path.Value)
-				name := ""
-				if imp.Name != nil {
-					name = imp.Name.Name
-				}
-				if astutil.DeleteNamedImport(fset, f, name, p) {
-					changed = true
+			sort.Strings(keys)
+			for _, k := range keys {
+				var err error
+				if out, err = dropSpec(filename, out, func(s *ast.ImportSpec) bool { return specKey(s) == k }); err != nil {
+					return "", err
 				}
 			}
 		}
@@ -330,11 +326,58 @@ func EditImports(filename, src, oldSrc string, add []string, prune bool) (string
 		if err != nil {
 			return "", err
 		}
-		if astutil.AddNamedImport(fset, f, alias, p) {
-			changed = true
+		_, f, err := parse(filename, out)
+		if err != nil {
+			return "", err
+		}
+		if hasSpec(f, alias, p) {
+			continue
+		}
+		if next, ok := addSpec(filename, out, alias, p); ok {
+			out = next
+			continue
+		}
+		if out, err = addSpecAST(filename, out, alias, p); err != nil {
+			return "", err
 		}
 	}
-	if !changed {
+	return out, nil
+}
+
+// dropSpec removes the first import spec pick accepts, as text when possible, else through the printer.
+func dropSpec(filename, src string, pick func(*ast.ImportSpec) bool) (string, error) {
+	if out, removed, ok := removeSpec(filename, src, pick); ok {
+		return out, nil
+	} else if removed {
+		return src, nil
+	}
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return "", err
+	}
+	for _, s := range f.Imports {
+		if !pick(s) {
+			continue
+		}
+		p, _ := strconv.Unquote(s.Path.Value)
+		name := ""
+		if s.Name != nil {
+			name = s.Name.Name
+		}
+		if astutil.DeleteNamedImport(fset, f, name, p) {
+			collapseSingleImports(f)
+			return spliceImports(filename, src, fset, f)
+		}
+	}
+	return src, nil
+}
+
+func addSpecAST(filename, src, alias, path string) (string, error) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return "", err
+	}
+	if !astutil.AddNamedImport(fset, f, alias, path) {
 		return src, nil
 	}
 	collapseSingleImports(f)
@@ -408,37 +451,36 @@ func spliceImports(filename, src string, fset *token.FileSet, f *ast.File) (stri
 
 // DropImport removes the import `name "path"` (name "" for a plain import, "." for a dot import).
 func DropImport(filename, src, name, path string) (string, error) {
-	fset, f, err := parse(filename, src)
-	if err != nil {
-		return "", err
-	}
-	if !astutil.DeleteNamedImport(fset, f, name, path) {
-		return src, nil
-	}
-	collapseSingleImports(f)
-	return spliceImports(filename, src, fset, f)
+	return dropSpec(filename, src, func(s *ast.ImportSpec) bool {
+		n := ""
+		if s.Name != nil {
+			n = s.Name.Name
+		}
+		p, _ := strconv.Unquote(s.Path.Value)
+		return n == name && p == path
+	})
 }
 
-// ImportsUsed lists, as `alias "path"` specs, the imports of src that the code in snippet uses.
+// ImportsUsed lists, as `alias "path"` specs, the imports of src that the code in snippet uses
+// (a dot import counts when the snippet names something its package exports).
 func ImportsUsed(filename, src, snippet string) []string {
 	_, f, err := parse(filename, src)
 	if err != nil {
 		return nil
 	}
-	type imp struct{ path, spec string }
-	var imps []imp
+	var specs []*ast.ImportSpec
+	var lines []string
 	var header strings.Builder
 	header.WriteString("package p\n")
 	for _, i := range f.Imports {
+		if i.Name != nil && i.Name.Name == "_" {
+			continue
+		}
 		line := i.Path.Value
 		if i.Name != nil {
-			if i.Name.Name == "_" || i.Name.Name == "." {
-				continue
-			}
 			line = i.Name.Name + " " + line
 		}
-		p, _ := strconv.Unquote(i.Path.Value)
-		imps = append(imps, imp{p, line})
+		specs, lines = append(specs, i), append(lines, line)
 		header.WriteString("import " + line + "\n")
 	}
 	_, sf, err := parse(filename, header.String()+snippet)
@@ -446,9 +488,9 @@ func ImportsUsed(filename, src, snippet string) []string {
 		return nil
 	}
 	var out []string
-	for _, i := range imps {
-		if astutil.UsesImport(sf, i.path) {
-			out = append(out, i.spec)
+	for i, s := range specs {
+		if used, _ := specUsed(filepath.Dir(filename), sf, s); used {
+			out = append(out, lines[i])
 		}
 	}
 	return out

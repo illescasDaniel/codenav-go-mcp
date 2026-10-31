@@ -90,7 +90,7 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 func unformattedNotes(root string, plan *edits.EditPlan) []string {
 	var names []string
 	for _, c := range plan.Changes {
-		if c.Old != nil && c.New != nil && strings.HasSuffix(c.Path, ".go") && !isGofmted(c.Path, *c.New) {
+		if c.Old != nil && c.New != nil && strings.HasSuffix(c.Path, ".go") && !isGofmted(c.Path, *c.Old) {
 			names = append(names, edits.RelativeName(c.Path, root))
 		}
 	}
@@ -270,7 +270,10 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		if in.NewString == nil {
 			return nil, toolerr.Inputf("old_string needs new_string; pass new_string=\"\" to delete the text.")
 		}
-		n := strings.Count(old, in.OldString)
+		// Match on LF-normalised text, so an old_string written with LF finds CRLF (or mixed) lines;
+		// fileChange gives the result the file's line endings back, line by line.
+		hay, needle := strings.ReplaceAll(old, "\r\n", "\n"), strings.ReplaceAll(in.OldString, "\r\n", "\n")
+		n := strings.Count(hay, needle)
 		switch {
 		case n == 0:
 			return nil, toolerr.Inputf("old_string was not found in %s (it must match exactly, including whitespace).", in.FilePath)
@@ -281,18 +284,18 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		if in.ReplaceAll {
 			count = -1
 		}
-		next = strings.Replace(old, in.OldString, edits.MatchEOL(*in.NewString, old), count)
+		next = strings.Replace(hay, needle, strings.ReplaceAll(*in.NewString, "\r\n", "\n"), count)
 	default:
 		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
 	}
 	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
 }
 
-// isGofmted reports whether text (any line endings) is what gofmt/goimports would leave unchanged.
+// isGofmted reports whether text (any line endings) is what gofmt would leave unchanged. (goimports'
+// merging of two import declarations does not count: a file gofmt accepts is clean.)
 func isGofmted(abs, text string) bool {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
-	f, err := gosrc.Format(abs, text)
-	return err == nil && f == text
+	return gosrc.GofmtClean(text)
 }
 
 // fileChange turns the complete new text of one file into a change: gofmt-ed, line endings and BOM

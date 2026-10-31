@@ -436,7 +436,7 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	}
 	from, to := d.Start, d.End
 	from, to = lineStart(l.text, from), lineEnd(l.text, to)
-	next := l.text[:from] + l.text[to:]
+	next := applyEdits(l.text, []tedit{{from, to, ""}})
 	next, err = gosrc.EditImports(l.path, next, l.text, nil, prune)
 	if err != nil {
 		return nil, "", err

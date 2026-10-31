@@ -47,3 +47,9 @@ func IsGenerated(src string) bool {
 	}
 	return generatedRE.MatchString(head)
 }
+
+// GofmtClean: text (LF line endings) is what plain gofmt leaves unchanged.
+func GofmtClean(text string) bool {
+	f, err := format.Source([]byte(text))
+	return err == nil && string(f) == text
+}

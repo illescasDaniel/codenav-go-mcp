@@ -434,6 +434,15 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 	if err != nil {
 		return qfResult{}, toolerr.Inputf("the fixes could not be combined: %v", err)
 	}
+	for i, c := range changes {
+		// A file that was gofmt-clean stays so (a removal can leave blanks behind); a messy one keeps its text.
+		if c.Old != nil && c.New != nil && strings.HasSuffix(c.Path, ".go") {
+			if f, ferr := fileChange(c.Path, *c.New, c.Old, c.OldBOM); ferr == nil {
+				f.NewBOM = c.NewBOM
+				changes[i] = f
+			}
+		}
+	}
 	if len(importSpecs) > 0 {
 		// Several "Add import" fixes are merged into one change so a single import block results.
 		base, old, bom := text, text, false
