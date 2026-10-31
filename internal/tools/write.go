@@ -14,6 +14,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
@@ -102,7 +103,8 @@ func unformattedNotes(root string, plan *edits.EditPlan) []string {
 }
 
 // nestedModuleNotes warns when edited files belong to a module the workspace does not build (a
-// nested go.mod with no go.work listing it): importers in other modules are not part of the type check.
+// nested go.mod with no go.work listing it): the edit rewrites only workspace code, so callers in other
+// modules are type-checked (their errors are listed) but never edited.
 func nestedModuleNotes(root string, paths []string) []string {
 	seen := map[string]bool{}
 	var notes []string
@@ -116,8 +118,14 @@ func nestedModuleNotes(root string, paths []string) []string {
 		if name == "" {
 			name = edits.RelativeName(n.Dir, root)
 		}
-		notes = append(notes, fmt.Sprintf("%s belongs to module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover; its own packages are type-checked, but packages of other modules importing it are not, so the error count may miss breakages there. A go.work listing the modules (go work init . ./%s) fixes that.",
-			edits.RelativeName(p, root), name, edits.RelativeName(n.Dir, root), edits.RelativeName(n.Dir, root)))
+		dirs := []string{"./" + edits.RelativeName(n.Dir, root)}
+		for _, o := range gomod.UncoveredModules(root, exclude.IsDirName, 6) {
+			if o.Dir != n.Dir {
+				dirs = append(dirs, "./"+edits.RelativeName(o.Dir, root))
+			}
+		}
+		notes = append(notes, fmt.Sprintf("%s belongs to module %s (%s/go.mod), which no go.work lists, so only this module is edited: callers in other modules (a replace directive, a sibling directory) are type-checked, and any breakage shows above as a new error, but they are NOT rewritten - fix them by hand, or join the modules with a go.work (go work init %s) so the edit rewrites them too.",
+			edits.RelativeName(p, root), name, edits.RelativeName(n.Dir, root), strings.Join(dirs, " ")))
 	}
 	return notes
 }
@@ -248,7 +256,7 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 				out = w.scrub(out)
 			}
 		}
-		return text(h.Notes().Annotate(out)), nil, nil
+		return text(h.Notes().Annotate(w.withConfigProblem(ctx, out))), nil, nil
 	})
 }
 

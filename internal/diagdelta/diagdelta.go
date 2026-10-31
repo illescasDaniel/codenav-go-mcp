@@ -75,6 +75,20 @@ func (e Entry) Render() string {
 	return fmt.Sprintf("%s:%d:%d %s%s: %s", e.Path, e.Line, e.Column, labels[e.Severity], code, msg)
 }
 
+// pkgConflictRE is go/packages' complaint about a directory holding two package names; it ends with the
+// absolute directory, repeated by every file of it.
+var pkgConflictRE = regexp.MustCompile(`^found packages (\w+) \(([^)]+)\) and (\w+) \(([^)]+)\) in \S+$`)
+
+const pkgConflictPrefix = "the files of this directory declare different packages: "
+
+// friendlyMessage rewrites the diagnostics whose raw text is unhelpful (absolute paths, repeated per file).
+func friendlyMessage(msg string) string {
+	if m := pkgConflictRE.FindStringSubmatch(msg); m != nil {
+		return fmt.Sprintf("%spackage %s (%s) and package %s (%s)", pkgConflictPrefix, m[1], m[2], m[3], m[4])
+	}
+	return msg
+}
+
 // FromLSP converts diagnostics of the file whose current text is text.
 func FromLSP(rel, text string, items []lsp.Diagnostic) []Entry {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
@@ -94,7 +108,7 @@ func FromLSP(rel, text string, items []lsp.Diagnostic) []Entry {
 		if code == "null" {
 			code = ""
 		}
-		out = append(out, Entry{rel, l + 1, it.Range.Start.Character + 1, sev, code, it.Message, src})
+		out = append(out, Entry{rel, l + 1, it.Range.Start.Character + 1, sev, code, friendlyMessage(it.Message), src})
 	}
 	return out
 }
@@ -221,6 +235,9 @@ func dedupe(es []Entry) []Entry {
 	out := es[:0:0]
 	for _, e := range es {
 		k := fmt.Sprintf("%s|%d|%d|%s", e.Path, e.Line, e.Column, e.Message)
+		if strings.HasPrefix(e.Message, pkgConflictPrefix) {
+			k = dirOf(e.Path) + "|" + e.Message // every file of the directory reports the same conflict
+		}
 		if !seen[k] {
 			seen[k] = true
 			out = append(out, e)

@@ -327,7 +327,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	}
 	find()
 	if A == nil {
-		return nil, toolerr.Inputf("%s is not part of a package in this workspace's module.", filepath.Base(l.path))
+		return nil, notInWorkspaceModules(w, l.path)
 	}
 	// A destination in another module (a nested go.mod) is not covered by "./..." of the root module:
 	// its import path comes from its own go.mod, and its packages are loaded separately.
@@ -843,3 +843,18 @@ func usesNameLexically(path, name, pkgPath string, inPkg bool) bool {
 }
 
 func pathBase(p string) string { return gosrc.ImportName(p) }
+
+// notInWorkspaceModules explains why a source file is in no package move can load: it belongs to a
+// module that neither the root module nor a go.work lists.
+func notInWorkspaceModules(w *Workspace, file string) error {
+	rel := edits.RelativeName(file, w.Root)
+	if n, ok := gomod.Uncovered(w.Root, file); ok {
+		name := n.Path
+		if name == "" {
+			name = edits.RelativeName(n.Dir, w.Root)
+		}
+		mod := edits.RelativeName(n.Dir, w.Root)
+		return toolerr.Inputf("%s belongs to module %s (%s/go.mod), which neither the workspace's go.mod nor a go.work lists, so move can't load its packages. A move between modules needs both of them in one go.work (go work init ./%s ./<destination module dir>), or move within a single module.", rel, name, mod, mod)
+	}
+	return toolerr.Inputf("%s is not part of a package in this workspace's modules (the root module and the go.work `use` modules); check its build constraints, or that its directory has a go.mod listed in go.work.", rel)
+}

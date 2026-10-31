@@ -232,6 +232,7 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 	if len(leftOut) > 0 {
 		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
 	}
+	seenConstraint := map[string]bool{}
 	for _, c := range plan.Changes {
 		if filepath.Ext(c.Path) != ".go" {
 			continue
@@ -244,7 +245,8 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 		case c.Old != nil:
 			src, ok = *c.Old, true
 		}
-		if ok && gomod.HasBuildConstraint(src) {
+		if ok && gomod.HasBuildConstraint(src) && !seenConstraint[src] {
+			seenConstraint[src] = true // a moved file appears under its old and new path: one note
 			plan.Notes = appendUnique(plan.Notes, edits.RelativeName(c.Path, w.Root)+" has a build constraint; diagnostics only cover the current GOOS/GOARCH/tags, so the check may not see this file's own errors.")
 		}
 	}

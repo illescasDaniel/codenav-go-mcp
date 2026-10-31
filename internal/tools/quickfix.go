@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/token"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -180,6 +181,7 @@ type qfResult struct {
 	titles   []string
 	notFixed []string
 	wrote    bool
+	plain    bool // nothing was targeted: no Applied/Not fixed tail
 }
 
 // quickFix runs quickFixRun and ends the answer with "Applied:" and "Not fixed:" lines.
@@ -187,6 +189,9 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 	r, err := quickFixRun(ctx, w, in)
 	if err != nil {
 		return "", err
+	}
+	if r.plain || (len(r.titles) == 0 && len(r.notFixed) == 0 && !r.wrote) {
+		return r.out, nil
 	}
 	applied := "nothing"
 	switch {
@@ -269,7 +274,34 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			if in.Line > 0 {
 				at = fmt.Sprintf(" at line %d", in.Line)
 			}
-			return qfResult{out: "No diagnostics to fix in " + rel + at + "."}, nil
+			if len(diags) > 0 && (in.Code != "" || in.Line > 0) {
+				present := map[string]bool{}
+				for _, d := range diags {
+					if c := strings.Trim(string(d.Code), `"`); c != "" && c != "null" {
+						present[c] = true
+					}
+				}
+				var codes []string
+				for c := range present {
+					codes = append(codes, c)
+				}
+				sort.Strings(codes)
+				what := ""
+				switch {
+				case in.Code != "" && in.Line > 0:
+					what = fmt.Sprintf("with code %s at line %d", in.Code, in.Line)
+				case in.Code != "":
+					what = "with code " + in.Code
+				default:
+					what = fmt.Sprintf("at line %d", in.Line)
+				}
+				have := fmt.Sprintf("%d diagnostic(s) in the file", len(diags))
+				if len(codes) > 0 {
+					have += "; codes present: " + strings.Join(codes, ", ")
+				}
+				return qfResult{out: fmt.Sprintf("No diagnostics %s in %s (%s).", what, rel, have), plain: true}, nil
+			}
+			return qfResult{out: "No diagnostics to fix in " + rel + at + ".", plain: true}, nil
 		}
 		// reasons[i] says why wanted[i] is not fixed.
 		reasons := map[int]string{}
@@ -322,6 +354,9 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			switch {
 			case len(acts) == 0:
 				reasons[i] = "no fix offered"
+				if strings.Contains(d.Message, "imported and not used") {
+					reasons[i] = "gopls offers no fix for an unused import; run quick_fix with organize_imports=true to remove it"
+				}
 				if len(cmdOnly) > 0 {
 					label += fmt.Sprintf(" (gopls offers '%s' only as a command (not supported))", cmdOnly[0])
 					reasons[i] = "command-only: gopls offers '" + cmdOnly[0] + "' only as a command"

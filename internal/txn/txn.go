@@ -65,7 +65,7 @@ func (g WriteGuard) CheckPath(path string) error {
 	}
 	rel, err := filepath.Rel(root, resolved)
 	if err != nil || strings.HasPrefix(rel, "..") {
-		return toolerr.Inputf("%s is outside the workspace %s", path, root)
+		return toolerr.Inputf("%s", outsideMessage(path, g.Root, root))
 	}
 	// A symlinked directory inside the workspace would write the real file under another path
 	// than the one the language server indexes. (A symlinked component of the root itself is fine:
@@ -85,6 +85,25 @@ func (g WriteGuard) CheckPath(path string) error {
 		}
 	}
 	return nil
+}
+
+// outsideMessage explains a write that would leave the workspace: the edit needs to change a file that
+// lies in another module, outside the root the server navigates.
+func outsideMessage(path, given, root string) string {
+	shown := path
+	if rel, err := filepath.Rel(given, path); err == nil {
+		shown = filepath.ToSlash(rel)
+	}
+	msg := fmt.Sprintf("this edit would change %s, which is outside the workspace %s (a reference or declaration in a module or directory above the workspace root)", shown, root)
+	for d := filepath.Dir(root); ; d = filepath.Dir(d) {
+		if _, err := os.Stat(filepath.Join(d, "go.work")); err == nil {
+			return msg + fmt.Sprintf("; a go.work in %s covers it - set CODENAV_GO_MCP_WORKSPACE to %s so that the whole workspace is navigated", d, d)
+		}
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	return msg + "; point CODENAV_GO_MCP_WORKSPACE at a directory containing every module involved"
 }
 
 func (g WriteGuard) CheckPlan(p *edits.EditPlan, allowLarge bool) error {

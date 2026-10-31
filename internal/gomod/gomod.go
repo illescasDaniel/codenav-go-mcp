@@ -229,6 +229,19 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 			}
 		}
 	}
+	if len(nestedDirs) > 0 {
+		// A module the workspace does not build can be imported by its siblings (a replace directive):
+		// their packages are listed too, so the importers of the edited packages are found.
+		for _, o := range UncoveredModules(root, exclude.IsDirName, maxSiblingModules) {
+			if nestedDirs[o.Dir] {
+				continue
+			}
+			nestedDirs[o.Dir] = true
+			if more, merr := list(ctx, o.Dir); merr == nil || len(more) > 0 {
+				pkgs = append(pkgs, more...)
+			}
+		}
+	}
 	seen := map[string]bool{}
 	add := func(f string) {
 		if !seen[f] {
@@ -276,6 +289,9 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 	}
 	return files, nil
 }
+
+// maxSiblingModules bounds how many uncovered modules are listed to find importers of an edited one.
+const maxSiblingModules = 20
 
 // IsExcludedFromBuild is a best-effort hint that a file has a build constraint; true when its
 // "//go:build" line is present. gopls only checks the current GOOS/GOARCH/tags.
