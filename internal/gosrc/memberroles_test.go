@@ -35,3 +35,32 @@ func TestDropOrphanImportCommentsHeadings(t *testing.T) {
 		t.Errorf("trailing heading must go:\n%s", got)
 	}
 }
+
+// Round 13 (item 9): the type checker tells a field, selector, keyed literal or method named like a
+// package-level symbol from the symbol itself.
+func TestMemberIdentsInDir(t *testing.T) {
+	a := "package p\n\nimport \"fmt\"\n\nfunc foo(n int) int { return n }\n\ntype T struct{ foo int }\n\nfunc (t T) Use() int { return t.foo + foo(1) }\n\nfunc (t T) bar() {}\n\nvar _ = T{foo: 1}\n\nvar _ = map[string]int{\"x\": foo(2)}\n\nfunc F() { fmt.Println(foo(3)) }\n"
+	b := "package p\n\nfunc (t T) foo2() {}\n\nfunc Other(t T) int { return t.foo }\n"
+	got := MemberIdentsInDir(map[string]string{"/d/a.go": a, "/d/b.go": b}, "foo")
+	ga, gb := got["/d/a.go"], got["/d/b.go"]
+	// Members: the field declaration (7:16), t.foo (9:33), the keyed literal (13:11), t.foo in b.go (5:32).
+	for _, want := range []int{7<<20 | 16, 9<<20 | 33, 13<<20 | 11} {
+		if !ga[want] {
+			t.Errorf("a.go: %d:%d should be a member: %v", want>>20, want&(1<<20-1), ga)
+		}
+	}
+	if !gb[5<<20|32] {
+		t.Errorf("b.go: t.foo (a field declared in another file) should be a member: %v", gb)
+	}
+	// Not members: the func declaration (5:6), its calls, including the call in a map literal.
+	for _, no := range []int{5<<20 | 6, 9<<20 | 39, 15<<20 | 29, 17<<20 | 24} {
+		if ga[no] {
+			t.Errorf("a.go: %d:%d is the package-level func, not a member", no>>20, no&(1<<20-1))
+		}
+	}
+	// A method named like the symbol is a member too.
+	m := MemberIdentsInDir(map[string]string{"/d/m.go": "package p\n\nfunc foo() {}\n\ntype T struct{}\n\nfunc (T) foo() {}\n"}, "foo")
+	if !m["/d/m.go"][7<<20|10] || m["/d/m.go"][3<<20|6] {
+		t.Errorf("method vs func: %v", m)
+	}
+}

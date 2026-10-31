@@ -210,3 +210,15 @@ func TestCallersAreCapped(t *testing.T) {
 		t.Errorf("want 50 callers listed, got %d:\n%s", n, out)
 	}
 }
+
+// Item 9: renaming a package-level func does not list same-named struct fields, selectors, keyed
+// literals or methods as "code the type checker did not link": they are other objects.
+func TestRenameMentionsIgnoreFieldsSelectorsAndMethods(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shad/shad.go", "package shad\n\nfunc foo(a int) int { return a }\n\ntype T struct{ foo int }\n\nfunc (t T) Method() int { return t.foo }\n\nfunc (t T) foo2() int { return foo(1) }\n\nfunc (T) foo() {}\n\nfunc Keyed() T {\n\treturn T{foo: 1}\n}\n\nvar tbl = map[string]int{\"k\": foo(2)}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shad.foo", "new_name": "bar", "apply": false})
+	mustHave(t, "rename", out, "func bar(a int) int", "return bar(1)", "bar(2)")
+	if strings.Contains(out, "did not link") || strings.Contains(out, "still appears") {
+		t.Errorf("fields, selectors, keyed literals and methods named foo are other objects than the func:\n%s", out)
+	}
+}

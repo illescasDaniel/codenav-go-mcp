@@ -364,6 +364,7 @@ func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, afte
 	checked := 0
 	bare := map[string]map[int]bool{}      // abs path -> positions of non-member identifiers
 	qualified := map[string]map[int]bool{} // abs path -> positions of identifiers that are not selected
+	var members map[string]map[int]bool    // abs path -> positions of fields and methods of the symbol's package
 	for _, m := range ms {
 		abs := filepath.Join(w.Root, m.Path)
 		if m.Kind != "code" || m.Col <= 0 {
@@ -400,6 +401,15 @@ func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, afte
 			if set[m.Line<<20|m.Col] {
 				continue
 			}
+		} else {
+			// The symbol's own package: a struct field, a method, a selector or a keyed literal of the
+			// same name is another object (the type checker says which).
+			if members == nil {
+				members = sameDirMembers(filepath.Dir(declFile), after, name)
+			}
+			if members[abs][m.Line<<20|m.Col] {
+				continue
+			}
 		}
 		if _, changed := after[abs]; !changed && checked < maxDefinitionChecks {
 			checked++
@@ -410,6 +420,25 @@ func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, afte
 		out = append(out, m)
 	}
 	return out
+}
+
+// sameDirMembers: per .go file of dir (texts as they will be after the edit), the positions of the
+// identifiers called name that are fields or methods.
+func sameDirMembers(dir string, after map[string]string, name string) map[string]map[int]bool {
+	files := map[string]string{}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		if text, ok := after[p]; ok {
+			files[p] = text
+		} else if text, _, err := edits.ReadSource(p); err == nil {
+			files[p] = text
+		}
+	}
+	return gosrc.MemberIdentsInDir(files, name)
 }
 
 var dotImport = regexp.MustCompile(`(?m)^\s*(?:import\s+)?\.\s+"`)
