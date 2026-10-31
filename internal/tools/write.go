@@ -84,6 +84,9 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 		return "", "", err
 	}
 	plan.Notes = append(plan.Notes, unformattedNotes(w.Root, plan)...)
+	for _, c := range plan.Changes {
+		plan.Notes = append(plan.Notes, c.Notes...)
+	}
 	return conclude(w, plan, delta, apply, maxNew, allowLarge)
 }
 
@@ -453,6 +456,19 @@ func fileChange(abs, next string, old *string, bom bool) (edits.FileChange, erro
 		formatted = strings.ReplaceAll(next, "\r\n", "\n")
 	}
 	c := edits.FileChange{Path: abs, NewBOM: bom}
+	if strings.HasSuffix(abs, ".go") {
+		was := map[string]bool{}
+		if old != nil {
+			for _, d := range gosrc.DuplicateImports(*old) {
+				was[d] = true
+			}
+		}
+		for _, d := range gosrc.DuplicateImports(next) {
+			if !was[d] {
+				c.Notes = append(c.Notes, fmt.Sprintf("%s listed %s twice; formatting merged them into one", filepath.Base(abs), d))
+			}
+		}
+	}
 	if old != nil {
 		formatted = edits.RestoreEOL(formatted, *old)
 		c.Old, c.OldBOM = old, bom

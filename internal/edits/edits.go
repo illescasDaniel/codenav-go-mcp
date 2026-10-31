@@ -151,6 +151,8 @@ type FileChange struct {
 	Path           string
 	Old, New       *string
 	OldBOM, NewBOM bool
+	// Notes are things worth telling about this file's change (e.g. an import that was listed twice).
+	Notes []string
 }
 
 func (c FileChange) Kind() string {
@@ -182,7 +184,7 @@ func (c FileChange) NewBytes() []byte {
 }
 
 func (c FileChange) Inverse() FileChange {
-	return FileChange{c.Path, c.New, c.Old, c.NewBOM, c.OldBOM}
+	return FileChange{Path: c.Path, Old: c.New, New: c.Old, OldBOM: c.NewBOM, NewBOM: c.OldBOM}
 }
 
 func Str(s string) *string { return &s }

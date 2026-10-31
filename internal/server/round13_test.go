@@ -312,3 +312,15 @@ func TestEditReportsWarningsHiddenByErrors(t *testing.T) {
 		t.Errorf("no hidden warnings expected:\n%s", out)
 	}
 }
+
+// Item 11 (c): adding an import that is already there says that formatting merged the two.
+func TestEditNotesDuplicateImport(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "dupimp/b.go", "package dupimp\n\nimport \"fmt\"\n\nfunc H() { fmt.Println() }\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "dupimp/b.go", "old_string": "import \"fmt\"", "new_string": "import \"fmt\"\nimport \"fmt\"", "apply": false})
+	mustHave(t, "dup import", out, `b.go listed "fmt" twice; formatting merged them into one`)
+	out = call(t, cs, "edit", map[string]any{"file_path": "dupimp/b.go", "old_string": "fmt.Println()", "new_string": "fmt.Println(1)", "apply": false})
+	if strings.Contains(out, "twice") {
+		t.Errorf("no note expected without a duplicate:\n%s", out)
+	}
+}

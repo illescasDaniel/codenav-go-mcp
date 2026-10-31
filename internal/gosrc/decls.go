@@ -792,3 +792,23 @@ func EnclosingDecl(filename, src string, off int) (start, end int, ok bool) {
 	}
 	return 0, 0, false
 }
+
+// DuplicateImports lists the import specs (`"fmt"`, `str "strings"`) that src declares more than once.
+func DuplicateImports(src string) []string {
+	f, err := parser.ParseFile(token.NewFileSet(), "x.go", src, parser.ImportsOnly)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]int{}
+	var order []string
+	for _, im := range f.Imports {
+		k := im.Path.Value
+		if im.Name != nil {
+			k = im.Name.Name + " " + k
+		}
+		if seen[k]++; seen[k] == 2 {
+			order = append(order, k)
+		}
+	}
+	return order
+}
