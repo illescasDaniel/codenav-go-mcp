@@ -278,3 +278,22 @@ func TestQuickFixDirectoryPathIsRelative(t *testing.T) {
 		}
 	}
 }
+
+// Item 11 (a): moving out of a package that does not compile shows the compiler lines, not the raw
+// "-: # pkg" go list text, and each error once.
+func TestMoveFromBrokenPackageMessageIsClean(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "brk/a.go", "package brk\n\nfunc A() int { return 1 }\n")
+	writeFile(t, root, "brk/bad.go", "package brk\n\nimport \"os\"\n\nfunc Bad() string { return strings.ToUpper(\"a\") }\n")
+	writeFile(t, root, "brkdst/d.go", "package brkdst\n")
+	out := call(t, cs, "move", map[string]any{"name": "brk.A", "to_file": "brkdst/d.go", "apply": false})
+	mustHave(t, "move", out, "has errors (", "fix them before moving code out of it")
+	for _, bad := range []string{"-:", "# ", "\n./"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("raw go output %q leaked:\n%s", bad, out)
+		}
+	}
+	if n := strings.Count(out, "undefined: strings"); n != 1 {
+		t.Errorf("each error once, got %d:\n%s", n, out)
+	}
+}

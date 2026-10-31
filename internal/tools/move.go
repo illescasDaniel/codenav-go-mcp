@@ -357,7 +357,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		return nil, toolerr.Inputf("%s is in %s, a file that imports \"C\"; its declarations can't be moved automatically.", display, filepath.Base(l.path))
 	}
 	if len(A.Errors) > 0 {
-		return nil, toolerr.Inputf("package %s has errors (%v); fix them before moving code out of it.", A.PkgPath, A.Errors[0])
+		return nil, toolerr.Inputf("package %s has errors (%s); fix them before moving code out of it.", A.PkgPath, packageErrorText(A.Errors))
 	}
 	bName, bPath := "", ""
 	switch {
@@ -857,4 +857,38 @@ func notInWorkspaceModules(w *Workspace, file string) error {
 		return toolerr.Inputf("%s belongs to module %s (%s/go.mod), which neither the workspace's go.mod nor a go.work lists, so move can't load its packages. A move between modules needs both of them in one go.work (go work init ./%s ./<destination module dir>), or move within a single module.", rel, name, mod, mod)
 	}
 	return toolerr.Inputf("%s is not part of a package in this workspace's modules (the root module and the go.work `use` modules); check its build constraints, or that its directory has a go.mod listed in go.work.", rel)
+}
+
+// packageErrorText renders go list errors on one line: the "# pkg" banner of the raw compiler output and
+// the "-:" placeholder position are dropped, "./" prefixes too, at most three messages are kept.
+func packageErrorText(errs []packages.Error) string {
+	var msgs []string
+	seen := map[string]bool{}
+	for _, e := range errs {
+		for _, l := range strings.Split(e.Msg, "\n") {
+			l = strings.TrimSpace(l)
+			if l == "" || strings.HasPrefix(l, "#") {
+				continue
+			}
+			l = strings.TrimPrefix(l, "./")
+			if e.Pos != "" && e.Pos != "-" && !strings.Contains(l, ".go:") {
+				l = strings.TrimPrefix(e.Pos, "./") + ": " + l
+			}
+			key := l
+			if i := strings.Index(l, ".go:"); i >= 0 {
+				key = l[i:] // the same error reached by a different relative path
+			}
+			if !seen[key] {
+				seen[key] = true
+				msgs = append(msgs, l)
+			}
+		}
+	}
+	if len(msgs) > 3 {
+		msgs = append(msgs[:3], fmt.Sprintf("+%d more", len(msgs)-3))
+	}
+	if len(msgs) == 0 {
+		return "unknown error"
+	}
+	return strings.Join(msgs, "; ")
 }
