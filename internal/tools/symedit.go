@@ -2,9 +2,12 @@ package tools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -162,11 +165,29 @@ func stripKeyword(src, keyword string) string {
 }
 
 func checkSnippet(src string, d *gosrc.Decl) error {
-	wrapped := "package p\n" + src
+	wrapped, header := "package p\n"+src, 1
 	if d != nil && d.Grouped {
-		wrapped = "package p\n" + d.Keyword + " (\n" + src + "\n)"
+		wrapped, header = "package p\n"+d.Keyword+" (\n"+src+"\n)", 2
 	}
-	return gosrc.CheckSyntax("source.go", wrapped)
+	return checkWrapped(wrapped, header)
+}
+
+var sourcePosRE = regexp.MustCompile(`source\.go:(\d+):(\d+)`)
+
+// checkWrapped is gosrc.CheckSyntax for a snippet the caller wrapped in header lines of its own: the
+// positions in the error are rewritten to count from the snippet's first line.
+func checkWrapped(wrapped string, header int) error {
+	err := gosrc.CheckSyntax("source.go", wrapped)
+	var ie *toolerr.InputError
+	if !errors.As(err, &ie) {
+		return err
+	}
+	msg := sourcePosRE.ReplaceAllStringFunc(ie.Msg, func(m string) string {
+		p := sourcePosRE.FindStringSubmatch(m)
+		line, _ := strconv.Atoi(p[1])
+		return fmt.Sprintf("source line %d, column %s", max(1, line-header), p[2])
+	})
+	return toolerr.Inputf("%s", msg)
 }
 
 func lineStart(text string, off int) int { return strings.LastIndex(text[:off], "\n") + 1 }
@@ -192,8 +213,19 @@ func editSymbol(ctx context.Context, w *Workspace, in editSymbolIn) (string, err
 		}
 		plan, err = replaceSymbol(ctx, w, in, source, prune)
 	case "insert":
-		if strings.TrimSpace(source) == "" || in.FilePath == "" {
-			return "", toolerr.Inputf(`action="insert" needs source and file_path.`)
+		var missing []string
+		if strings.TrimSpace(source) == "" {
+			missing = append(missing, "source")
+		}
+		if in.FilePath == "" {
+			missing = append(missing, "file_path")
+		}
+		if len(missing) > 0 {
+			hint := ""
+			if in.FilePath == "" && in.Name != "" {
+				hint = " (name only anchors the position; file_path names the file to insert into)"
+			}
+			return "", toolerr.Inputf(`action="insert" needs %s, which %s missing%s.`, strings.Join(missing, " and "), map[bool]string{true: "is", false: "are"}[len(missing) == 1], hint)
 		}
 		plan, err = insertSymbol(ctx, w, in, source)
 	case "delete":
@@ -344,7 +376,7 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 			return nil, toolerr.Inputf("%s is not a struct or interface type; `into` adds fields or interface methods.", in.Name)
 		}
 		wrapped := "package p\ntype T " + d.BodyKind + " {\n" + source + "\n}"
-		if err := gosrc.CheckSyntax("source.go", wrapped); err != nil {
+		if err := checkWrapped(wrapped, 2); err != nil {
 			return nil, err
 		}
 		next = insertMember(text, d.Closing, edits.MatchEOL(source, text))
@@ -435,7 +467,7 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	}
 	var exported []string
 	if !d.Method && d.Keyword == "func" {
-		exported = cgoExportSites(l.path, l.text, d.Name)
+		exported = cgoExportSites(w.Root, l.path, l.text, d.Name)
 	}
 	if len(exported) > 0 && !in.Force {
 		return nil, fmt.Sprintf("Not deleted: %s is exported to C (//export %s): C code calls it by name, so deleting it breaks the cgo build (force=true deletes it anyway). Mentioned at:\n    %s",

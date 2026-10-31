@@ -12,12 +12,16 @@ import (
 )
 
 // InputError is a caller mistake (bad name, unsupported file, ...).
-type InputError struct{ Msg string }
+type InputError struct {
+	Msg string
+	// Hint lists names the caller probably meant (case-insensitive matches), when there are any.
+	Hint []string
+}
 
 func (e *InputError) Error() string { return e.Msg }
 
 // Inputf builds an InputError.
-func Inputf(format string, args ...any) error { return &InputError{fmt.Sprintf(format, args...)} }
+func Inputf(format string, args ...any) error { return &InputError{Msg: fmt.Sprintf(format, args...)} }
 
 // Format turns err into the text a tool returns; ok is false for unexpected errors.
 func Format(err error) (text string, ok bool) {

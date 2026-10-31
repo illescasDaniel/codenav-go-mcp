@@ -75,8 +75,20 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 				out = w.scrub(out)
 			}
 		}
-		return text(h.Notes().Annotate(out)), nil, nil
+		return text(h.Notes().Annotate(w.withConfigProblem(ctx, out))), nil, nil
 	})
+}
+
+// withConfigProblem appends the go command's complaint about a broken go.mod / go.work, which otherwise
+// shows up as unrelated "nothing found" answers (gopls loads no packages at all).
+func (w *Workspace) withConfigProblem(ctx context.Context, out string) string {
+	if w == nil {
+		return out
+	}
+	if p := gomod.ConfigProblem(ctx, w.Root); p != "" {
+		return out + "\n\nWarning: the Go configuration of this workspace is broken, so no package is loaded and type-resolved results (symbols, diagnostics, rename) are empty or wrong: " + p
+	}
+	return out
 }
 
 // addIndexed adds the exact and prefix matches of the symbol index to gopls's (capped, build-config
@@ -241,6 +253,18 @@ func uncoveredNote(w *Workspace, sym resolve.Symbol) string {
 		name = rel
 	}
 	return fmt.Sprintf("Note: %s is in module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover (a nested or replace-d module); gopls holds it as a separate folder, so callers and references in other modules, such as the root module, are not seen. A go.work listing the modules (go work init . ./%s) joins them.", sym.Name, name, rel, rel)
+}
+
+// caseNote tells that a read tool matched name only ignoring case (write tools refuse such a name).
+func caseNote(w *Workspace, name string, sym resolve.Symbol) string {
+	if sym.CaseFolded == "" {
+		return ""
+	}
+	msg := fmt.Sprintf("Note: no symbol is called %q (names are case-sensitive); this is %s.", name, sym.CaseFolded)
+	if dir := packageDir(w.Root, name); dir != "" {
+		msg += fmt.Sprintf(" %s is also a package (directory %s).", name, dir)
+	}
+	return msg
 }
 
 func checkGoFile(p string) error {
@@ -529,6 +553,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if note := uncoveredNote(w, sym); note != "" {
 				parts = append(parts, "", note)
 			}
+			if note := caseNote(w, name, sym); note != "" {
+				parts = append([]string{note, ""}, parts...)
+			}
 			return strings.Join(parts, "\n"), nil
 		})
 
@@ -590,6 +617,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if note := uncoveredNote(w, sym); note != "" {
 				out += "\n" + note
 			}
+			if note := caseNote(w, name, sym); note != "" {
+				out = note + "\n" + out
+			}
 			return out, nil
 		})
 
@@ -614,7 +644,11 @@ func RegisterNav(s *mcp.Server, h Host) {
 				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
 			}
 			locs = dropForeignUnexported(locs, w.Root)
-			return implementerNames(locs) + splitTests(locs, w.Root), nil
+			out := implementerNames(locs) + splitTests(locs, w.Root)
+			if note := caseNote(w, name, sym); note != "" {
+				out = note + "\n" + out
+			}
+			return out, nil
 		})
 }
 

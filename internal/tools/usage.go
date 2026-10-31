@@ -122,7 +122,10 @@ func friendlyTypeError(text string) string {
 
 func strconvQuote(s string) string { return strconv.Quote(s) }
 
-var missingRE = regexp.MustCompile(`required: missing properties: \[([^\]]*)\]`)
+var missingRE = regexp.MustCompile(`(?:validating /properties/([^:]*): )?required: missing properties: \[([^\]]*)\]`)
+
+// itemPathRE: "add/items/1" (or "add/items") in a validator path, naming an element of an array parameter.
+var itemPathRE = regexp.MustCompile(`^(\w+)/items(?:/(\d+))?`)
 
 // FriendlyValidation turns the schema validator's "required: missing properties" refusal into a hint that
 // names the missing parameters and shows the tool's usage, the way the name-based tools already answer.
@@ -157,10 +160,21 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 			return res, err
 		}
 		var names []string
-		for _, n := range strings.Fields(m[1]) {
+		for _, n := range strings.Fields(m[2]) {
 			names = append(names, strings.Trim(n, `"`))
 		}
 		msg := "Missing required parameter(s): " + strings.Join(names, ", ") + "."
+		if im := itemPathRE.FindStringSubmatch(m[1]); im != nil {
+			where := "an item of " + im[1]
+			if im[2] != "" {
+				where = fmt.Sprintf("%s[%s]", im[1], im[2])
+			} else if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+				if i := firstItemMissing(params.Arguments, im[1], names); i >= 0 {
+					where = fmt.Sprintf("%s[%d]", im[1], i)
+				}
+			}
+			msg = fmt.Sprintf("%s is missing %s.", where, strings.Join(names, ", "))
+		}
 		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
 			usages.Lock()
 			u := usages.m[params.Name]
@@ -197,4 +211,22 @@ func dropNulls(raw json.RawMessage) json.RawMessage {
 		return raw
 	}
 	return out
+}
+
+// firstItemMissing: the index of the first element of the array argument param that lacks one of the
+// named properties, or -1.
+func firstItemMissing(raw json.RawMessage, param string, names []string) int {
+	var m map[string]json.RawMessage
+	var items []map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil || json.Unmarshal(m[param], &items) != nil {
+		return -1
+	}
+	for i, item := range items {
+		for _, n := range names {
+			if _, ok := item[n]; !ok {
+				return i
+			}
+		}
+	}
+	return -1
 }

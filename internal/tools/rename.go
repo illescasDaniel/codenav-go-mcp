@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
@@ -135,7 +136,12 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		sym, err := resolveSymbol(ctx, w, in.Name, in.FilePath)
 		if err != nil {
 			if dir := packageDir(w.Root, in.Name); dir != "" && strings.HasPrefix(err.Error(), "No symbol found") {
-				return nil, toolerr.Inputf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", in.Name, dir)
+				msg := fmt.Sprintf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", in.Name, dir)
+				var ie *toolerr.InputError
+				if errors.As(err, &ie) && len(ie.Hint) > 0 {
+					msg += fmt.Sprintf(". Did you mean `%s`? (names are case-sensitive)", strings.Join(ie.Hint, "` or `"))
+				}
+				return nil, toolerr.Inputf("%s", msg)
 			}
 			return nil, err
 		}
@@ -152,6 +158,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 				if off := edits.Offset(src, root.line, root.col); off >= a && off <= b {
 					return nil, packageRenameError(w, src[a:b], abs)
 				}
+			}
+			if ip := importPathAt(abs, src, edits.Offset(src, root.line, root.col)); ip != "" {
+				return nil, toolerr.Inputf("the position %s:%d:%d is on the import path %q; there is no symbol to rename there. Put the position on a use of a symbol, or pass name.", edits.RelativeName(abs, w.Root), in.Line, in.Column, ip)
 			}
 			if identAt(abs, root.line, root.col) == "C" {
 				if imps, _ := gosrc.ImportScope(abs, src); imps["C"] != "" {
@@ -210,7 +219,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 
 	if in.Parameter == "" {
-		if err := cgoExportRefusal(root.path, text, oldName); err != nil {
+		if err := cgoExportRefusal(w.Root, root.path, text, oldName); err != nil {
 			return nil, err
 		}
 	}
@@ -687,8 +696,8 @@ func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp
 // cgoExportRefusal refuses to rename a Go function that is exported to C with `//export name`: C code
 // (the cgo preamble or .c/.h files) calls it by that name, and neither the directive nor those
 // calls are Go identifiers the type checker can follow, so the rename would break the cgo build.
-func cgoExportRefusal(path, text, name string) error {
-	where := cgoExportSites(path, text, name)
+func cgoExportRefusal(root, path, text, name string) error {
+	where := cgoExportSites(root, path, text, name)
 	if where == nil {
 		return nil
 	}
@@ -698,7 +707,7 @@ func cgoExportRefusal(path, text, name string) error {
 
 // cgoExportSites lists where a function exported to C with `//export name` is mentioned (the directive
 // and the C code that calls it); nil when it is not exported.
-func cgoExportSites(path, text, name string) []string {
+func cgoExportSites(root, path, text, name string) []string {
 	re := regexp.MustCompile(`(?m)^//export[ \t]+` + regexp.QuoteMeta(name) + `[ \t]*$`)
 	loc := re.FindStringIndex(text)
 	if loc == nil {
@@ -707,7 +716,7 @@ func cgoExportSites(path, text, name string) []string {
 	dir := filepath.Dir(path)
 	word := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
 	var where []string
-	where = append(where, fmt.Sprintf("%s:%d (//export %s)", filepath.Base(path), 1+strings.Count(text[:loc[0]], "\n"), name))
+	where = append(where, fmt.Sprintf("%s:%d (//export %s)", edits.RelativeName(path, root), 1+strings.Count(text[:loc[0]], "\n"), name))
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		ext := filepath.Ext(e.Name())
@@ -742,9 +751,26 @@ func cgoExportSites(path, text, name string) []string {
 				if ext == ".go" {
 					line = 1 + strings.Count(string(raw)[:strings.Index(string(raw), src)], "\n") + n
 				}
-				where = append(where, fmt.Sprintf("%s:%d: %s", e.Name(), line, strings.TrimSpace(ln)))
+				where = append(where, fmt.Sprintf("%s:%d: %s", edits.RelativeName(filepath.Join(dir, e.Name()), root), line, strings.TrimSpace(ln)))
 			}
 		}
 	}
 	return where
+}
+
+// importPathAt is the import path whose string literal contains offset off of src ("" if none).
+func importPathAt(file, src string, off int) string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, file, src, parser.ImportsOnly)
+	if f == nil || err != nil {
+		return ""
+	}
+	tf := fset.File(f.Pos())
+	for _, sp := range f.Imports {
+		if off >= tf.Offset(sp.Path.Pos()) && off <= tf.Offset(sp.Path.End()) {
+			p, _ := strconv.Unquote(sp.Path.Value)
+			return p
+		}
+	}
+	return ""
 }

@@ -23,10 +23,10 @@ import (
 
 // resolveSymbol is resolve.Resolve with a Go-aware explanation when nothing matches.
 func resolveSymbol(ctx context.Context, w *Workspace, name, file string) (resolve.Symbol, error) {
-	sym, err := resolve.Resolve(ctx, w.Client, w.Index, w.Root, name, file)
+	sym, err := resolve.ResolveExact(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if errors.As(err, &nf) {
-		return sym, toolerr.Inputf("%s", notFoundMessage(ctx, w, nf.Query, false))
+		return sym, &toolerr.InputError{Msg: notFoundMessage(ctx, w, nf.Query, false, nf.Suggest), Hint: nf.Suggest}
 	}
 	return sym, err
 }
@@ -46,7 +46,7 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	case perr == nil:
 		return psym, nil
 	case errors.Is(perr, resolve.ErrNoProbe):
-		return sym, toolerr.Inputf("%s", notFoundMessage(ctx, w, nf.Query, false))
+		return sym, toolerr.Inputf("%s", notFoundMessage(ctx, w, nf.Query, false, nil))
 	}
 	var pe *resolve.ProbeError
 	if errors.As(perr, &pe) {
@@ -142,7 +142,7 @@ var typeKinds = map[int]bool{5: true, 10: true, 11: true, 23: true, 26: true}
 // notFoundMessage explains why query matches no workspace symbol, with the hint that fits.
 //
 // ro is set for the read-only tools, which already tried a package-qualified name outside the workspace.
-func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool) string {
+func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, suggest []string) string {
 	msg := fmt.Sprintf("No symbol found matching %q", shortQuery(query))
 	parts := strings.Split(query, ".")
 	first, last := parts[0], parts[len(parts)-1]
@@ -172,6 +172,13 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool) s
 		msg += fmt.Sprintf(": %s is in the standard library, outside the workspace%s", first, outside)
 	default:
 		msg += fmt.Sprintf(": no type or package named %s in the workspace%s", first, outside)
+	}
+	if len(suggest) > 0 {
+		quoted := make([]string, len(suggest))
+		for i, n := range suggest {
+			quoted[i] = "`" + n + "`"
+		}
+		msg += fmt.Sprintf(" Did you mean %s? (names are case-sensitive; write tools never guess the case)", strings.Join(quoted, " or "))
 	}
 	if nested := gomod.UncoveredModules(w.Root, exclude.IsDirName, 3); len(nested) > 0 {
 		var names []string

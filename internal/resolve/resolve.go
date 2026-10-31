@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf16"
@@ -28,6 +29,8 @@ type Symbol struct {
 	// Unbuilt: only the symbol index knows the declaration, and its file carries a build constraint, so
 	// gopls (current GOOS/GOARCH/tags) does not type-check it.
 	Unbuilt bool
+	// CaseFolded is set when the query matched only ignoring case: the spelling that really exists.
+	CaseFolded string
 }
 
 // Rel is the workspace-relative path of the symbol's file.
@@ -57,6 +60,21 @@ func matches(s *lsp.Symbol, q string) int {
 		try(s.ContainerName + "." + s.Name)
 	}
 	return best
+}
+
+// foldedForm is the spelling of s that equals q ignoring case ("Gen" for q "gen", "gen.Box" for "gen.box"),
+// "" when none does.
+func foldedForm(s *lsp.Symbol, q string) string {
+	cands := []string{s.Name}
+	if s.ContainerName != "" {
+		cands = append(cands, pkgBase(s.ContainerName)+"."+s.Name, s.ContainerName+"."+s.Name)
+	}
+	for _, c := range cands {
+		if strings.EqualFold(c, q) {
+			return c
+		}
+	}
+	return ""
 }
 
 // fileTarget turns file_path (relative, ./relative or absolute) into a clean workspace-relative path
@@ -149,6 +167,8 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 type NotFoundError struct {
 	Query string
 	Err   *toolerr.InputError
+	// Suggest holds the symbols that match Query when the case is ignored (set by strict resolution).
+	Suggest []string
 }
 
 func (e *NotFoundError) Error() string { return e.Err.Msg }
@@ -290,6 +310,17 @@ func merge(ix *index.Index, query string, exact, loose []*lsp.Symbol) (ex, lo []
 // Resolve finds the one symbol named query, optionally restricted to file (workspace-relative). ix, when
 // not nil, is consulted next to gopls: it knows every declaring file, built or not.
 func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, file string) (Symbol, error) {
+	return resolve(ctx, c, ix, root, query, file, false)
+}
+
+// ResolveExact is Resolve for tools that write: names are case-sensitive, so a name that matches only
+// ignoring case ("gen" for Gen, or for a package called gen) is not found, and the error suggests the
+// real spelling.
+func ResolveExact(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, file string) (Symbol, error) {
+	return resolve(ctx, c, ix, root, query, file, true)
+}
+
+func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, file string, exactCase bool) (Symbol, error) {
 	query = strings.TrimSpace(query)
 	last := query
 	if i := strings.LastIndex(query, "."); i >= 0 {
@@ -312,8 +343,22 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 	exact, loose = dedupeSymbols(format.Rank(exact, last)), dedupeSymbols(format.Rank(loose, last))
 	// A case-exact match beats a merely case-insensitive one.
 	cands := exact
+	folded := false
 	if len(cands) == 0 {
+		if exactCase && len(loose) > 0 {
+			var sug []string
+			seen := map[string]bool{}
+			for _, s := range loose {
+				if f := foldedForm(s, query); f != "" && !seen[f] {
+					seen[f] = true
+					sug = append(sug, f)
+				}
+			}
+			sort.Strings(sug)
+			return Symbol{}, &NotFoundError{Query: query, Suggest: sug, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q (names are case-sensitive).", query), Hint: sug}}
+		}
 		cands = loose
+		folded = len(loose) > 0
 	}
 	if query == "init" || query == "main" {
 		// Every package has its own: unless one is asked for by package, only the workspace's count.
@@ -351,6 +396,15 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		}
 		cands = narrowed
 	}
+	if len(cands) > 1 { // deterministic order for the ambiguity listing
+		sort.SliceStable(cands, func(i, j int) bool {
+			a, b := canonPath(cands[i].Location.URI), canonPath(cands[j].Location.URI)
+			if a != b {
+				return a < b
+			}
+			return cands[i].Location.Range.Start.Line < cands[j].Location.Range.Start.Line
+		})
+	}
 	switch len(cands) {
 	case 0:
 		hint := ""
@@ -361,6 +415,9 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 	case 1:
 		sym := fromLSP(cands[0])
 		sym.Unbuilt = onlyIndex[cands[0]] && cands[0].Detail != ""
+		if folded {
+			sym.CaseFolded = foldedForm(cands[0], query)
+		}
 		return sym, nil
 	}
 	sameFile := true

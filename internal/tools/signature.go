@@ -95,7 +95,13 @@ func planOrder(sig *gosrc.Sig, in changeSigIn) ([]entry, error) {
 		a := &in.Add[k]
 		switch {
 		case a.Name == "" || a.Type == "" || strings.TrimSpace(a.Value) == "":
-			return nil, toolerr.Inputf("every added parameter needs name, type and value (the argument for existing calls)")
+			var miss []string
+			for _, f := range []struct{ n, v string }{{"name", a.Name}, {"type", a.Type}, {"value", strings.TrimSpace(a.Value)}} {
+				if f.v == "" {
+					miss = append(miss, f.n)
+				}
+			}
+			return nil, toolerr.Inputf("add[%d] is missing %s: every added parameter needs name, type and value (the argument for existing calls)", k, strings.Join(miss, ", "))
 		case !token.IsIdentifier(a.Name):
 			return nil, toolerr.Inputf("%q is not a valid Go parameter name (letters, digits and _, not starting with a digit, not a keyword)", a.Name)
 		case taken[a.Name]:
@@ -242,7 +248,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 					return "", toolerr.Inputf("%s is the %s function: the Go toolchain requires it to take no parameters.", in.Name, sp)
 				}
 				if !d.Method {
-					if where := cgoExportSites(root.path, text, d.Name); where != nil {
+					if where := cgoExportSites(w.Root, root.path, text, d.Name); where != nil {
 						return "", toolerr.Inputf("%s is exported to C (//export %s): C code calls it with the prototype written in the cgo preamble or a header, which is not a Go declaration this tool can rewrite, so changing its signature would break the cgo build. Change it by hand, together with all of these:\n    %s", in.Name, d.Name, strings.Join(where, "\n    "))
 					}
 				}
