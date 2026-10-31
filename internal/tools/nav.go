@@ -54,6 +54,7 @@ func text(s string) *mcp.CallToolResult {
 
 // add registers a read-only text tool; expected errors become tool text.
 func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
+	registerUsage[In](name)
 	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}
 	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
 		w, err := h.Acquire(ctx, req.Session)

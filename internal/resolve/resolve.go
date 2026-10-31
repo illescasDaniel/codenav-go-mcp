@@ -11,6 +11,7 @@ import (
 	"unicode/utf16"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
@@ -91,15 +92,52 @@ func matchesFile(s *lsp.Symbol, root, file string, exact bool) bool {
 	return rel == target || strings.HasSuffix(rel, "/"+target) || strings.HasSuffix(target, "/"+rel)
 }
 
+// pkgLabel is the import path of the package a candidate lives in: gopls reports it, the symbol index
+// only knows the package name, so that one is completed from the nearest go.mod.
+// qualifiedExample is the candidate's own name with its package name in front ("shapes.Scale").
+func qualifiedExample(c *lsp.Symbol, query string) string {
+	if strings.Contains(query, ".") || c.ContainerName == "" {
+		return ""
+	}
+	return path.Base(c.ContainerName) + "." + query
+}
+
+func pkgLabel(c *lsp.Symbol) string {
+	if strings.Contains(c.ContainerName, "/") || c.Location == nil {
+		return c.ContainerName
+	}
+	dir := filepath.Dir(lsp.URIToPath(c.Location.URI))
+	if m, ok := gomod.Owner(dir); ok {
+		if rel, err := filepath.Rel(m.Dir, dir); err == nil && !strings.HasPrefix(rel, "..") {
+			if rel == "." {
+				return m.Path
+			}
+			return m.Path + "/" + filepath.ToSlash(rel)
+		}
+	}
+	return c.ContainerName
+}
+
+// candidateLines lists ambiguous candidates alike: package by import path and, as soon as one of them
+// sits behind a build constraint, the constraint (or its absence) on every line.
 func candidateLines(cands []*lsp.Symbol, root string) string {
+	constrained := false
+	for _, c := range cands {
+		constrained = constrained || c.Detail != ""
+	}
 	lines := make([]string, len(cands))
 	for i, c := range cands {
-		lines[i] = "  " + format.FormatWorkspaceSymbol(c, root)
-		if c.ContainerName != "" {
-			lines[i] += "  in " + c.ContainerName
+		plain := *c
+		plain.Detail = ""
+		lines[i] = "  " + format.FormatWorkspaceSymbol(&plain, root)
+		if l := pkgLabel(c); l != "" {
+			lines[i] += "  in " + l
 		}
-		if c.Detail != "" {
-			lines[i] += "  (" + c.Detail + ")"
+		switch {
+		case c.Detail != "":
+			lines[i] += "  (build: " + c.Detail + ")"
+		case constrained:
+			lines[i] += "  (no build constraint)"
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -311,7 +349,10 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 			sameFile = false
 		}
 	}
-	hint := "qualify it with the package (`shapes.Scale`) or pass file_path to disambiguate"
+	hint := "pass file_path to disambiguate"
+	if q := qualifiedExample(cands[0], query); q != "" {
+		hint = "qualify it with the package (`" + q + "`) or " + hint
+	}
 	if sameFile {
 		hint = "these all live in the same file; use search_symbol to get exact line/column, then hover/definition/references with that position"
 	}

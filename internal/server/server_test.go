@@ -2197,3 +2197,83 @@ func TestDeleteSymbolCollapsesBlankLinesAtTheSeam(t *testing.T) {
 		t.Errorf("move out of the end:\n%q", got)
 	}
 }
+
+func TestDeleteIotaConstRefusedUnlessForced(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "io/io.go", "package io2\n\nconst (\n\tA = iota\n\tB\n\tC\n)\n\nconst (\n\tX = 1\n\tY = 2\n)\n")
+	out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "io2.A"})
+	if !strings.Contains(out, "Not deleted") || !strings.Contains(out, "force=true") || !strings.Contains(readFile(t, root, "io/io.go"), "A = iota") {
+		t.Errorf("iota delete must be refused:\n%s", out)
+	}
+	// the last constant, and constants with explicit values, shift nothing
+	if out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "io2.C"}); !strings.Contains(out, "Applied") {
+		t.Errorf("last const of an iota block:\n%s", out)
+	}
+	if out := call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "io2.X"}); !strings.Contains(out, "Applied") {
+		t.Errorf("explicit values:\n%s", out)
+	}
+	writeFile(t, root, "io/io.go", "package io2\n\nconst (\n\tA = 1 << iota\n\tB = 1 << iota\n)\n")
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "delete", "name": "io2.A", "force": true})
+	if !strings.Contains(out, "Applied") || !strings.Contains(out, "shifted") {
+		t.Errorf("forced delete keeps the note:\n%s", out)
+	}
+}
+
+func TestAmbiguousCandidatesAreLabelledConsistently(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "un/a.go", "package un\n\nfunc Twin() int { return 1 }\n")
+	writeFile(t, root, "un/b_other.go", "//go:build !linux\n\npackage un\n\nfunc Twin() int { return 2 }\n")
+	writeFile(t, root, "deux/c.go", "package deux\n\nfunc Twin() int { return 3 }\n")
+	out := call(t, cs, "symbol_info", map[string]any{"name": "Twin"})
+	if strings.Contains(out, "shapes.Scale") || !(strings.Contains(out, "`deux.Twin`") || strings.Contains(out, "`un.Twin`")) || strings.Contains(out, "  in un") || strings.Contains(out, "build:  ") {
+		t.Errorf("hint and package labels:\n%s", out)
+	}
+	if n := strings.Count(out, "in example.com/fx/"); n != 3 {
+		t.Errorf("every candidate carries the import path of its package:\n%s", out)
+	}
+	if strings.Count(out, "(build: //go:build !linux)") != 1 || strings.Count(out, "(no build constraint)") != 2 {
+		t.Errorf("the build constraint is shown on every candidate:\n%s", out)
+	}
+}
+
+func TestMissingParametersGetAFriendlyHint(t *testing.T) {
+	cs, _ := session(t, nil)
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+		want []string
+	}{
+		{"hover", map[string]any{"file_path": "a.go"}, []string{"line", "column", "hover(file_path, line, column)"}},
+		{"move", map[string]any{}, []string{"to_file", "move(to_file, "}},
+		{"edit", map[string]any{}, []string{"file_path", "edit(file_path"}},
+		{"edit_symbol", map[string]any{}, []string{"Missing required parameter(s)"}},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		if strings.Contains(out, "validating") {
+			t.Errorf("%s: raw validation error:\n%s", c.tool, out)
+		}
+		for _, w := range c.want {
+			if !strings.Contains(out, w) {
+				t.Errorf("%s: want %q in:\n%s", c.tool, w, out)
+			}
+		}
+	}
+}
+
+func TestMoveCgoCallersRefusedAndCgoPackageMoveHasNoFalseErrors(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc+"\nfunc UsePlain() int { return Plain(3) }\n")
+	writeFile(t, root, "cg/plain.go", "package cg\n\n// Plain doubles.\nfunc Plain(x int) int { return x * 2 }\n")
+	out := call(t, cs, "move", map[string]any{"name": "cg.Plain", "to_file": "util/plain.go"})
+	if strings.Contains(out, "Applied") || !strings.Contains(out, "cg/cg.go") || !strings.Contains(out, "can't be rewritten automatically") {
+		t.Errorf("a caller in a cgo file must refuse the move:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "cg/plain.go"), "func Plain") {
+		t.Error("nothing may be written")
+	}
+	out = call(t, cs, "move", map[string]any{"file_path": "cg", "to_file": "cg2"})
+	if !strings.Contains(out, "Applied") || !strings.Contains(out, "0 new error(s)") || !strings.Contains(out, "ignored: cgo diagnostics") {
+		t.Errorf("moving a cgo package must not report artefacts as new errors:\n%s", out)
+	}
+}

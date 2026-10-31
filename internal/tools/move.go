@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
@@ -333,6 +334,19 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 			}
 		}
 	}
+	// Files that import "C" are type-checked from cgo's generated output, so their syntax positions do not
+	// match the source: they are scanned lexically instead, and a use of the moved name in one is refused.
+	cgoFile := map[string]bool{}
+	for _, p := range pkgs {
+		for _, f := range p.GoFiles {
+			if !cgoFile[f] && importsC(f) {
+				cgoFile[f] = true
+			}
+		}
+	}
+	if cgoFile[l.path] {
+		return nil, toolerr.Inputf("%s is in %s, a file that imports \"C\"; its declarations can't be moved automatically.", display, filepath.Base(l.path))
+	}
 	if len(A.Errors) > 0 {
 		return nil, toolerr.Inputf("package %s has errors (%v); fix them before moving code out of it.", A.PkgPath, A.Errors[0])
 	}
@@ -469,6 +483,13 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		for _, f := range p.Syntax {
 			fname := fset.Position(f.Pos()).Filename
 			if done[fname] || p.TypesInfo == nil {
+				continue
+			}
+			if cgoFile[fname] {
+				done[fname] = true
+				if usesNameLexically(fname, d.Name, A.PkgPath, isA) {
+					refuse("%s refers to %s, but it imports \"C\", so its callers can't be rewritten automatically (edit that file by hand)", edits.RelativeName(fname, w.Root), d.Name)
+				}
 				continue
 			}
 			done[fname] = true
@@ -731,3 +752,62 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	}
 	return edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...), nil
 }
+
+// importsC: the Go file at path has `import "C"`.
+func importsC(path string) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
+	if err != nil {
+		return false
+	}
+	for _, im := range f.Imports {
+		if im.Path.Value == `"C"` {
+			return true
+		}
+	}
+	return false
+}
+
+// usesNameLexically: the file at path mentions name as the moved declaration would be reached from
+// it: unqualified in a file of the declaring package (inPkg), else through an import of pkgPath.
+func usesNameLexically(path, name, pkgPath string, inPkg bool) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		return true // unreadable: be careful
+	}
+	quals := map[string]bool{}
+	dot := false
+	for _, im := range f.Imports {
+		if p, _ := strconv.Unquote(im.Path.Value); p == pkgPath {
+			switch {
+			case im.Name == nil:
+				quals[pathBase(p)] = true
+			case im.Name.Name == ".":
+				dot = true
+			default:
+				quals[im.Name.Name] = true
+			}
+		}
+	}
+	found := false
+	sels := map[*ast.Ident]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			sels[sel.Sel] = true
+			if x, ok := sel.X.(*ast.Ident); ok && quals[x.Name] && sel.Sel.Name == name {
+				found = true
+			}
+		}
+		return !found
+	})
+	if inPkg || dot {
+		ast.Inspect(f, func(n ast.Node) bool {
+			if id, ok := n.(*ast.Ident); ok && id.Name == name && !sels[id] {
+				found = true
+			}
+			return !found
+		})
+	}
+	return found
+}
+
+func pathBase(p string) string { return gosrc.ImportName(p) }

@@ -729,3 +729,39 @@ func IsEmbeddedFieldAt(filename, src string, off int) bool {
 	})
 	return found
 }
+
+// ConstShift reports whether deleting the const spec inside src[start:end) of a parenthesised block
+// would change the value of a later constant: one that repeats the previous expression (no value of its
+// own) or uses iota itself.
+func ConstShift(filename, src string, start, end int) bool {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return false
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST || !gd.Lparen.IsValid() {
+			continue
+		}
+		for i, spec := range gd.Specs {
+			if o := fset.Position(spec.Pos()).Offset; o < start || o >= end {
+				continue
+			}
+			for _, later := range gd.Specs[i+1:] {
+				vs := later.(*ast.ValueSpec)
+				uses := len(vs.Values) == 0
+				ast.Inspect(vs, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok && id.Name == "iota" {
+						uses = true
+					}
+					return !uses
+				})
+				if uses {
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}

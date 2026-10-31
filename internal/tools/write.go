@@ -215,6 +215,7 @@ func readOnlyDesc(desc string, readOnly bool) string {
 
 // addWrite registers a tool that may change files.
 func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
+	registerUsage[In](name)
 	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
 	if readOnly {
 		// `apply` stays in the schema (clients that always send it must keep working): apply=false previews,

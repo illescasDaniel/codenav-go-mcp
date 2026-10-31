@@ -172,6 +172,7 @@ func New(version string) (*mcp.Server, *Manager) {
 			"verify_changes re-checks the workspace."
 	}
 	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{Instructions: instructions})
+	s.AddReceivingMiddleware(tools.FriendlyValidation)
 	tools.RegisterNav(s, m)
 	tools.RegisterWrite(s, m, readOnly)
 	return s, m

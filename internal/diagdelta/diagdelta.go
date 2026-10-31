@@ -104,6 +104,47 @@ type Delta struct {
 	Unchanged    int
 	FilesChecked int
 	Unchecked    []string
+	// Ignored describes diagnostics left out as analysis artefacts (see DropCgoArtefacts).
+	Ignored []string
+}
+
+const cgoListFailure = "go list failed to return CompiledGoFiles"
+
+// DropCgoArtefacts removes what gopls reports for a cgo package it cannot load from an in-memory copy
+// (the package moved or was edited in an overlay): the CompiledGoFiles failure itself and the
+// "undefined: C.x" errors of the same directory. They say nothing about the code, so they are left
+// out of both sides of the comparison. It returns the kept entries and the files the dropped ones were in.
+func DropCgoArtefacts(es []Entry) ([]Entry, []string) {
+	dirs := map[string]bool{}
+	for _, e := range es {
+		if strings.Contains(e.Message, cgoListFailure) {
+			dirs[dirOf(e.Path)] = true
+		}
+	}
+	if len(dirs) == 0 {
+		return es, nil
+	}
+	var out []Entry
+	seen := map[string]bool{}
+	var files []string
+	for _, e := range es {
+		if dirs[dirOf(e.Path)] && (strings.Contains(e.Message, cgoListFailure) || strings.HasPrefix(e.Message, "undefined: C.") || strings.HasPrefix(e.Message, "could not import C")) {
+			if !seen[e.Path] {
+				seen[e.Path] = true
+				files = append(files, e.Path)
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	return out, files
+}
+
+func dirOf(p string) string {
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[:i]
+	}
+	return ""
 }
 
 func (d Delta) NewErrors() []Entry   { return filter(d.New, true) }
@@ -196,6 +237,9 @@ func Format(d Delta, limit int) string {
 	}
 	head += fmt.Sprintf(" (%d file(s) checked, %d unchanged)", d.FilesChecked, d.Unchanged)
 	lines := []string{head}
+	if len(d.Ignored) > 0 {
+		lines = append(lines, "  ignored: "+strings.Join(d.Ignored, "; "))
+	}
 	if len(d.Unchecked) > 0 {
 		lines = append(lines, "  not checked: "+strings.Join(d.Unchecked[:min(5, len(d.Unchecked))], ", "))
 	}

@@ -434,6 +434,10 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 		return nil, fmt.Sprintf("Not deleted: %s is still used in %d place(s) (force=true deletes it anyway and shows what breaks):\n%s",
 			in.Name, len(users), format.FormatReferences(users, w.Root, format.DefaultReferencesSnippetLimit)), nil
 	}
+	shifts := d.Grouped && d.Keyword == "const" && gosrc.ConstShift(l.path, l.text, d.Start, d.End)
+	if shifts && !in.Force {
+		return nil, fmt.Sprintf("Not deleted: %s sits in a const block whose later constants rely on iota or on a repeated expression, so removing it would change their values (force=true deletes it anyway; or give the later constants explicit values first).", in.Name), nil
+	}
 	from, to := d.Start, d.End
 	from, to = lineStart(l.text, from), lineEnd(l.text, to)
 	next := applyEdits(l.text, []tedit{{from, to, ""}})
@@ -441,8 +445,8 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	if err != nil {
 		return nil, "", err
 	}
-	if d.Grouped && strings.Contains(blockText(l.text, d.Start, d.End), "iota") {
-		notes = append(notes, "The block uses iota: the values of the constants after the deleted one shift.")
+	if shifts {
+		notes = append(notes, "Forced: the values of the constants after the deleted one shifted (iota or repeated expression).")
 	}
 	if sp == "init" {
 		notes = append(notes, "init functions run at program start; its side effects are gone with it.")
@@ -467,23 +471,6 @@ func carveOut(l *located) (*located, error) {
 	c := *l
 	c.text, c.decl = carved, d
 	return &c, nil
-}
-
-// blockText is the parenthesised const/var/type block around a grouped spec.
-func blockText(text string, start, end int) string {
-	a := strings.LastIndex(text[:start], "\n)")
-	b := strings.LastIndex(text[:start], " (\n")
-	if a > b {
-		b = a
-	}
-	if b < 0 {
-		b = 0
-	}
-	e := strings.Index(text[end:], "\n)")
-	if e < 0 {
-		return text[b:]
-	}
-	return text[b : end+e]
 }
 
 // insertMember puts member before the closing brace at offset closing; it adds no blank line

@@ -89,6 +89,13 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 	if err := run(after, skipAfter, &ae, &ua); err != nil {
 		return diagdelta.Delta{}, err
 	}
+	var ignored []string
+	for _, side := range []*[]diagdelta.Entry{&be, &ae} {
+		var files []string
+		if *side, files = diagdelta.DropCgoArtefacts(*side); len(files) > 0 && side == &ae {
+			ignored = append(ignored, fmt.Sprintf("cgo diagnostics in %s (a cgo package can't be loaded from an in-memory copy, so they say nothing about the edit; run go build to confirm)", strings.Join(files[:min(len(files), 4)], ", ")))
+		}
+	}
 	errDirs := map[string]bool{}
 	for _, es := range [][]diagdelta.Entry{be, ae} {
 		for _, e := range es {
@@ -98,7 +105,7 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 		}
 	}
 	d := diagdelta.Diff(keepDiagnostics(be, errDirs), keepDiagnostics(ae, errDirs))
-	d.FilesChecked = len(check)
+	d.Ignored = ignored
 	seen := map[string]bool{}
 	for _, u := range append(ub, ua...) {
 		if !seen[u] {
@@ -106,6 +113,7 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 			d.Unchecked = append(d.Unchecked, u)
 		}
 	}
+	d.FilesChecked = max(0, len(check)-len(d.Unchecked)) // a file that was "not checked" is not counted as checked
 	return d, nil
 }
 
