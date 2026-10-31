@@ -38,7 +38,7 @@ func collect(ctx context.Context, w *Workspace, overlays map[string]string, path
 			text = b
 		}
 		rel := edits.RelativeName(p, w.Root)
-		if index.Unbuildable(p) {
+		if index.UnbuildableText(p, text) {
 			unchecked = append(unchecked, rel+" (not part of any package the Go toolchain builds, so the type check cannot see it)")
 			continue
 		}
@@ -107,7 +107,8 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 	d := diagdelta.Diff(keepDiagnostics(be, errDirs), keepDiagnostics(ae, errDirs))
 	d.Ignored = ignored
 	seen := map[string]bool{}
-	for _, u := range append(ub, ua...) {
+	_ = ub // A file only the before side could not check is checked after the edit, which is what the report is about
+	for _, u := range ua {
 		if !seen[u] {
 			seen[u] = true
 			d.Unchecked = append(d.Unchecked, u)
@@ -232,7 +233,13 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
 	}
 	for _, p := range changed {
-		if b, err := os.ReadFile(p); err == nil && gomod.HasBuildConstraint(string(b)) {
+		src, ok := after[p]
+		if !ok {
+			if b, err := os.ReadFile(p); err == nil {
+				src, ok = string(b), true
+			}
+		}
+		if ok && gomod.HasBuildConstraint(src) {
 			plan.Notes = appendUnique(plan.Notes, edits.RelativeName(p, w.Root)+" has a build constraint; diagnostics only cover the current GOOS/GOARCH/tags, so the check may not see this file's own errors.")
 		}
 	}

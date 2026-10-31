@@ -2355,3 +2355,18 @@ func TestCgoRenameRefusedAndHoverUsesSourceNames(t *testing.T) {
 		t.Errorf("cgo hover:\n%s", out)
 	}
 }
+
+func TestBuildConstraintCheckUsesPostEditContent(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/gen.go", "//go:build ignore\n\npackage shapes\n\nvar broken int = \"text\"\n")
+	// Removing the ignore header makes the file part of the package: its error is now seen.
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/gen.go", "old_string": "//go:build ignore\n\n", "new_string": "", "apply": false})
+	if strings.Contains(out, "not part of any package") || !strings.Contains(out, "broken") && !strings.Contains(out, "cannot use") {
+		t.Errorf("the edited file must be type-checked once the header is gone:\n%s", out)
+	}
+	// Adding the header to a compiled file: it is no longer checked, and the report says so without counting it.
+	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "package shapes", "new_string": "//go:build ignore\n\npackage shapes", "apply": false})
+	if !strings.Contains(out, "not part of any package") {
+		t.Errorf("a file that just became ignored is not checked:\n%s", out)
+	}
+}

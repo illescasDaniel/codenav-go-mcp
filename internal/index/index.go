@@ -272,12 +272,25 @@ func headerConstraint(f *ast.File) string {
 // Unbuildable reports whether the go tool never compiles the file whatever the build flags: a name
 // starting with `_` or `.`, or a `//go:build ignore` header.
 func Unbuildable(path string) bool {
-	if base := filepath.Base(path); strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".") {
+	if unbuildableName(path) {
 		return true
 	}
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return false
+	}
+	return UnbuildableText(path, string(src))
+}
+
+func unbuildableName(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".")
+}
+
+// UnbuildableText is Unbuildable for the given content of path (an edit's result, not the disk).
+func UnbuildableText(path, src string) bool {
+	if unbuildableName(path) {
+		return true
 	}
 	f, _ := parser.ParseFile(token.NewFileSet(), path, src, parser.PackageClauseOnly|parser.ParseComments)
 	return f != nil && f.Name != nil && neverBuilt(headerConstraint(f))
