@@ -193,7 +193,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		// A use of a standard-library or dependency symbol: name the file that declares it (the plan's
 		// first file would be an arbitrary one, such as doc.go).
 		if defs, derr := w.Client.Definition(ctx, root.path, root.line+1, root.col+1); derr == nil && len(defs) > 0 {
-			if dp := lsp.URIToPath(defs[0].URI); dp != "" && !w.inWorkspace(dp) {
+			if dp := lsp.URIToPath(defs[0].URI); dp != "" && isCgoGenerated(dp) {
+				return nil, toolerr.Inputf("%s is declared in cgo-generated code (it is C.%s); rename the C symbol in the cgo preamble or C sources instead.", identAt(root.path, root.line, root.col), identAt(root.path, root.line, root.col))
+			} else if dp != "" && !w.inWorkspace(dp) {
 				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace %s; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), dp, defs[0].Range.Start.Line+1, w.Root)
 			}
 		}

@@ -117,6 +117,25 @@ func goCache() string {
 	return goCacheDir
 }
 
+// isCgoGenerated: a file cgo wrote into the go build cache.
+func isCgoGenerated(p string) bool {
+	cache := goCache()
+	return cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) || strings.Contains(filepath.ToSlash(p), "/go-build/")
+}
+
+var cgoNameRE = regexp.MustCompile(`\b_C(?:func|type|var|const|macro)_(\w+)`)
+
+// cgoHover shows cgo's generated names the way the source spells them: `_Cfunc_add` is `C.add`.
+func cgoHover(path, text string) string {
+	if !strings.Contains(text, "_C") {
+		return text
+	}
+	if src, _, err := edits.ReadSource(path); err != nil || !strings.Contains(src, `import "C"`) {
+		return text
+	}
+	return cgoNameRE.ReplaceAllString(text, "C.$1")
+}
+
 // maxDefinitions caps the locations `definition` lists.
 const maxDefinitions = 10
 
@@ -349,7 +368,11 @@ func RegisterNav(s *mcp.Server, h Host) {
 				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
 			if t := tidyHover(hoverText(raw)); t != "" {
-				return t, nil
+				abs := in.FilePath
+				if !filepath.IsAbs(abs) {
+					abs = filepath.Join(w.Root, abs)
+				}
+				return cgoHover(abs, t), nil
 			}
 			return "No hover information at that position.", nil
 		})

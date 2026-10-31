@@ -2341,3 +2341,17 @@ func TestDefinitionOnCgoCallAndImportPath(t *testing.T) {
 		t.Errorf("definition of an import path must be capped:\n%s", out)
 	}
 }
+
+func TestCgoRenameRefusedAndHoverUsesSourceNames(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc)
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "cg/cg.go", "line": 11, "column": 40, "new_name": "plus"})
+	if !strings.Contains(out, "cgo-generated") || strings.Contains(out, "go-build") {
+		t.Errorf("rename of a cgo symbol:\n%s", out)
+	}
+	out = call(t, cs, "hover", map[string]any{"file_path": "cg/cg.go", "line": 11, "column": 40})
+	if !strings.Contains(out, "C.add") || strings.Contains(out, "_Cfunc_") || strings.Contains(out, "_Ctype_") {
+		t.Errorf("cgo hover:\n%s", out)
+	}
+}
