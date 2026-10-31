@@ -299,6 +299,15 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	if err != nil {
 		return nil, err
 	}
+	// "./..." covers only the root's own module; the other modules of a go.work are loaded separately
+	// so their packages (the symbol's own, the destination, the callers) are all seen.
+	for _, md := range gomod.WorkModules(w.Root) {
+		ncfg := *cfg
+		ncfg.Dir = md
+		if more, merr := packages.Load(&ncfg, "./..."); merr == nil {
+			pkgs = append(pkgs, more...)
+		}
+	}
 	destDir := filepath.Dir(dest)
 	var A, B *packages.Package
 	find := func() {
@@ -452,7 +461,30 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		if !p.IsValid() {
 			return false
 		}
-		return inSpan(fset.Position(p).Filename, off(p)) >= 0
+		if inSpan(fset.Position(p).Filename, off(p)) >= 0 {
+			return true
+		}
+		// An object of another module of a go.work comes from compiler export data, which keeps its line but
+		// not its column (it reads as column 1): compare it by line.
+		pos := fset.Position(p)
+		if pos.Column != 1 {
+			return false
+		}
+		for _, sp := range spans {
+			if sp.file != pos.Filename {
+				continue
+			}
+			t, _, err := read(sp.file)
+			if err != nil || sp.end > len(t) {
+				continue
+			}
+			first, _ := edits.PositionOf(t, sp.start)
+			last, _ := edits.PositionOf(t, max(sp.start, sp.end-1))
+			if pos.Line-1 >= first && pos.Line-1 <= last {
+				return true
+			}
+		}
+		return false
 	}
 
 	var refusals []string

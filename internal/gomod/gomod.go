@@ -88,27 +88,35 @@ func fingerprint(root string, flags []string) string {
 	}
 	n := 0
 	ok := true
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	roots := []string{root}
+	for _, d := range WorkModules(root) {
+		if rel, err := filepath.Rel(root, d); err != nil || strings.HasPrefix(rel, "..") {
+			roots = append(roots, d) // a used module outside root: its files matter too
 		}
-		if d.IsDir() {
-			if p != root && exclude.IsDirName(d.Name()) {
-				return filepath.SkipDir
+	}
+	for _, r := range roots {
+		_ = filepath.WalkDir(r, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if p != r && exclude.IsDirName(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if name := d.Name(); strings.HasSuffix(name, ".go") || name == "go.mod" || name == "go.work" || name == "go.sum" {
+				if n++; n > 50000 {
+					ok = false
+					return filepath.SkipAll
+				}
+				if info, err := d.Info(); err == nil {
+					sb.WriteString(p + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10) + "\n")
+				}
 			}
 			return nil
-		}
-		if name := d.Name(); strings.HasSuffix(name, ".go") || name == "go.mod" || name == "go.work" || name == "go.sum" {
-			if n++; n > 50000 {
-				ok = false
-				return filepath.SkipAll
-			}
-			if info, err := d.Info(); err == nil {
-				sb.WriteString(p + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10) + "\n")
-			}
-		}
-		return nil
-	})
+		})
+	}
 	if !ok {
 		return ""
 	}
@@ -138,7 +146,49 @@ func list(ctx context.Context, root string) ([]pkg, error) {
 	return pkgs, err
 }
 
+// WorkModules lists the directories of the go.work's `use` modules other than root itself (empty
+// without a go.work). `go list ./...` and packages.Load("./...") at the root see only the root's own
+// module, so these are listed and loaded separately.
+func WorkModules(root string) []string {
+	work := findWork(root)
+	if work == "" {
+		return nil
+	}
+	var out []string
+	for d := range workUses(work) {
+		if d == filepath.Clean(root) {
+			continue
+		}
+		if st, err := os.Stat(filepath.Join(d, "go.mod")); err == nil && !st.IsDir() {
+			out = append(out, d)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func runList(ctx context.Context, root string, flags []string) ([]pkg, error) {
+	pkgs, err := runListDir(ctx, root, flags)
+	seen := map[string]bool{}
+	for _, p := range pkgs {
+		seen[p.ImportPath+"\x00"+p.Dir] = true
+	}
+	for _, d := range WorkModules(root) {
+		more, merr := runListDir(ctx, d, flags)
+		if merr != nil && len(more) == 0 {
+			continue
+		}
+		for _, p := range more {
+			if !seen[p.ImportPath+"\x00"+p.Dir] {
+				seen[p.ImportPath+"\x00"+p.Dir] = true
+				pkgs = append(pkgs, p)
+			}
+		}
+	}
+	return pkgs, err
+}
+
+func runListDir(ctx context.Context, root string, flags []string) ([]pkg, error) {
 	listRuns.Add(1)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
