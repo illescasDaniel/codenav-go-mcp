@@ -43,7 +43,22 @@ func snippet(lines []string, row int) string {
 }
 
 // shortName: names this short are also ordinary words (a, id, go), so prose needs code context.
-func shortName(name string) bool { return len(name) < 3 }
+// Upper-case short names (U, K, V, ID, F) are not words, except the English "A" and "I", so they are
+// searched like any other name.
+func shortName(name string) bool {
+	if len(name) >= 3 {
+		return false
+	}
+	if name == "A" || name == "I" {
+		return true
+	}
+	for _, r := range name {
+		if r < 'A' || r > 'Z' {
+			return true
+		}
+	}
+	return false
+}
 
 // codeContext matches name written as code in prose: `name`, [name], name( or .name
 func codeContext(name string) *regexp.Regexp {

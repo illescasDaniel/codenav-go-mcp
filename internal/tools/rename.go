@@ -35,7 +35,7 @@ type renameIn struct {
 	Parameter         string `json:"parameter,omitempty" jsonschema:"rename this parameter of the function or method given by name (or at line/column) instead of the function itself"`
 	Linked            *bool  `json:"linked,omitempty" jsonschema:"default true: rename the interface method and every implementation together"`
 	Apply             *bool  `json:"apply,omitempty"`
-	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
+	MaxNewErrors      *int   `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool  `json:"include_dependents,omitempty"`
 	AllowLarge        bool   `json:"allow_large,omitempty"`
 }
@@ -210,6 +210,12 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 
 	if in.Parameter == "" {
+		if err := cgoExportRefusal(root.path, text, oldName); err != nil {
+			return nil, err
+		}
+	}
+
+	if in.Parameter == "" {
 		if d, derr := gosrc.FindDeclAt(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)); derr == nil {
 			if sp := specialFunc(d, gosrc.PackageName(text)); sp != "" {
 				return nil, toolerr.Inputf("%s is the %s function; renaming it would break the program (go build %s).", oldName, sp, map[string]string{"main": "finds no entry point", "init": "no longer runs it at start-up"}[sp])
@@ -314,7 +320,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	// A parameter or local variable is fully resolved by gopls; same-named text elsewhere is unrelated.
 	if in.Parameter == "" && kind != 0 {
 		ms := mentions.FindScoped(w.Root, oldName, after, "", couldRefer(root.path, oldName))
-		notes = append(notes, mentions.Notes(otherObjects(ctx, w, ms, after), oldName)...)
+		notes = append(notes, mentions.Notes(otherObjects(ctx, w, ms, after, oldName, root.path, kind >= 6 && kind <= 8), oldName)...)
 	} else if ptext, ok := after[root.path]; ok {
 		// A local, parameter or type parameter lives inside one declaration: only that span can
 		// still mention the old name.
@@ -333,15 +339,54 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	return edits.NewPlan(desc, changes, notes...), nil
 }
 
-// otherObjects drops the code mentions that gopls resolves to a declaration: after the rename every
-// reference to the symbol is gone, so a name that still resolves is some other, unrelated object.
-// Files the rename changes are kept (their positions no longer match what gopls has).
-func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, after map[string]string) []mentions.Mention {
+// otherObjects drops the code mentions that are some other, unrelated object. For a field or method,
+// a bare identifier (a package-level func or variable of the same name, a local) can never be the
+// member, so it goes whether or not its file changed. For the rest, a name gopls still resolves after
+// the rename is another object; that needs the file's positions to be unchanged, so files the rename
+// edits are kept.
+func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, after map[string]string, name, declFile string, member bool) []mentions.Mention {
 	out := ms[:0:0]
 	checked := 0
+	bare := map[string]map[int]bool{}      // abs path -> positions of non-member identifiers
+	qualified := map[string]map[int]bool{} // abs path -> positions of identifiers that are not selected
 	for _, m := range ms {
 		abs := filepath.Join(w.Root, m.Path)
-		if _, changed := after[abs]; m.Kind == "code" && !changed && m.Col > 0 && checked < 40 {
+		if m.Kind != "code" || m.Col <= 0 {
+			out = append(out, m)
+			continue
+		}
+		if member {
+			set, ok := bare[abs]
+			if !ok {
+				text, have := after[abs]
+				if !have {
+					text, _, _ = edits.ReadSource(abs)
+				}
+				set = gosrc.NonMemberIdents(abs, text, name)
+				bare[abs] = set
+			}
+			if set[m.Line<<20|m.Col] {
+				continue
+			}
+		} else if filepath.Dir(abs) != filepath.Dir(declFile) {
+			// Another directory is another package: only `pkg.Name` can mean the renamed symbol
+			// (a dot import aside).
+			set, ok := qualified[abs]
+			if !ok {
+				text, have := after[abs]
+				if !have {
+					text, _, _ = edits.ReadSource(abs)
+				}
+				if !dotImport.MatchString(text) {
+					set = gosrc.NonSelectorIdents(abs, text, name)
+				}
+				qualified[abs] = set
+			}
+			if set[m.Line<<20|m.Col] {
+				continue
+			}
+		}
+		if _, changed := after[abs]; !changed && checked < maxDefinitionChecks {
 			checked++
 			if defs, err := w.Client.Definition(ctx, abs, m.Line, m.Col); err == nil && len(defs) > 0 {
 				continue
@@ -351,6 +396,11 @@ func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, afte
 	}
 	return out
 }
+
+var dotImport = regexp.MustCompile(`(?m)^\s*(?:import\s+)?\.\s+"`)
+
+// maxDefinitionChecks bounds the gopls round trips spent on telling unrelated mentions apart.
+const maxDefinitionChecks = 200
 
 // couldRefer accepts the Go files that could name the symbol declared in declFile: the files of its
 // directory (including ones excluded by build constraints, which the type checker never saw) and,
@@ -632,4 +682,59 @@ func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp
 		extra += fmt.Sprintf(" (a tag value already equals the new name %s)", newName)
 	}
 	return fmt.Sprintf("field %s has struct tags (%s); the tag values were not changed - serialised names stay the same / update them if the wire format should change%s.", oldName, gosrc.FormatTag(tag), extra)
+}
+
+// cgoExportRefusal refuses to rename a Go function that is exported to C with `//export name`: C code
+// (the cgo preamble or .c/.h files) calls it by that name, and neither the directive nor those
+// calls are Go identifiers the type checker can follow, so the rename would break the cgo build.
+func cgoExportRefusal(path, text, name string) error {
+	re := regexp.MustCompile(`(?m)^//export[ \t]+` + regexp.QuoteMeta(name) + `[ \t]*$`)
+	loc := re.FindStringIndex(text)
+	if loc == nil {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	word := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	var where []string
+	where = append(where, fmt.Sprintf("%s:%d (//export %s)", filepath.Base(path), 1+strings.Count(text[:loc[0]], "\n"), name))
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		ext := filepath.Ext(e.Name())
+		if e.IsDir() || (ext != ".go" && ext != ".c" && ext != ".h" && ext != ".cc" && ext != ".cpp") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		src := string(raw)
+		inC := ext != ".go"
+		if ext == ".go" {
+			if !strings.Contains(src, `import "C"`) {
+				continue
+			}
+			// Only the cgo preamble (the comment right above import "C") is C code.
+			i := strings.Index(src, `import "C"`)
+			start := strings.LastIndex(src[:i], "/*")
+			if start < 0 || strings.Contains(src[start:i], "*/\n\n") {
+				continue
+			}
+			src = src[start:i]
+			inC = true
+		}
+		if !inC {
+			continue
+		}
+		for n, ln := range strings.Split(src, "\n") {
+			if word.MatchString(ln) {
+				line := n + 1
+				if ext == ".go" {
+					line = 1 + strings.Count(string(raw)[:strings.Index(string(raw), src)], "\n") + n
+				}
+				where = append(where, fmt.Sprintf("%s:%d: %s", e.Name(), line, strings.TrimSpace(ln)))
+			}
+		}
+	}
+	return toolerr.Inputf("%s is exported to C (//export %s): C code calls it by name, and the directive and those calls are not Go identifiers the type checker follows, so renaming it would break the cgo build. Rename it by hand, changing all of these together:\n    %s",
+		name, name, strings.Join(where, "\n    "))
 }
