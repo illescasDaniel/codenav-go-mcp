@@ -103,6 +103,10 @@ constraints is invisible to the type check (the response says when an edit touch
   an edit there can break importers without the error count showing it. Tools say so when they meet one (`callers` and `symbol_info` too, when the symbol lives in such a module, for instance a
   `replace`-d directory inside the workspace: callers in the root module are not seen);
   `go work init . ./sub` joins the modules properly.
+- **File paths** given to the read tools must lie in the workspace, GOROOT, the module cache or a
+  `replace`/`use`-d directory; anything else (`../other-project/main.go`) is refused. `definition` on an
+  import path lists at most 10 files (`(+K more files)`); on `C.x` it points at the cgo preamble line that
+  declares `x`. Renaming a cgo-generated symbol is refused (rename the C symbol); cgo hover shows `C.x`.
 - **Name lookups outside the workspace** work for the read-only tools (`symbol_info`, `callers`,
   `implementations`): `json.Marshal`, `encoding/json.Decoder.Decode` or a symbol of a required dependency
   resolve through a scratch file that exists only as a gopls overlay (never on disk). A short qualifier is

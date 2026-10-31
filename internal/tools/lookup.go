@@ -151,6 +151,10 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool) s
 		outside = "; for a standard-library or dependency symbol spell the import path (math/rand.Int, github.com/x/y.Client.Do; the module must be in go.mod)."
 	}
 	switch {
+	case len(parts) > 1 && last == "":
+		msg += fmt.Sprintf(": %q ends with a dot; name the member after it (%sName), or drop the dot to look up %s itself.", query, query, strings.TrimSuffix(query, "."))
+	case len(parts) > 1 && first == "":
+		msg += fmt.Sprintf(": %q starts with a dot; write Type.Member or package.Name, or drop the dot to look up %s itself.", query, strings.TrimPrefix(query, "."))
 	case len(parts) == 1 && builtins[query]:
 		msg += ": " + query + " is a Go builtin (predeclared), with no declaration to show."
 	case len(parts) == 1 && packageDir(w.Root, query) != "":

@@ -4,6 +4,7 @@ package resolve
 import (
 	"context"
 	"fmt"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -339,6 +340,13 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 			}
 		}
 		if len(cands) > 0 && len(narrowed) == 0 {
+			fp := file
+			if !filepath.IsAbs(fp) {
+				fp = filepath.Join(root, fp)
+			}
+			if _, serr := os.Stat(fp); serr != nil {
+				return Symbol{}, toolerr.Inputf("File %q does not exist in the workspace; %q is declared in %d other place(s):\n%s", file, query, len(cands), candidateLines(cands, root))
+			}
 			return Symbol{}, toolerr.Inputf("No symbol %q in %q; %d match(es) elsewhere:\n%s", query, file, len(cands), candidateLines(cands, root))
 		}
 		cands = narrowed

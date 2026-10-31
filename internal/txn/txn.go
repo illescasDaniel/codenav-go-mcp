@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -270,6 +271,9 @@ func (j *Journal) CheckFresh(p *edits.EditPlan) error {
 			more = fmt.Sprintf(" (+%d more)", len(stale)-5)
 			stale = stale[:5]
 		}
+		if !p.Previewed {
+			return toolerr.Inputf("changed while the edit was being applied (another writer got there first): %s%s. Run the refactoring again.", strings.Join(stale, ", "), more)
+		}
 		return toolerr.Inputf("changed since the preview was made: %s%s. Run the refactoring again.", strings.Join(stale, ", "), more)
 	}
 	return nil
@@ -345,7 +349,10 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 	defer j.mu.Unlock()
 	if len(j.entries) == 0 {
 		if id != "" {
-			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server", id)
+			if j.undone[id] {
+				return nil, toolerr.Inputf("edit %q was already undone; no other edits are left to undo", id)
+			}
+			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server (or all were undone)", id)
 		}
 		return nil, toolerr.Inputf("nothing to undo: no edits were applied by this server")
 	}
@@ -360,7 +367,16 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			}
 		}
 		if idx < 0 {
-			return nil, toolerr.Inputf("unknown edit id %q (known: %s)", id, strings.Join(known, ", "))
+			msg := fmt.Sprintf("unknown edit id %q (known: %s", id, strings.Join(known, ", "))
+			var gone []string
+			for u := range j.undone {
+				gone = append(gone, u)
+			}
+			sort.Strings(gone)
+			if len(gone) > 0 {
+				msg += "; already undone: " + strings.Join(gone, ", ")
+			}
+			return nil, toolerr.Inputf("%s)", msg)
 		}
 	}
 	e := j.entries[idx]
@@ -459,6 +475,7 @@ func (s *PlanStore) Add(p *edits.EditPlan) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := newID()
+	p.Previewed = true
 	s.plans[id] = p
 	s.ids = append(s.ids, id)
 	if len(s.ids) > 20 {

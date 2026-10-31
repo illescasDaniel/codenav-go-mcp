@@ -414,7 +414,11 @@ func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int
 		lines = append(lines, fmt.Sprintf("(%d looser fuzzy match%s whose names don't contain %q hidden; pass fuzzy=true to list them)", hidden, s, query))
 	}
 	if weak > 0 {
-		lines = append(lines, fmt.Sprintf("(%d weak matches hidden)", weak))
+		what := "weak matches"
+		if weak == 1 {
+			what = "weak match"
+		}
+		lines = append(lines, fmt.Sprintf("(%d %s hidden; pass fuzzy=true to list them)", weak, what))
 	}
 	return strings.Join(lines, "\n")
 }

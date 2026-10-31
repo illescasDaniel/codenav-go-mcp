@@ -75,7 +75,7 @@ func TestConcurrentJournalsOnOneFileWriteOnce(t *testing.T) {
 	for _, err := range errs {
 		if err == nil {
 			ok++
-		} else if !strings.Contains(err.Error(), "changed since the preview") {
+		} else if !strings.Contains(err.Error(), "changed while the edit was being applied") {
 			t.Errorf("the loser must be told the file changed, got %v", err)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -312,11 +313,20 @@ const maxHoverBytes = 4096
 
 // adHocLink matches the pkg.go.dev link gopls prints for files outside any package (a `package main`
 // scratch file): the address is made up and leads nowhere.
+// fileLink: the file:// URLs gopls puts into stdlib doc links; the plain path reads better.
+var fileLink = regexp.MustCompile(`file://[^\s)\]>"]+`)
+
 var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/command-line-arguments[^)\n]*\)[ \t]*`)
 
 // tidyHover drops useless links and caps the length, keeping the head (signature and summary).
 func tidyHover(t string) string {
 	t = strings.TrimRight(adHocLink.ReplaceAllString(t, ""), "\n ")
+	t = fileLink.ReplaceAllStringFunc(t, func(m string) string {
+		if u, err := url.PathUnescape(strings.TrimPrefix(m, "file://")); err == nil {
+			return u
+		}
+		return m
+	})
 	if len(t) <= maxHoverBytes {
 		return t
 	}
@@ -463,7 +473,11 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", friendlyNavErr(err, in.FilePath, 0, 0)
 			}
-			return format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit), nil
+			out := format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit)
+			if src, _, rerr := edits.ReadSource(abs); rerr == nil && gomod.HasBuildConstraint(src) {
+				out += "\n(build-constrained: this file has a build constraint, and diagnostics only cover the current GOOS/GOARCH/tags; if the constraint excludes it here, it was not type-checked.)"
+			}
+			return out, nil
 		})
 
 	add(s, h, "symbol_info", "What is X and where is it used? e.g. name=\"Square.Area\". Header, hover, definition and references grouped by file.",
@@ -592,8 +606,68 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if len(locs) == 0 {
 				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
 			}
-			return splitTests(dropForeignUnexported(locs, w.Root), w.Root), nil
+			locs = dropForeignUnexported(locs, w.Root)
+			return implementerNames(locs) + splitTests(locs, w.Root), nil
 		})
+}
+
+// implementerNames lists the type behind each location ("Implementers: A, B, ..."), so the answer
+// names them before the source excerpts. "" when no location is inside a type or a method.
+func implementerNames(locs []lsp.Location) string {
+	const shown = 20
+	var names []string
+	seen := map[string]bool{}
+	for _, l := range locs {
+		p := lsp.URIToPath(l.URI)
+		text, _, err := edits.ReadSource(p)
+		if err != nil {
+			continue
+		}
+		off := edits.Offset(text, l.Range.Start.Line, l.Range.Start.Character)
+		name := enclosingTypeName(p, text, off)
+		if name == "" {
+			name = receiverTypeAt(p, text, off)
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	more := ""
+	if len(names) > shown {
+		more = fmt.Sprintf(", ... (+%d more)", len(names)-shown)
+		names = names[:shown]
+	}
+	return fmt.Sprintf("Types (%d): %s%s\n\n", len(seen), strings.Join(names, ", "), more)
+}
+
+// receiverTypeAt is the receiver type of the method declared around offset off ("" if none).
+func receiverTypeAt(filename, src string, off int) string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
+	if err != nil {
+		return ""
+	}
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Recv == nil || len(fd.Recv.List) == 0 || off < fset.Position(fd.Pos()).Offset || off >= fset.Position(fd.End()).Offset {
+			continue
+		}
+		t := fd.Recv.List[0].Type
+		if st, ok := t.(*ast.StarExpr); ok {
+			t = st.X
+		}
+		if ix, ok := t.(*ast.IndexExpr); ok {
+			t = ix.X
+		}
+		if id, ok := t.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
 }
 
 // dropForeignUnexported removes interfaces declared outside the workspace under an unexported name

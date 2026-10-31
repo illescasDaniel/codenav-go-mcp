@@ -260,6 +260,7 @@ type EditPlan struct {
 	Notes       []string
 	BaseHashes  map[string]string // path -> hash of bytes at plan time ("" = absent)
 	AllowLarge  bool              // allow_large was given when the plan was made; apply_edit honours it
+	Previewed   bool              // kept in the plan store: a preview exists for it
 }
 
 func NewPlan(desc string, changes []FileChange, notes ...string) *EditPlan {

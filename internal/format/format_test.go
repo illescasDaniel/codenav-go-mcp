@@ -20,7 +20,7 @@ func TestFuzzyHidesWeakMatches(t *testing.T) {
 	if strings.Contains(out, "ConfigRetryTTL") || strings.Contains(out, "MaxGroupRate") {
 		t.Fatalf("scattered matches must be hidden:\n%s", out)
 	}
-	if !strings.Contains(out, "(2 weak matches hidden)") {
+	if !strings.Contains(out, "(2 weak matches hidden; pass fuzzy=true to list them)") {
 		t.Fatalf("hidden count missing:\n%s", out)
 	}
 }

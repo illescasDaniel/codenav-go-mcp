@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -2368,5 +2369,48 @@ func TestBuildConstraintCheckUsesPostEditContent(t *testing.T) {
 	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "package shapes", "new_string": "//go:build ignore\n\npackage shapes", "apply": false})
 	if !strings.Contains(out, "not part of any package") {
 		t.Errorf("a file that just became ignored is not checked:\n%s", out)
+	}
+}
+
+func TestCosmeticMessages(t *testing.T) {
+	cs, root := session(t, nil)
+	if out := call(t, cs, "symbol_info", map[string]any{"name": "Shape."}); !strings.Contains(out, "ends with a dot") {
+		t.Errorf("trailing dot:\n%s", out)
+	}
+	if out := call(t, cs, "symbol_info", map[string]any{"name": ".Shape"}); !strings.Contains(out, "starts with a dot") {
+		t.Errorf("leading dot:\n%s", out)
+	}
+	if out := call(t, cs, "symbol_info", map[string]any{"name": "Square", "file_path": "nonexist.go"}); !strings.Contains(out, "does not exist") {
+		t.Errorf("missing file:\n%s", out)
+	}
+	writeFile(t, root, "shapes/one.go", "package shapes\n\ntype Box struct{ W int }\n")
+	call(t, cs, "edit_symbol", map[string]any{"action": "insert", "name": "Box", "position": "into", "file_path": "shapes/one.go", "source": "H int"})
+	if got := readFile(t, root, "shapes/one.go"); !strings.Contains(got, "type Box struct {\n\tW int\n\tH int\n}") {
+		t.Errorf("single-line struct must expand:\n%s", got)
+	}
+	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/one.go", "old_string": "W int", "new_string": "W, V int"})
+	id := regexp.MustCompile(`edit id (\w+)`).FindStringSubmatch(out)
+	if id == nil {
+		t.Fatalf("no edit id:\n%s", out)
+	}
+	call(t, cs, "undo_edit", map[string]any{"id": id[1]})
+	if out := call(t, cs, "undo_edit", map[string]any{"id": "nope"}); !strings.Contains(out, "already undone: "+id[1]) && !strings.Contains(out, id[1]) {
+		t.Errorf("unknown id must list known and undone ids:\n%s", out)
+	}
+}
+
+func TestHoverLinksImplementationsAndConstrainedDiagnostics(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/uses.go", "package shapes\n\nimport \"io\"\n\nvar _ io.Reader\n\nfunc F(r io.Reader) { _ = r }\n")
+	if out := call(t, cs, "hover", map[string]any{"file_path": "shapes/uses.go", "line": 5, "column": 10}); strings.Contains(out, "file://") {
+		t.Errorf("hover must not carry file:// links:\n%s", out)
+	}
+	out := call(t, cs, "implementations", map[string]any{"name": "Shape"})
+	if !strings.Contains(out, "Types (") || !strings.Contains(out, "Square") {
+		t.Errorf("implementations must name the types:\n%s", out)
+	}
+	writeFile(t, root, "shapes/lin.go", "//go:build linux || darwin\n\npackage shapes\n\nvar L = 1\n")
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/lin.go"}); !strings.Contains(out, "build-constrained") {
+		t.Errorf("diagnostics of a constrained file:\n%s", out)
 	}
 }
