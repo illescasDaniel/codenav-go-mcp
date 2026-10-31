@@ -495,9 +495,6 @@ func RestoreEOL(text, like string) string {
 	// newLines[i] for i < len(newLines)-1 is followed by a newline; the last part never is.
 	n := len(newLines) - 1
 	ends := make([]string, n)
-	for i := range ends {
-		ends[i] = eol
-	}
 	term := func(l string) (content, end string) {
 		if strings.HasSuffix(l, "\r\n") {
 			return l[:len(l)-2], "\r\n"
@@ -539,6 +536,24 @@ func RestoreEOL(text, like string) string {
 				gone = gone[1:]
 			}
 			j++
+		}
+	}
+	// An added line (no ending yet) takes the ending of its neighbour above, so inserted code looks
+	// like the code around it; at the top of the file it takes the one below; the dominant ending is
+	// only the last resort (a text with no ending of its own to copy).
+	for k := 1; k < n; k++ {
+		if ends[k] == "" {
+			ends[k] = ends[k-1]
+		}
+	}
+	for k := n - 2; k >= 0; k-- {
+		if ends[k] == "" {
+			ends[k] = ends[k+1]
+		}
+	}
+	for k := range ends {
+		if ends[k] == "" {
+			ends[k] = eol
 		}
 	}
 	var b strings.Builder
