@@ -25,7 +25,7 @@ type quickFixIn struct {
 	FixAll            bool   `json:"fix_all,omitempty" jsonschema:"instead of diagnostic fixes: apply gopls' source.fixAll to the whole file"`
 	Strict            *bool  `json:"strict,omitempty" jsonschema:"default false: apply nothing unless every targeted diagnostic gets a fix. With choice set the default is true when the choice fits only some diagnostics"`
 	Apply             *bool  `json:"apply,omitempty"`
-	MaxNewErrors      *int   `json:"max_new_errors,omitempty"`
+	MaxNewErrors      *int   `json:"max_new_errors,omitempty" jsonschema:"default 0; -1 = no limit; other negative values are refused"`
 	IncludeDependents *bool  `json:"include_dependents,omitempty"`
 }
 
@@ -437,7 +437,8 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 	for i, c := range changes {
 		// A file that was gofmt-clean stays so (a removal can leave blanks behind); a messy one keeps its text.
 		if c.Old != nil && c.New != nil && strings.HasSuffix(c.Path, ".go") {
-			if f, ferr := fileChange(c.Path, *c.New, c.Old, c.OldBOM); ferr == nil {
+			next := gosrc.DropOrphanImportComments(c.Path, *c.Old, *c.New)
+			if f, ferr := fileChange(c.Path, next, c.Old, c.OldBOM); ferr == nil {
 				f.NewBOM = c.NewBOM
 				changes[i] = f
 			}

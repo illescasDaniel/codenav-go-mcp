@@ -50,7 +50,7 @@ from your home directory. Prebuilt binaries are attached to each GitHub release.
 | `hover`, `definition`, `references` | Position tools: `file_path`, `line`, `column` (1-indexed). `diagnostics` takes `file_path` only |
 
 Names may be dotted: `Type.Method`, `Type.Field`, `pkg.Name` (`pkg` is the package name or its directory's name). `name` and `query` are
-aliases. A missing required parameter (of any tool) gets `Missing required parameter(s): x, y.` plus the tool's usage, not a raw schema error.
+aliases. A missing required parameter (of any tool; an explicit JSON `null` counts as missing, and as not given for an optional one) gets `Missing required parameter(s): x, y.` plus the tool's usage, not a raw schema error.
 
 ## Write tools: type check before every write
 
@@ -63,15 +63,15 @@ written until that is on the table. Output is gofmt-ed with imports fixed, excep
 |------|------|
 | `edit` | Type-checked text edit of a Go file: `old_string`/`new_string` or a whole `new_text` |
 | `edit_symbol` | `replace` / `insert` / `delete` a func, method, type, const or var by name; `imports=[...]` added. Delete refuses while the symbol is used. Replacing a struct type notes every field whose struct tag changed or that lost its tag with the field |
-| `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs. Renaming a field that carries a struct tag notes that the tag values (`json:"user_name"`, ...) were not changed |
+| `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs (for a method or field only selectors, declarations and literal keys count as code, so a package-level func of the same name is not listed; other packages count only as `pkg.Name`). Lower-case names of one or two letters (and `A`, `I`) are also English words, so in comments and text files they count only as `name`, [name], name( or .name; upper-case ones (`U`, `ID`) are searched like any name. A Go function exported to C with `//export` is refused, with the locations in the directive and the cgo preamble to change by hand. Renaming a field that carries a struct tag notes that the tag values (`json:"user_name"`, ...) were not changed |
 | `change_signature` | Add / remove / reorder parameters and rewrite every call site; linked methods follow. Uses as a value are listed as manual work |
 | `move` | With `name`: move a top-level func, type, const or var to another file, in the same or another package (qualifiers and imports rewritten; refuses unexported-use problems, import cycles and name clashes). Without `name`: move a package directory (`file_path` -> `to_file`) and rewrite every import |
-| `quick_fix` | Apply gopls's quick fixes (plus own fixes for `declared and not used`: mark it used, or remove it) and organize imports; ambiguous fixes are listed instead of guessed. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
+| `quick_fix` | Apply gopls's quick fixes (plus own fixes for `declared and not used`: mark it used, or remove it) and organize imports; ambiguous fixes are listed instead of guessed; organizing imports also drops the heading comments of the imports it removes. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
 | `verify_changes` | Which errors the uncommitted changes gained or lost against git `HEAD` (`include_dependents`) |
 | `apply_edit` / `undo_edit` | Write a previewed edit by id; revert an applied one |
 
 Every write tool writes when the edit adds no more than `max_new_errors` (default 0; `-1` =
-unlimited) errors. Otherwise nothing is written and you get the diagnostics plus an id for
+unlimited; other negative values are refused) errors. Otherwise nothing is written and you get the diagnostics plus an id for
 `apply_edit`. `apply=false` always previews.
 
 Safety rules, enforced in code:
@@ -106,7 +106,7 @@ constraints is invisible to the type check (the response says when an edit touch
 - **File paths** given to the read tools must lie in the workspace, GOROOT, the module cache or a
   `replace`/`use`-d directory; anything else (`../other-project/main.go`) is refused. `definition` on an
   import path lists at most 10 files (`(+K more files)`); on `C.x` it points at the cgo preamble line that
-  declares `x`. Renaming a cgo-generated symbol is refused (rename the C symbol); cgo hover shows `C.x`.
+  declares `x`. Renaming a cgo-generated symbol is refused (rename the C symbol); cgo hover shows `C.x`. Hover prints a pkg.go.dev link only for real module paths (none for a `replace`-d directory).
 - **Name lookups outside the workspace** work for the read-only tools (`symbol_info`, `callers`,
   `implementations`): `json.Marshal`, `encoding/json.Decoder.Decode` or a symbol of a required dependency
   resolve through a scratch file that exists only as a gopls overlay (never on disk). A short qualifier is

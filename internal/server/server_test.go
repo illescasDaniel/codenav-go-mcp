@@ -2414,3 +2414,96 @@ func TestHoverLinksImplementationsAndConstrainedDiagnostics(t *testing.T) {
 		t.Errorf("diagnostics of a constrained file:\n%s", out)
 	}
 }
+
+func TestRenameMethodIgnoresSameNamedFunc(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/area.go", "package shapes\n\n// Area is a package-level function, unrelated to Shape.Area.\nfunc Area(s Shape) float64 { return s.Area() }\n\nfunc other() float64 { return Area(Square{1}) }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Shape.Area", "new_name": "Surface", "apply": false})
+	if !strings.Contains(out, "Surface") || strings.Contains(out, "did not link") {
+		t.Errorf("a package-level func Area is not the renamed method and must not be listed:\n%s", out)
+	}
+}
+
+func TestRenameShortNamesFindMentions(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/gen.go", "package shapes\n\n// Map maps T to U; U is the result type.\nfunc Map[T, U any](xs []T, f func(T) U) []U {\n\tvar out []U\n\tfor _, x := range xs {\n\t\tout = append(out, f(x))\n\t}\n\treturn out\n}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "shapes/gen.go", "line": 4, "column": 13, "new_name": "Out", "apply": false})
+	if !strings.Contains(out, "appears in comments") || !strings.Contains(out, "U is the result type") {
+		t.Errorf("a short (upper-case) type parameter still named in the doc comment must be listed:\n%s", out)
+	}
+	writeFile(t, root, "shapes/f.go", "package shapes\n\nfunc F(x int) int { return x }\n")
+	writeFile(t, root, "other/o.go", "package other\n\nimport \"example.com/fx/shapes\"\n\nfunc F(x int) int { return x }\n\nvar _ = F(1) + shapes.F(2)\n")
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "shapes.F", "new_name": "G", "apply": false})
+	if strings.Contains(out, "did not link") {
+		t.Errorf("the other package's own F is another symbol and must not be listed:\n%s", out)
+	}
+}
+
+func TestNullCountsAsMissing(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "symbol_info", map[string]any{"name": nil})
+	if !strings.Contains(out, "Missing required parameter") && !strings.Contains(out, "Pass `name`") {
+		t.Errorf("a null name must get the friendly answer:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "shapes.Scale", "new_name": nil})
+	if !strings.Contains(out, "Missing required parameter(s): new_name") {
+		t.Errorf("a null required parameter must count as missing:\n%s", out)
+	}
+	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "unused int", "new_string": "unused int, v int", "apply": false, "max_new_errors": nil})
+	if strings.Contains(out, "validating") {
+		t.Errorf("a null optional parameter must be ignored:\n%s", out)
+	}
+}
+
+func TestNegativeMaxNewErrorsRefused(t *testing.T) {
+	cs, root := session(t, nil)
+	args := map[string]any{"file_path": "shapes/shapes.go", "old_string": scaleSig, "new_string": "func Scale(s Shape, k float64)", "max_new_errors": -5}
+	out := call(t, cs, "edit", args)
+	if !strings.Contains(out, "max_new_errors=-5 is invalid") || !strings.Contains(readFile(t, root, "shapes/shapes.go"), scaleSig) {
+		t.Errorf("max_new_errors=-5 must be refused and write nothing:\n%s", out)
+	}
+	args["max_new_errors"] = -1
+	if out := call(t, cs, "edit", args); !strings.Contains(out, "Applied") {
+		t.Errorf("max_new_errors=-1 means no limit:\n%s", out)
+	}
+}
+
+func TestReplacedDirectoryIsReadable(t *testing.T) {
+	cs, root := session(t, nil)
+	dep := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-outdep")
+	writeFile(t, dep, "go.mod", "module example.com/outdep\n\ngo 1.22\n")
+	writeFile(t, dep, "o.go", "package outdep\n\n// Hello says hi.\nfunc Hello() string { return \"hi\" }\n")
+	writeFile(t, root, "go.mod", "module example.com/fx\n\ngo 1.24\n\nrequire example.com/outdep v0.0.0\n\nreplace example.com/outdep => ../"+filepath.Base(dep)+"\n")
+	writeFile(t, root, "use/use.go", "package use\n\nimport \"example.com/outdep\"\n\nfunc Use() string { return outdep.Hello() }\n")
+	out := call(t, cs, "outline", map[string]any{"file_path": filepath.Join(dep, "o.go")})
+	if !strings.Contains(out, "Hello") {
+		t.Errorf("a replace-d directory must be readable:\n%s", out)
+	}
+	out = call(t, cs, "hover", map[string]any{"file_path": "use/use.go", "line": 5, "column": 36})
+	if !strings.Contains(out, "Hello says hi") || strings.Contains(out, "pkg.go.dev") {
+		t.Errorf("hover on a replaced module must not link pkg.go.dev:\n%s", out)
+	}
+}
+
+func TestRenameCgoExportedFuncRefused(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cx/cx.go", "package cx\n\n/*\nextern int goAdd(int, int);\nstatic int callGo(int a, int b) { return goAdd(a, b); }\n*/\nimport \"C\"\n\n//export goAdd\nfunc goAdd(a, b C.int) C.int { return a + b }\n\nfunc Run() int { return int(C.callGo(1, 2)) }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "cx.goAdd", "new_name": "goSum"})
+	if !strings.Contains(out, "exported to C") || !strings.Contains(out, "cx.go:9 (//export goAdd)") || !strings.Contains(out, "cx.go:5:") {
+		t.Errorf("renaming a //export func must be refused with the locations:\n%s", out)
+	}
+	if !strings.Contains(readFile(t, root, "cx/cx.go"), "func goAdd") {
+		t.Error("nothing may be written")
+	}
+}
+
+func TestOrganizeImportsDropsOrphanHeadings(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/imp.go", "package shapes\n\nimport (\n\t// Standard library\n\t\"fmt\"\n\n\t// Unused one\n\t\"os\"\n\n\t// Unused two\n\t\"sort\" // trailing\n)\n\nfunc Show() string { return fmt.Sprint(1) }\n")
+	out := call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/imp.go", "organize_imports": true})
+	got := readFile(t, root, "shapes/imp.go")
+	if !strings.Contains(out, "Applied") || strings.Contains(got, "Unused") || strings.Contains(got, "trailing") || !strings.Contains(got, "// Standard library") {
+		t.Errorf("headings of removed imports must go with them:\n%s\n%s", out, got)
+	}
+}
