@@ -306,7 +306,14 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		text string
 		bom  bool
 	}{l.text, l.bom}
-	off := func(p token.Pos) int { return fset.Position(p).Offset }
+	// Offsets in a file that starts with a BOM count its 3 bytes; the text we edit has them stripped.
+	off := func(p token.Pos) int {
+		pos := fset.Position(p)
+		if _, b, err := read(pos.Filename); err == nil && b {
+			return pos.Offset - len("\xef\xbb\xbf")
+		}
+		return pos.Offset
+	}
 
 	// The declaration and, for a type, its methods wherever they live in the package.
 	spans := []span{{file: l.path, snippet: 0}}
@@ -356,8 +363,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		if !p.IsValid() {
 			return false
 		}
-		pos := fset.Position(p)
-		return inSpan(pos.Filename, pos.Offset) >= 0
+		return inSpan(fset.Position(p).Filename, off(p)) >= 0
 	}
 
 	var refusals []string

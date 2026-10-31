@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -264,8 +265,16 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	}
 
 	var order []entry
-	var manual []string
-	manualSeen := map[string]bool{} // linked members share references; list each use once
+	// Uses that need manual work, listed once per source line (with a count when a line has several).
+	type manualLine struct {
+		where string
+		uses  int
+		whys  []string
+	}
+	var manual []*manualLine
+	manualByLine := map[string]*manualLine{}
+	manualSeen := map[string]bool{} // linked members share references; count each use once
+	manualUses := 0
 	calls, dropped := 0, 0
 	for mi, m := range members {
 		fs, err := state(m.path)
@@ -310,9 +319,22 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 			where := fmt.Sprintf("%s:%d: %s", edits.RelativeName(rfs.path, w.Root), r.Range.Start.Line+1, rfs.parse.Line(off))
 			c := rfs.parse.CallAt(off)
 			addManual := func(why string) {
-				if key := fmt.Sprintf("%s:%d", rfs.path, off); !manualSeen[key] {
-					manualSeen[key] = true
-					manual = append(manual, where+"  ("+why+")")
+				key := fmt.Sprintf("%s:%d", rfs.path, off)
+				if manualSeen[key] {
+					return
+				}
+				manualSeen[key] = true
+				manualUses++
+				lk := fmt.Sprintf("%s:%d", rfs.path, r.Range.Start.Line)
+				ml := manualByLine[lk]
+				if ml == nil {
+					ml = &manualLine{where: where}
+					manualByLine[lk] = ml
+					manual = append(manual, ml)
+				}
+				ml.uses++
+				if !slices.Contains(ml.whys, why) {
+					ml.whys = append(ml.whys, why)
 				}
 			}
 			switch {
@@ -330,7 +352,6 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 				continue
 			}
 			rfs.seen[c.Start] = true
-			calls++
 			for i, h := range have {
 				keep := false
 				for _, e := range order {
@@ -346,7 +367,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 				}
 			}
 			ord, fx := order, fixed
-			rfs.es = append(rfs.es, sigEdit{start: c.Start, end: c.End, args: c.Args, build: func(args []string) string {
+			build := func(args []string) string {
 				var out []string
 				for _, e := range ord {
 					switch {
@@ -359,7 +380,15 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 					}
 				}
 				return strings.Join(out, ", ")
-			}})
+			}
+			argTexts := make([]string, len(c.Args))
+			for k, r := range c.Args {
+				argTexts[k] = rfs.text[r[0]:r[1]]
+			}
+			if build(argTexts) != strings.Join(argTexts, ", ") { // a no-op reorder leaves the call as it is
+				calls++
+			}
+			rfs.es = append(rfs.es, sigEdit{start: c.Start, end: c.End, args: c.Args, build: build})
 		}
 	}
 
@@ -396,6 +425,9 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	}
 
 	notes := []string{fmt.Sprintf("Updated %d call site(s).", calls)}
+	if len(changes) == 0 {
+		notes = []string{"No change: the parameter list is already as requested."}
+	}
 	notes = append(notes, importNotes...)
 	if len(members) > 1 {
 		notes = append(notes, fmt.Sprintf("Changed %d interface/implementing method declarations together.", len(members)))
@@ -407,7 +439,16 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		notes = append(notes, fmt.Sprintf("%d argument expression(s) were dropped; check they had no side effects.", dropped))
 	}
 	if len(manual) > 0 {
-		notes = append(notes, fmt.Sprintf("%d use(s) need manual work:\n    %s", len(manual), strings.Join(manual[:min(len(manual), 12)], "\n    ")))
+		lines := make([]string, min(len(manual), 12))
+		for i := range lines {
+			ml := manual[i]
+			why := strings.Join(ml.whys, "; ")
+			if ml.uses > 1 {
+				why = fmt.Sprintf("%d uses: %s", ml.uses, why)
+			}
+			lines[i] = ml.where + "  (" + why + ")"
+		}
+		notes = append(notes, fmt.Sprintf("%d use(s) need manual work:\n    %s", manualUses, strings.Join(lines, "\n    ")))
 	}
 	plan := edits.NewPlan("change_signature "+in.Name, changes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)

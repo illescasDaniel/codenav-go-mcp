@@ -13,7 +13,7 @@ func sym(name string) *lsp.Symbol {
 
 func TestFuzzyHidesWeakMatches(t *testing.T) {
 	syms := []*lsp.Symbol{sym("ConfigRetryTTL"), sym("Greeting"), sym("MaxGroupRate"), sym("Greet")}
-	out := FormatWorkspaceSymbols(syms, "/r", "grt", 50, true)
+	out := FormatWorkspaceSymbols(syms, "/r", "grt", 50, false)
 	if !strings.Contains(out, "Greet") || !strings.Contains(out, "Greeting") {
 		t.Fatalf("compact matches must stay:\n%s", out)
 	}
@@ -22,6 +22,17 @@ func TestFuzzyHidesWeakMatches(t *testing.T) {
 	}
 	if !strings.Contains(out, "(2 weak matches hidden)") {
 		t.Fatalf("hidden count missing:\n%s", out)
+	}
+}
+
+func TestFuzzyTrueListsWeakMatches(t *testing.T) {
+	syms := []*lsp.Symbol{sym("ConfigRetryTTL"), sym("Greeting"), sym("MaxGroupRate"), sym("Greet")}
+	out := FormatWorkspaceSymbols(syms, "/r", "grt", 50, true)
+	if !strings.Contains(out, "ConfigRetryTTL") || !strings.Contains(out, "MaxGroupRate") || strings.Contains(out, "hidden") {
+		t.Fatalf("fuzzy=true must list the weak matches:\n%s", out)
+	}
+	if strings.Index(out, "Greet") > strings.Index(out, "ConfigRetryTTL") {
+		t.Fatalf("weak matches go last:\n%s", out)
 	}
 }
 

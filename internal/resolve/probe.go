@@ -97,7 +97,13 @@ func Probe(ctx context.Context, c *lsp.Client, root, query string, known map[str
 			reasons = append(reasons, reason)
 			continue
 		}
-		hits = append(hits, sym)
+		dup := false
+		for _, h := range hits { // two readings of the name can land on one declaration
+			dup = dup || (canonPath(h.URI) == canonPath(sym.URI) && h.Line == sym.Line && h.Column == sym.Column)
+		}
+		if !dup {
+			hits = append(hits, sym)
+		}
 		if fullPath {
 			break
 		}

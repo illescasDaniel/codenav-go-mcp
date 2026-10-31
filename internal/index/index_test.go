@@ -109,3 +109,30 @@ func TestLookupExactBeatsManySimilar(t *testing.T) {
 		t.Errorf("prefix U: %d", n)
 	}
 }
+
+func TestUncompiledFilesAreSkipped(t *testing.T) {
+	root := t.TempDir()
+	put := func(name, src string) {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("ok.go", "package p\n\nfunc Seen() {}\n")
+	put("_under.go", "package p\n\nfunc Under() {}\n")
+	put(".dot.go", "package p\n\nfunc Dot() {}\n")
+	put("ign.go", "//go:build ignore\n\npackage main\n\nfunc Ign() {}\n")
+	put("ign2.go", "//go:build ignore && linux\n\npackage main\n\nfunc Ign2() {}\n")
+	put("win.go", "//go:build !linux\n\npackage p\n\nfunc Win() {}\n")
+	ix := New(root)
+	if err := ix.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]bool{"Seen": true, "Win": true, "Under": false, "Dot": false, "Ign": false, "Ign2": false} {
+		if ex, _ := ix.Lookup(name); (len(ex) > 0) != want {
+			t.Errorf("%s indexed = %v, want %v", name, len(ex) > 0, want)
+		}
+	}
+	if !Unbuildable(filepath.Join(root, "ign.go")) || Unbuildable(filepath.Join(root, "win.go")) || !Unbuildable(filepath.Join(root, "_under.go")) {
+		t.Error("Unbuildable disagrees with the index")
+	}
+}

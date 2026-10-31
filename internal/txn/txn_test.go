@@ -132,6 +132,31 @@ func TestUndoRefusesStale(t *testing.T) {
 	}
 }
 
+func TestUndoNamesLaterEditsToUndoFirst(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.go")
+	write(t, a, "one\n")
+	j := NewJournal(WriteGuard{Root: root})
+	e1, err := j.Apply(edits.NewPlan("first edit", []edits.FileChange{change(t, a, "one\n", "two\n")}), false, "ENV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := j.Apply(edits.NewPlan("second edit", []edits.FileChange{change(t, a, "two\n", "three\n")}), false, "ENV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = j.Undo(e1.ID, "ENV")
+	if err == nil || !strings.Contains(err.Error(), e2.ID) || !strings.Contains(err.Error(), "second edit") || !strings.Contains(err.Error(), "undo them first") {
+		t.Errorf("want the later edit named, got %v", err)
+	}
+	if _, err := j.Undo(e2.ID, "ENV"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Undo(e1.ID, "ENV"); err != nil {
+		t.Errorf("undoing in order works: %v", err)
+	}
+}
+
 func TestApplyRefusesStalePlanAndReadOnly(t *testing.T) {
 	root := t.TempDir()
 	a := filepath.Join(root, "a.go")

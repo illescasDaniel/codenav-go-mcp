@@ -163,7 +163,20 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 		}
 		return a.Line < b.Line
 	})
-	return found
+	// One entry per line and kind: `U` twice in `Map[T, U any]` is one place to look at.
+	type key struct {
+		path, kind string
+		line       int
+	}
+	seenLine := map[key]bool{}
+	uniq := found[:0]
+	for _, m := range found {
+		if k := (key{m.Path, m.Kind, m.Line}); !seenLine[k] {
+			seenLine[k] = true
+			uniq = append(uniq, m)
+		}
+	}
+	return uniq
 }
 
 // Notes renders one note per kind: a heading plus a few example lines.

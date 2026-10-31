@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode/utf16"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
@@ -163,6 +164,40 @@ func lookup(ctx context.Context, c *lsp.Client, query, last string) ([]*lsp.Symb
 	return all, nil
 }
 
+// canonPath is the symlink-free path of a file URI, so one declaration reached through two spellings
+// (a replace directive, a symlinked checkout, the index's walk vs gopls's view) compares equal.
+func canonPath(uri string) string {
+	if p, ok := canonCache.Load(uri); ok {
+		return p.(string)
+	}
+	p := evalLink(filepath.Clean(lsp.URIToPath(uri)))
+	canonCache.Store(uri, p)
+	return p
+}
+
+// canonCache memoises canonPath (one syscall per file instead of one per comparison).
+var canonCache sync.Map
+
+// dedupeSymbols drops later symbols that sit at the same file, line and column as an earlier one.
+func dedupeSymbols(in []*lsp.Symbol) []*lsp.Symbol {
+	type key struct {
+		file      string
+		line, col int
+	}
+	seen := map[key]bool{}
+	var out []*lsp.Symbol
+	for _, s := range in {
+		uri, l, c := format.SymbolPosition(s)
+		k := key{canonPath(uri), l, c}
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, s)
+	}
+	return out
+}
+
 // FromEntry converts an index entry to a workspace symbol; Detail carries the build constraint.
 func FromEntry(e index.Entry) *lsp.Symbol {
 	end := e.Col
@@ -189,10 +224,10 @@ func merge(ix *index.Index, query string, exact, loose []*lsp.Symbol) (ex, lo []
 	ie, il := ix.Lookup(query)
 	fold := func(have []*lsp.Symbol, entries []index.Entry) []*lsp.Symbol {
 		for _, e := range entries {
-			uri := lsp.PathToURI(e.File)
+			uri := canonPath(lsp.PathToURI(e.File))
 			var hit *lsp.Symbol
 			for _, s := range have {
-				if _, l, _ := format.SymbolPosition(s); s.Location.URI == uri && l == e.Line {
+				if _, l, _ := format.SymbolPosition(s); l == e.Line && canonPath(s.Location.URI) == uri {
 					hit = s
 					break
 				}
@@ -235,7 +270,7 @@ func Resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		}
 	}
 	exact, loose, onlyIndex := merge(ix, query, exact, loose)
-	exact, loose = format.Rank(exact, last), format.Rank(loose, last)
+	exact, loose = dedupeSymbols(format.Rank(exact, last)), dedupeSymbols(format.Rank(loose, last))
 	// A case-exact match beats a merely case-insensitive one.
 	cands := exact
 	if len(cands) == 0 {

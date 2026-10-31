@@ -48,3 +48,22 @@ func TestFindShortName(t *testing.T) {
 		t.Fatalf("only=b.go: %v", only)
 	}
 }
+
+func TestFindListsALineOnce(t *testing.T) {
+	root := t.TempDir()
+	src := "package p\n\ntype Map[T, U any] struct{ m map[T]U }\n\nfunc F[U any](u U) U { return u }\n"
+	_ = os.WriteFile(filepath.Join(root, "a.go"), []byte(src), 0o644)
+	ms := Find(root, "U", nil, "")
+	lines := map[int]int{}
+	for _, m := range ms {
+		lines[m.Line]++
+	}
+	for l, n := range lines {
+		if n != 1 {
+			t.Errorf("line %d listed %d times: %v", l, n, ms)
+		}
+	}
+	if len(lines) != 2 {
+		t.Errorf("want lines 3 and 5, got %v", lines)
+	}
+}

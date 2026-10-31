@@ -212,8 +212,8 @@ func looseSpan(name, query string) (span int, ok bool) {
 	return 0, false
 }
 
-// dropWeak removes the weak tier-4 matches from the ranked list and orders the rest by span.
-func dropWeak(ranked []*lsp.Symbol, query string) (kept []*lsp.Symbol, weak int) {
+// dropWeak splits the weak tier-4 matches off the ranked list and orders the rest by span.
+func dropWeak(ranked []*lsp.Symbol, query string) (kept, weak []*lsp.Symbol) {
 	type spanned struct {
 		s    *lsp.Symbol
 		span int
@@ -227,7 +227,7 @@ func dropWeak(ranked []*lsp.Symbol, query string) (kept []*lsp.Symbol, weak int)
 		if span, ok := looseSpan(s.Name, query); ok {
 			tail = append(tail, spanned{s, span})
 		} else {
-			weak++
+			weak = append(weak, s)
 		}
 	}
 	sort.SliceStable(tail, func(i, j int) bool { return tail[i].span < tail[j].span })
@@ -390,7 +390,13 @@ func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int
 	}
 	weak := 0
 	if query != "" {
-		ranked, weak = dropWeak(ranked, query)
+		var w []*lsp.Symbol
+		ranked, w = dropWeak(ranked, query)
+		if fuzzy {
+			ranked = append(ranked, w...) // asked for: the weak matches are listed, last
+		} else {
+			weak = len(w)
+		}
 	}
 	shown := ranked[:min(len(ranked), max(0, limit))]
 	lines := make([]string, len(shown))

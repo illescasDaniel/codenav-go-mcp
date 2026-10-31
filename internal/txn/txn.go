@@ -377,7 +377,21 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 		}
 	}
 	if len(stale) > 0 {
-		return nil, toolerr.Inputf("cannot undo %s: changed since it was applied: %s", e.ID, strings.Join(stale[:min(5, len(stale))], ", "))
+		msg := fmt.Sprintf("cannot undo %s: changed since it was applied: %s", e.ID, strings.Join(stale[:min(5, len(stale))], ", "))
+		// A later edit that touched the same files is the usual cause: say which to undo first.
+		var later []string
+		for i := len(j.entries) - 1; i > idx; i-- {
+			for path := range e.AppliedHashes {
+				if _, ok := j.entries[i].AppliedHashes[path]; ok {
+					later = append(later, fmt.Sprintf("%s (%s)", j.entries[i].ID, j.entries[i].Plan.Description))
+					break
+				}
+			}
+		}
+		if len(later) > 0 {
+			msg += "; later edit(s) touched the same files, undo them first (latest first): " + strings.Join(later, ", ")
+		}
+		return nil, toolerr.Inputf("%s", msg)
 	}
 	inv := e.Plan.Inverse()
 	if err := j.Guard.CheckWritesEnabled(readOnlyHint); err != nil {

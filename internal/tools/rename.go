@@ -184,6 +184,15 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		}
 		return nil, toolerr.Inputf("nothing renameable at %s:%d:%d.", edits.RelativeName(root.path, w.Root), root.line+1, root.col+1)
 	}
+	if in.Parameter == "" {
+		// A use of a standard-library or dependency symbol: name the file that declares it (the plan's
+		// first file would be an arbitrary one, such as doc.go).
+		if defs, derr := w.Client.Definition(ctx, root.path, root.line+1, root.col+1); derr == nil && len(defs) > 0 {
+			if dp := lsp.URIToPath(defs[0].URI); dp != "" && !w.inWorkspace(dp) {
+				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace %s; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), dp, defs[0].Range.Start.Line+1, w.Root)
+			}
+		}
+	}
 	text, _, err := edits.ReadSource(root.path)
 	if err != nil {
 		return nil, err
@@ -262,7 +271,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		notes = append(notes, fmt.Sprintf("%s is an embedded field; renaming it also renames the type %s (and every other embedding of it).", oldName, oldName))
 	}
 	if in.Parameter == "" {
-		if n := fieldTagNote(ctx, w, root.path, text, rng, oldName); n != "" {
+		if n := fieldTagNote(ctx, w, root.path, text, rng, oldName, in.NewName); n != "" {
 			notes = append(notes, n)
 		}
 	}
@@ -561,7 +570,7 @@ func uniqueSorted(xs []string) []string {
 // fieldTagNote says that the struct field being renamed carries a struct tag: gopls renames the Go
 // identifier only, so the serialised name (json, db, yaml, xml, ...) stays as the tag has it. rng is the
 // renamed identifier in text (file path); a rename started at a use is followed to the field's declaration.
-func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp.Range, oldName string) string {
+func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp.Range, oldName, newName string) string {
 	declPath, declText, off := path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)
 	if defs, err := w.Client.Definition(ctx, path, rng.Start.Line+1, rng.Start.Character+1); err == nil && len(defs) > 0 {
 		if p := lsp.URIToPath(defs[0].URI); p != "" {
@@ -577,6 +586,9 @@ func fieldTagNote(ctx context.Context, w *Workspace, path, text string, rng *lsp
 	extra := ""
 	if gosrc.TagNamesField(tag, oldName) {
 		extra = fmt.Sprintf(" (a tag value equals the old name %s, so it no longer matches the field)", oldName)
+	}
+	if gosrc.TagNamesField(tag, newName) {
+		extra += fmt.Sprintf(" (a tag value already equals the new name %s)", newName)
 	}
 	return fmt.Sprintf("field %s has struct tags (%s); the tag values were not changed - serialised names stay the same / update them if the wire format should change%s.", oldName, gosrc.FormatTag(tag), extra)
 }

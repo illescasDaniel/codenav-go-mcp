@@ -81,7 +81,23 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 		return "", "", err
 	}
 	plan.Notes = append(plan.Notes, nestedModuleNotes(w.Root, planPaths(plan))...)
+	plan.Notes = append(plan.Notes, unformattedNotes(w.Root, plan)...)
 	return conclude(w, plan, delta, apply, maxNew, allowLarge)
+}
+
+// unformattedNotes names the modified files that were not gofmt-clean before the edit and are not now:
+// they were left as they were so the diff shows the edit only.
+func unformattedNotes(root string, plan *edits.EditPlan) []string {
+	var names []string
+	for _, c := range plan.Changes {
+		if c.Old != nil && c.New != nil && strings.HasSuffix(c.Path, ".go") && !isGofmted(c.Path, *c.New) {
+			names = append(names, edits.RelativeName(c.Path, root))
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("not gofmt-clean before the edit, so not reformatted (the diff shows the edit only; run gofmt -w to format): %s", strings.Join(names[:min(len(names), 5)], ", "))}
 }
 
 // nestedModuleNotes warns when edited files belong to a module the workspace does not build (a
@@ -270,12 +286,24 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
 }
 
+// isGofmted reports whether text (any line endings) is what gofmt/goimports would leave unchanged.
+func isGofmted(abs, text string) bool {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	f, err := gosrc.Format(abs, text)
+	return err == nil && f == text
+}
+
 // fileChange turns the complete new text of one file into a change: gofmt-ed, line endings and BOM
-// of the old file kept. old is nil for a new file.
+// of the old file kept. old is nil for a new file. An existing file that was not gofmt-clean before the
+// edit is not reformatted (the diff would be full of unrelated changes); it still has to parse, and
+// unformattedNotes says so.
 func fileChange(abs, next string, old *string, bom bool) (edits.FileChange, error) {
 	formatted, err := gosrc.Format(abs, strings.ReplaceAll(next, "\r\n", "\n"))
 	if err != nil {
 		return edits.FileChange{}, err
+	}
+	if old != nil && !isGofmted(abs, *old) {
+		formatted = strings.ReplaceAll(next, "\r\n", "\n")
 	}
 	c := edits.FileChange{Path: abs, NewBOM: bom}
 	if old != nil {

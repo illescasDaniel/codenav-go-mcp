@@ -109,8 +109,8 @@ func (ix *Index) Refresh() error {
 			}
 			return nil
 		}
-		if !strings.HasSuffix(p, ".go") {
-			return nil
+		if !strings.HasSuffix(p, ".go") || strings.HasPrefix(d.Name(), "_") || strings.HasPrefix(d.Name(), ".") {
+			return nil // the go tool never compiles _x.go and .x.go
 		}
 		if n++; n > maxFiles {
 			return filepath.SkipAll
@@ -269,6 +269,38 @@ func headerConstraint(f *ast.File) string {
 	return plus
 }
 
+// Unbuildable reports whether the go tool never compiles the file whatever the build flags: a name
+// starting with `_` or `.`, or a `//go:build ignore` header.
+func Unbuildable(path string) bool {
+	if base := filepath.Base(path); strings.HasPrefix(base, "_") || strings.HasPrefix(base, ".") {
+		return true
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	f, _ := parser.ParseFile(token.NewFileSet(), path, src, parser.PackageClauseOnly|parser.ParseComments)
+	return f != nil && f.Name != nil && neverBuilt(headerConstraint(f))
+}
+
+// neverBuilt: the constraint needs the conventional "ignore" tag (//go:build ignore), which no build sets,
+// whatever the other tags are. Such files are scratch programs and generators, not part of any package.
+func neverBuilt(cons string) bool {
+	if !constraint.IsGoBuild(cons) {
+		return false
+	}
+	expr, err := constraint.Parse(cons)
+	if err != nil {
+		return false
+	}
+	for _, other := range []bool{true, false} {
+		if expr.Eval(func(tag string) bool { return tag != "ignore" && other }) {
+			return false
+		}
+	}
+	return true
+}
+
 // utf16Col is the UTF-16 length of the line's text before byte offset off.
 func utf16Col(src []byte, lineStart, off int) int {
 	n := 0
@@ -293,6 +325,9 @@ func parseFile(path string) []Entry {
 	}
 	tf := fset.File(f.Pos())
 	cons := headerConstraint(f)
+	if neverBuilt(cons) {
+		return nil
+	}
 	if cons == "" {
 		cons = nameConstraint(path)
 	}

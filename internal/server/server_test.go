@@ -1633,8 +1633,8 @@ func TestSymbolIndexListsBuildTaggedDuplicates(t *testing.T) {
 
 func TestSymbolIndexSeesNewDirectoryWithoutGopls(t *testing.T) {
 	cs, root := session(t, nil)
-	// An ignored-by-build file in a brand-new directory is never loaded by gopls; only the index has it.
-	writeFile(t, root, "fresh/z.go", "//go:build ignore\n\npackage fresh\n\ntype Zed struct{ Name string }\n\nfunc (z Zed) Hello() {}\n")
+	// A tag-excluded file in a brand-new directory is never loaded by gopls; only the index has it.
+	writeFile(t, root, "fresh/z.go", "//go:build !linux\n\npackage fresh\n\ntype Zed struct{ Name string }\n\nfunc (z Zed) Hello() {}\n")
 	out := call(t, cs, "search_symbol", map[string]any{"query": "Zed"})
 	if !strings.Contains(out, "Zed  [struct]  (fresh/z.go:5:6)") {
 		t.Errorf("search_symbol must find the new directory's type at once:\n%s", out)
@@ -1737,5 +1737,216 @@ func TestEditSymbolReplaceStructTagNotes(t *testing.T) {
 		"source": "type User struct {\n\tName string `json:\"name\"`\n\tAge  int    `json:\"age\"`\n\tExtra int\n}"})
 	if strings.Contains(out, "struct tag") {
 		t.Errorf("unchanged tags and an added field need no note:\n%s", out)
+	}
+}
+
+func TestMoveCrossPackageCallersWithBOM(t *testing.T) {
+	cs, root := session(t, nil)
+	const bom = "\xef\xbb\xbf"
+	writeFile(t, root, "bom/a.go", "package bom\n\nfunc Gamma() int { return 1 }\n")
+	writeFile(t, root, "bom/b.go", bom+"package bom\n\nfunc B() int { return Gamma() }\n")
+	writeFile(t, root, "bom/c.go", bom+"package bom\n\nfunc C() int { return Gamma() }\n")
+	writeFile(t, root, "bom/d.go", "package bom\n\nfunc D() int { return Gamma() }\n")
+	out := call(t, cs, "move", map[string]any{"name": "bom.Gamma", "to_file": "bom/sub/new.go"})
+	if strings.Contains(out, "new error") && !strings.Contains(out, "0 new error") {
+		t.Fatalf("move must type-check:\n%s", out)
+	}
+	for _, f := range []string{"bom/b.go", "bom/c.go", "bom/d.go"} {
+		got := readFile(t, root, f)
+		if !strings.Contains(got, "return sub.Gamma() }") || !strings.Contains(got, `"example.com/fx/bom/sub"`) {
+			t.Errorf("%s not rewritten correctly:\n%s", f, got)
+		}
+		if strings.HasPrefix(got, bom) != (f != "bom/d.go") {
+			t.Errorf("%s: BOM not preserved", f)
+		}
+	}
+}
+
+func TestBOMFilesAcrossWriteTools(t *testing.T) {
+	cs, root := session(t, nil)
+	const bom = "\xef\xbb\xbf"
+	writeFile(t, root, "bom/a.go", bom+"package bom\n\nfunc Delta(a int) int { return a }\n\nfunc One() int { return Delta(1) }\n")
+	writeFile(t, root, "bom/b.go", bom+"package bom\n\nfunc Two() int {\n\tx := 1\n\treturn Delta(2)\n}\n")
+	out := call(t, cs, "change_signature", map[string]any{"name": "bom.Delta", "add": []map[string]any{{"name": "k", "type": "int", "value": "0"}}})
+	if !strings.Contains(readFile(t, root, "bom/b.go"), "Delta(2, 0)") || !strings.Contains(readFile(t, root, "bom/a.go"), "Delta(1, 0)") {
+		t.Fatalf("change_signature with BOM files:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "bom.Delta", "new_name": "Dx"})
+	if !strings.Contains(readFile(t, root, "bom/b.go"), "Dx(2, 0)") {
+		t.Fatalf("rename with BOM files:\n%s", out)
+	}
+	out = call(t, cs, "quick_fix", map[string]any{"file_path": "bom/b.go", "choice": "Mark x as used"})
+	if !strings.Contains(readFile(t, root, "bom/b.go"), "_ = x") {
+		t.Fatalf("quick_fix with BOM file:\n%s", out)
+	}
+	out = call(t, cs, "edit_symbol", map[string]any{"action": "replace", "name": "bom.Two", "source": "func Two() int { return Dx(3, 1) }"})
+	for _, f := range []string{"bom/a.go", "bom/b.go"} {
+		if got := readFile(t, root, f); !strings.HasPrefix(got, bom+"package bom") {
+			t.Errorf("%s lost its BOM or got mangled: %q", f, got)
+		}
+	}
+	if got := readFile(t, root, "bom/b.go"); !strings.Contains(got, "return Dx(3, 1)") {
+		t.Fatalf("edit_symbol with BOM file:\n%s\n%s", out, got)
+	}
+}
+
+func TestUncompiledFilesAreNotIndexedAndFailFriendly(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/_under.go", "package shapes\n\nfunc UnderZQ() int { return 1 }\n")
+	writeFile(t, root, "shapes/.dot.go", "package shapes\n\nfunc DotZQ() int { return 1 }\n")
+	writeFile(t, root, "shapes/ign.go", "//go:build ignore\n\npackage main\n\nfunc IgnZQ() int { return 1 }\n")
+	for _, q := range []string{"UnderZQ", "DotZQ", "IgnZQ"} {
+		if out := call(t, cs, "search_symbol", map[string]any{"query": q}); !strings.Contains(out, "No symbols matching") {
+			t.Errorf("%s must not be listed:\n%s", q, out)
+		}
+	}
+	const want = "is not part of any package the Go toolchain builds"
+	for _, tool := range []string{"hover", "definition", "references"} {
+		out := call(t, cs, tool, map[string]any{"file_path": "shapes/_under.go", "line": 3, "column": 6})
+		if !strings.Contains(out, want) || strings.Contains(out, "LSP error") {
+			t.Errorf("%s on an uncompiled file:\n%s", tool, out)
+		}
+	}
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/_under.go"}); !strings.Contains(out, want) || strings.Contains(out, "LSP error") {
+		t.Errorf("diagnostics on an uncompiled file:\n%s", out)
+	}
+	if out := call(t, cs, "hover", map[string]any{"file_path": "shapes/ign.go", "line": 5, "column": 6}); strings.Contains(out, "pkg.go.dev") {
+		t.Errorf("no made-up pkg.go.dev link for an ad-hoc file:\n%s", out)
+	}
+	// The conventional tag-excluded twin (!linux) stays visible: that is what the index is for.
+	writeFile(t, root, "shapes/os_c.go", "//go:build !linux\n\npackage shapes\n\nfunc OSNameZQ() string { return \"o\" }\n")
+	if out := call(t, cs, "search_symbol", map[string]any{"query": "OSNameZQ"}); !strings.Contains(out, "os_c.go") {
+		t.Errorf("a !linux file must stay indexed:\n%s", out)
+	}
+}
+
+func TestSearchSymbolHidesCgoGenerated(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc)
+	call(t, cs, "diagnostics", map[string]any{"file_path": "cg/cg.go"}) // load the package, as a user's first call would
+	for _, q := range []string{"add", "Cfunc", "cgo"} {
+		out := call(t, cs, "search_symbol", map[string]any{"query": q})
+		for _, bad := range []string{"_Cfunc_", "_cgo_", "__cgofn__", "go-build"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("search %q leaks generated cgo symbols (%s):\n%s", q, bad, out)
+			}
+		}
+	}
+}
+
+func TestReferencesAtNonIdentifier(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "references", map[string]any{"file_path": "shapes/shapes.go", "line": 2, "column": 1})
+	if strings.Contains(out, "LSP error") || !strings.Contains(out, "No identifier at shapes/shapes.go:2:1") {
+		t.Errorf("friendly message expected:\n%s", out)
+	}
+}
+
+func TestHoverOnPackageNameIsCapped(t *testing.T) {
+	cs, root := session(t, nil)
+	var b strings.Builder
+	b.WriteString("// Package big is documented at length.\n//\n")
+	for i := 0; i < 400; i++ {
+		fmt.Fprintf(&b, "// Line %d of a very long package comment that goes on.\n", i)
+	}
+	b.WriteString("package big\n\nfunc F() {}\n")
+	writeFile(t, root, "big/big.go", b.String())
+	out := call(t, cs, "hover", map[string]any{"file_path": "big/big.go", "line": 403, "column": 10})
+	if len(out) > 4400 || !strings.Contains(out, "(truncated, ") || !strings.Contains(out, "more bytes)") {
+		t.Errorf("hover must be capped with a note (%d bytes):\n%.300s", len(out), out)
+	}
+	if !strings.Contains(out, "package big") {
+		t.Errorf("the head must survive:\n%.300s", out)
+	}
+}
+
+func TestCallersOfReplacedModuleInWorkspaceGetsHint(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "go.mod", "module example.com/fx\n\ngo 1.21\n\nrequire example.com/dep v0.0.0\n\nreplace example.com/dep => ./_deps/dep\n")
+	writeFile(t, root, "_deps/dep/go.mod", "module example.com/dep\n\ngo 1.21\n")
+	writeFile(t, root, "_deps/dep/dep.go", "package dep\n\ntype Client struct{}\n\nfunc New() *Client { return &Client{} }\n\nfunc (c *Client) Do() int { return 1 }\n")
+	writeFile(t, root, "use/use.go", "package use\n\nimport \"example.com/dep\"\n\nfunc Run() int { return dep.New().Do() }\n")
+	for _, q := range []string{"example.com/dep.New", "dep.New", "dep.Client.Do"} {
+		out := call(t, cs, "callers", map[string]any{"name": q})
+		if strings.Contains(out, "symbols match") {
+			t.Errorf("%s must not be ambiguous with itself:\n%s", q, out)
+		}
+		if !strings.Contains(out, "go work init") || !strings.Contains(out, "_deps/dep/go.mod") {
+			t.Errorf("%s: a callers miss in a replaced module needs the go.work hint:\n%s", q, out)
+		}
+	}
+}
+
+func TestChangeSignatureManualUsesDedupedPerLine(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/multi.go", "package shapes\n\nfunc twoUses() { x, y := Scale, Scale; _, _ = x, y }\n\nfunc threeUses() { a, b, c := Scale, Scale, Scale; _, _, _ = a, b, c }\n")
+	out := call(t, cs, "change_signature", map[string]any{"name": "Scale", "remove": []string{"unused"}, "apply": false})
+	if n := strings.Count(out, "shapes/multi.go:3:"); n != 1 {
+		t.Errorf("a line with two uses is listed once, got %d:\n%s", n, out)
+	}
+	if n := strings.Count(out, "shapes/multi.go:5:"); n != 1 {
+		t.Errorf("a line with three uses is listed once, got %d:\n%s", n, out)
+	}
+	if !strings.Contains(out, "2 uses: used as a value") || !strings.Contains(out, "3 uses: used as a value") || !strings.Contains(out, "5 use(s) need manual work") {
+		t.Errorf("per-line use counts expected:\n%s", out)
+	}
+}
+
+func TestChangeSignatureNoopReorderReportsNoChange(t *testing.T) {
+	cs, _ := session(t, nil)
+	out := call(t, cs, "change_signature", map[string]any{"name": "Scale", "reorder": []string{"s", "k", "unused"}, "apply": false})
+	if strings.Contains(out, "Updated 2 call site") || strings.Contains(out, "Updated 1 call site") || !strings.Contains(out, "No change") {
+		t.Errorf("a no-op reorder must say no change:\n%s", out)
+	}
+	out = call(t, cs, "change_signature", map[string]any{"name": "Scale", "reorder": []string{"k", "s", "unused"}, "apply": false})
+	if strings.Contains(out, "No change") || !strings.Contains(out, "Updated ") {
+		t.Errorf("a real reorder still updates call sites:\n%s", out)
+	}
+}
+
+func TestRenameStdlibUseNamesDefiningFile(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/pr.go", "package shapes\n\nimport \"fmt\"\n\nfunc pr() { fmt.Println(1) }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "shapes/pr.go", "line": 5, "column": 22, "new_name": "Printlnx"})
+	if !strings.Contains(out, "print.go") || strings.Contains(out, "doc.go") || !strings.Contains(out, "outside the workspace") {
+		t.Errorf("the refusal must name the file defining fmt.Println:\n%s", out)
+	}
+}
+
+func TestRenameLeavesNonGofmtFileFormattingAlone(t *testing.T) {
+	cs, root := session(t, nil)
+	const messy = "package shapes\n\nfunc   messyA( ) int {\nreturn   1\n}\n\nfunc messyUse() float64 {   return Scale(Square{1}, 2, 0)   }\n"
+	writeFile(t, root, "shapes/messy.go", messy)
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Scale", "new_name": "Resize", "apply": false})
+	if strings.Contains(out, "-func   messyA") || strings.Contains(out, "+func messyA") {
+		t.Errorf("unrelated reformatting must stay out of the diff:\n%s", out)
+	}
+	if !strings.Contains(out, "not gofmt-clean before the edit") || !strings.Contains(out, "shapes/messy.go") {
+		t.Errorf("the output must say the file was not reformatted:\n%s", out)
+	}
+	call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)})
+	if got, want := readFile(t, root, "shapes/messy.go"), strings.Replace(messy, "Scale", "Resize", 1); got != want {
+		t.Errorf("only the rename changes:\ngot  %q\nwant %q", got, want)
+	}
+	// A clean file is still formatted.
+	writeFile(t, root, "shapes/neat.go", "package shapes\n\nfunc neat() float64 { return Resize(Square{1}, 2, 0) }\n")
+	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/neat.go", "old_string": "return Resize(Square{1}, 2, 0)", "new_string": "return   Resize(Square{1},2, 0)"})
+	if got := readFile(t, root, "shapes/neat.go"); !strings.Contains(got, "return Resize(Square{1}, 2, 0)") {
+		t.Errorf("a gofmt-clean file stays formatted:\n%s\n%s", out, got)
+	}
+}
+
+func TestRenameFieldWhoseTagHoldsTheNewName(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/titled.go", "package shapes\n\ntype Titled struct {\n\tName string `json:\"Title\" db:\"title\"`\n}\n\nfunc (t Titled) Get() string { return t.Name }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "Titled.Name", "new_name": "Title", "apply": false})
+	if !strings.Contains(out, "has struct tags") || !strings.Contains(out, "already equals the new name Title") {
+		t.Errorf("the tag holding the new name must be noted:\n%s", out)
+	}
+	call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)})
+	got := readFile(t, root, "shapes/titled.go")
+	if !strings.Contains(got, "Title string `json:\"Title\" db:\"title\"`") || !strings.Contains(got, "return t.Title") {
+		t.Errorf("the tag must be left intact:\n%s", got)
 	}
 }

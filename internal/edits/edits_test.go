@@ -92,3 +92,18 @@ func TestRestoreEOLMixed(t *testing.T) {
 		t.Errorf("uniform CRLF: got %q want %q", got, want)
 	}
 }
+
+func TestRestoreEOLMixedLineAddedInMiddle(t *testing.T) {
+	old := "package mix\r\n\r\nfunc Eps() int {\n\treturn 1\r\n}\n\r\nfunc Zeta() int { return Eps() }\r\n// tail\n"
+	next := "package mix\n\nfunc Eps() int {\n\treturn 1\n}\n\nfunc Zeta() int { return Eps() }\n\n// tail\n"
+	got := RestoreEOL(next, old)
+	// the added blank line takes the dominant (CRLF) ending; every kept line keeps its own
+	want := "package mix\r\n\r\nfunc Eps() int {\n\treturn 1\r\n}\n\r\nfunc Zeta() int { return Eps() }\r\n\r\n// tail\n"
+	if got != want {
+		t.Errorf("got %q want %q", got, want)
+	}
+	c := FileChange{Old: &old, New: &got}
+	if a, r := CountChanged(c); a != 1 || r != 0 {
+		t.Errorf("diff +%d -%d, want +1 -0", a, r)
+	}
+}

@@ -4,12 +4,16 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -17,6 +21,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
@@ -94,6 +99,78 @@ func addIndexed(w *Workspace, q string, have []*lsp.Symbol) []*lsp.Symbol {
 	return have
 }
 
+var (
+	goCacheOnce sync.Once
+	goCacheDir  string
+)
+
+// goCache is the go build cache directory (`go env GOCACHE`), "" when unknown.
+func goCache() string {
+	goCacheOnce.Do(func() {
+		if out, err := exec.Command("go", "env", "GOCACHE").Output(); err == nil {
+			goCacheDir = strings.TrimSpace(string(out))
+		}
+	})
+	return goCacheDir
+}
+
+// generatedPrefixes start the names cgo generates (`_Cfunc_add`, `_cgo_...`).
+var generatedPrefixes = []string{"_Cfunc_", "_Ctype_", "_Cvar_", "_Cmacro_", "_Cconst_", "_cgo_", "__cgofn__"}
+
+// dropNoise removes symbols from files the go tool never compiles (`_x.go`, `//go:build ignore`) and
+// the generated ones cgo leaves in the build cache.
+func dropNoise(syms []*lsp.Symbol) []*lsp.Symbol {
+	cache := goCache()
+	unbuildable := map[string]bool{}
+	kept := syms[:0:0]
+	for _, s := range syms {
+		uri, _, _ := format.SymbolPosition(s)
+		p := lsp.URIToPath(uri)
+		if p != "" {
+			if cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) || strings.Contains(filepath.ToSlash(p), "/go-build/") {
+				continue
+			}
+			u, ok := unbuildable[p]
+			if !ok {
+				u = index.Unbuildable(p)
+				unbuildable[p] = u
+			}
+			if u {
+				continue
+			}
+		}
+		generated := false
+		for _, pre := range generatedPrefixes {
+			if strings.HasPrefix(s.Name, pre) {
+				generated = true
+			}
+		}
+		if !generated {
+			kept = append(kept, s)
+		}
+	}
+	return kept
+}
+
+// uncoveredNote says why callers and references may miss users when the symbol lives in a module the
+// workspace's go.mod/go.work does not cover (a replace-d directory, a nested module): gopls holds it as a
+// separate folder, so packages of other modules importing it are not in its view. "" otherwise.
+func uncoveredNote(w *Workspace, sym resolve.Symbol) string {
+	p := lsp.URIToPath(sym.URI)
+	if p == "" {
+		return ""
+	}
+	n, ok := gomod.Uncovered(w.Root, p)
+	if !ok {
+		return ""
+	}
+	name, rel := n.Path, edits.RelativeName(n.Dir, w.Root)
+	if name == "" {
+		name = rel
+	}
+	return fmt.Sprintf("Note: %s is in module %s (%s/go.mod), which the workspace's go.mod/go.work does not cover (a nested or replace-d module); gopls holds it as a separate folder, so callers and references in other modules, such as the root module, are not seen. A go.work listing the modules (go work init . ./%s) joins them.", sym.Name, name, rel, rel)
+}
+
 func checkGoFile(p string) error {
 	if !strings.HasSuffix(p, ".go") {
 		return toolerr.Inputf("%q is not a .go file.", p)
@@ -162,6 +239,45 @@ func hoverText(raw json.RawMessage) string {
 	return ""
 }
 
+// maxHoverBytes caps what hover and symbol_info print; a package's hover can be tens of KB.
+const maxHoverBytes = 4096
+
+// adHocLink matches the pkg.go.dev link gopls prints for files outside any package (a `package main`
+// scratch file): the address is made up and leads nowhere.
+var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/command-line-arguments[^)\n]*\)[ \t]*`)
+
+// tidyHover drops useless links and caps the length, keeping the head (signature and summary).
+func tidyHover(t string) string {
+	t = strings.TrimRight(adHocLink.ReplaceAllString(t, ""), "\n ")
+	if len(t) <= maxHoverBytes {
+		return t
+	}
+	cut := maxHoverBytes
+	for cut > 0 && !utf8.RuneStart(t[cut]) {
+		cut--
+	}
+	if i := strings.LastIndex(t[:cut], "\n"); i > maxHoverBytes/2 {
+		cut = i
+	}
+	return t[:cut] + fmt.Sprintf("\n\n(truncated, %d more bytes)", len(t)-cut)
+}
+
+// friendlyNavErr turns the language server's errors about a position or file that has no analysis into
+// plain sentences.
+func friendlyNavErr(err error, file string, line, col int) error {
+	var re *lsp.RequestError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch {
+	case strings.Contains(re.Message, "no package metadata"):
+		return toolerr.Inputf("%s is not part of any package the Go toolchain builds (build constraints / name prefix); nothing to analyse.", file)
+	case strings.Contains(re.Message, "no identifier found"):
+		return toolerr.Inputf("No identifier at %s:%d:%d.", file, line, col)
+	}
+	return err
+}
+
 // RegisterNav registers the navigation tools.
 func RegisterNav(s *mcp.Server, h Host) {
 	add(s, h, "workspace", "Which directory is codenav navigating, and why? Use when results look like they come from the wrong checkout/worktree.",
@@ -176,9 +292,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			raw, err := w.Client.Hover(ctx, in.FilePath, in.Line, in.Column)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
-			if t := hoverText(raw); t != "" {
+			if t := tidyHover(hoverText(raw)); t != "" {
 				return t, nil
 			}
 			return "No hover information at that position.", nil
@@ -191,7 +307,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			locs, err := w.Client.Definition(ctx, in.FilePath, in.Line, in.Column)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
 			if len(locs) == 0 {
 				return "No definition found at that position.", nil
@@ -207,7 +323,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			decl := in.IncludeDeclaration == nil || *in.IncludeDeclaration
 			locs, err := w.Client.References(ctx, in.FilePath, in.Line, in.Column, decl)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
 			}
 			return splitTests(locs, w.Root), nil
 		})
@@ -230,7 +346,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			for i := range syms {
 				ptrs[i] = &syms[i]
 			}
-			ptrs = addIndexed(w, q, ptrs)
+			ptrs = dropNoise(addIndexed(w, q, ptrs))
 			if len(ptrs) == 0 {
 				return fmt.Sprintf("No symbols matching %q.", q), nil
 			}
@@ -255,7 +371,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, in.FilePath, 0, 0)
 			}
 			return format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit), nil
 		})
@@ -273,13 +389,13 @@ func RegisterNav(s *mcp.Server, h Host) {
 			rel, line, col := sym.Rel(w.Root), sym.Line+1, sym.Column+1
 			raw, err := w.Client.Hover(ctx, rel, line, col)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, rel, line, col)
 			}
 			defs, err := w.Client.Definition(ctx, rel, line, col)
 			if err != nil {
-				return "", err
+				return "", friendlyNavErr(err, rel, line, col)
 			}
-			ht := hoverText(raw)
+			ht := tidyHover(hoverText(raw))
 			if ht == "" {
 				ht = "No hover information."
 			}
@@ -291,13 +407,16 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if in.IncludeReferences == nil || *in.IncludeReferences {
 				refs, err := w.Client.References(ctx, rel, line, col, true)
 				if err != nil {
-					return "", err
+					return "", friendlyNavErr(err, rel, line, col)
 				}
 				prod, tests := format.SplitTests(refs)
 				parts = append(parts, "", "References:", format.FormatReferencesGrouped(prod, w.Root, format.DefaultReferenceFileLimit, false))
 				if len(tests) > 0 {
 					parts = append(parts, "", "In tests:", format.FormatReferencesGrouped(tests, w.Root, format.DefaultReferenceFileLimit, false))
 				}
+			}
+			if note := uncoveredNote(w, sym); note != "" {
+				parts = append(parts, "", note)
 			}
 			return strings.Join(parts, "\n"), nil
 		})
@@ -356,6 +475,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			out := format.FormatCallers(calls, w.Root, callerReceivers(calls))
 			if omitted > 0 {
 				out += fmt.Sprintf("\n(%d non-call reference(s) omitted: uses as a function or method value, such as f := %s; see references)", omitted, sym.Name)
+			}
+			if note := uncoveredNote(w, sym); note != "" {
+				out += "\n" + note
 			}
 			return out, nil
 		})

@@ -483,8 +483,8 @@ func MatchEOL(text, like string) string {
 }
 
 // RestoreEOL gives text (any line endings) the line endings of like, line by line when like mixes
-// CRLF and LF: lines of an unchanged leading and trailing run keep their own terminator (with equal
-// line counts every line keeps its counterpart's), the rest get like's dominant ending. So a mixed
+// CRLF and LF: lines that a diff pairs with a line of like keep that line's terminator, the rest
+// (added lines) get like's dominant ending. So a mixed
 // file is not normalised and unchanged lines stay out of the diff.
 func RestoreEOL(text, like string) string {
 	crlf := strings.Count(like, "\r\n")
@@ -515,17 +515,24 @@ func RestoreEOL(text, like string) string {
 			olds = append(olds, [2]string{c, e})
 		}
 	}
-	if len(olds) == n {
-		for i := range ends {
-			ends[i] = olds[i][1]
-		}
-	} else {
-		i := 0
-		for ; i < n && i < len(olds) && newLines[i] == olds[i][0]; i++ {
-			ends[i] = olds[i][1]
-		}
-		for j, k := n-1, len(olds)-1; j >= i && k >= i && newLines[j] == olds[k][0]; j, k = j-1, k-1 {
-			ends[j] = olds[k][1]
+	// Align the lines of both texts (LCS) rather than by index, so a line gofmt added or removed in
+	// the middle does not shift every later ending onto the wrong line. Lines the alignment pairs
+	// keep their own ending; added lines keep the dominant one.
+	oc := make([]string, len(olds))
+	for i, o := range olds {
+		oc[i] = o[0]
+	}
+	i, j := 0, 0
+	for _, o := range diffLines(oc, newLines[:n]) {
+		switch o.kind {
+		case ' ':
+			ends[j] = olds[i][1]
+			i++
+			j++
+		case '-':
+			i++
+		default:
+			j++
 		}
 	}
 	var b strings.Builder

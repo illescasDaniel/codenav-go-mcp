@@ -57,7 +57,7 @@ aliases; a missing parameter gets a short hint instead of a validation error.
 The edit is applied to in-memory copies first (a gopls overlay), gopls re-checks the edited
 files, their package and the packages importing them (including external `_test`
 packages), and the response says which diagnostics the edit adds or fixes. Nothing is
-written until that is on the table. Output is always gofmt-ed with imports fixed.
+written until that is on the table. Output is gofmt-ed with imports fixed, except in a file that was not gofmt-clean before the edit: that one keeps its formatting, so the diff shows the edit only (the output says so).
 
 | Tool | Does |
 |------|------|
@@ -100,7 +100,8 @@ constraints is invisible to the type check (the response says when an edit touch
 - **Nested modules:** gopls loads only the modules that the root `go.mod` or `go.work` covers. A directory
   with its own `go.mod` outside that is added to gopls as an extra workspace folder, so its symbols are found
   by name and its own packages are type-checked. Packages of *other* modules that import it are not seen, so
-  an edit there can break importers without the error count showing it. Tools say so when they meet one;
+  an edit there can break importers without the error count showing it. Tools say so when they meet one (`callers` and `symbol_info` too, when the symbol lives in such a module, for instance a
+  `replace`-d directory inside the workspace: callers in the root module are not seen);
   `go work init . ./sub` joins the modules properly.
 - **Name lookups outside the workspace** work for the read-only tools (`symbol_info`, `callers`,
   `implementations`): `json.Marshal`, `encoding/json.Decoder.Decode` or a symbol of a required dependency
@@ -109,7 +110,7 @@ constraints is invisible to the type check (the response says when an edit touch
   works. A package no module provides is reported as such. Write tools refuse these symbols.
 - **Symbol index:** next to gopls the server keeps its own index of declarations (funcs, methods, types,
   struct fields, interface methods, vars, consts) built with `go/parser` from every `.go` file below the
-  workspace root, skipping `.git`, `vendor`, `node_modules`, `testdata`, hidden and `_` directories. It is
+  workspace root, skipping `.git`, `vendor`, `node_modules`, `testdata`, hidden and `_` directories, and the files the go tool never compiles: names starting with `_` or `.` and `//go:build ignore` files (a tag-excluded file such as `!linux` stays indexed; symbols in the build cache, cgo's `_Cfunc_*`/`_cgo_*`, are filtered out of `search_symbol`). It is
   refreshed on every call (only files whose mtime or size changed are re-parsed) and does not depend on
   the build configuration. Name lookups merge it with gopls: gopls supplies kind and position where it has
   the symbol, and the index adds declarations gopls misses (files behind build tags, other GOOS/GOARCH
@@ -151,6 +152,11 @@ constraints is invisible to the type check (the response says when an edit touch
   that shows up as a new error, so nothing is written, and a second run removes them. A conversion to a
   user-defined type that is the whole right-hand side is treated as a call (`MyInt(f())`), which the type
   check rejects rather than writes.
+- **Formatting of messy files:** a write tool gofmt-s the files it changes only when they were gofmt-clean before.
+  A file that was not is written with the edit alone (it must still parse), and the output names it; there is
+  no partial, region-only gofmt. Run `gofmt -w` once if you want the whole file formatted.
+- **Output caps:** `hover` and `symbol_info` print at most about 4 KB of hover text (a package's documentation can be
+  tens of KB); the end is cut with a `(truncated, N more bytes)` note.
 - **Struct tags:** renames change Go identifiers only. `rename_symbol` on a field that has a struct tag, and
   `edit_symbol` `replace` of a struct type whose tags changed (or whose tagged field disappeared), say so in a
   note; there is no note for fields without tags, and no guessing about reflection or `encoding/json` use.
