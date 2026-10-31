@@ -88,5 +88,17 @@ func probeConfig(ctx context.Context, root string) string {
 	if len(lines) > 4 {
 		lines = append(lines[:4], "...")
 	}
-	return strings.Join(lines, "; ")
+	// A line ending in ":" introduces the next one ("go: errors parsing go.mod:" + detail).
+	var sb strings.Builder
+	for i, l := range lines {
+		if i > 0 {
+			if strings.HasSuffix(strings.TrimSpace(lines[i-1]), ":") {
+				sb.WriteString(" ")
+			} else {
+				sb.WriteString("; ")
+			}
+		}
+		sb.WriteString(l)
+	}
+	return sb.String()
 }

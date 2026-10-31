@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/token"
+	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -220,11 +221,14 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 	if err != nil {
 		return qfResult{}, err
 	}
+	rel := edits.RelativeName(abs, w.Root)
+	if st, serr := os.Stat(abs); serr == nil && st.IsDir() {
+		return qfResult{}, toolerr.Inputf("file_path %q is a directory, not a Go file: pass a .go file (relative to the workspace root).", rel)
+	}
 	text, _, err := edits.ReadSource(abs)
 	if err != nil {
 		return qfResult{}, err
 	}
-	rel := edits.RelativeName(abs, w.Root)
 	if index.Unbuildable(abs) {
 		return qfResult{}, notCompiledErr(rel)
 	}

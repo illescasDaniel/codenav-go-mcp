@@ -226,3 +226,16 @@ func TestConfigProblemSeparatesErrors(t *testing.T) {
 		t.Errorf("two errors must be separated by \"; \": %q", p)
 	}
 }
+
+// Round 13 (11f): a line that ends in ":" introduces the next one, so no ":;" shows up.
+func TestConfigProblemNoColonSemicolon(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	d := t.TempDir()
+	writeTree(t, d, map[string]string{"go.mod": "this is not a go.mod\n"})
+	p := ConfigProblem(context.Background(), d)
+	if strings.Contains(p, ":;") || !strings.Contains(p, "errors parsing go.mod: go.mod:1:") {
+		t.Errorf("want \"errors parsing go.mod: go.mod:1: ...\", got %q", p)
+	}
+}

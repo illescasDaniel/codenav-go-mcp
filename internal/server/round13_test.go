@@ -266,3 +266,15 @@ func TestPackageClauseRefusalNamesClausesAsWritten(t *testing.T) {
 		t.Errorf("x_test.go must not be listed under pk1:\n%s", out)
 	}
 }
+
+// Item 11 (e): quick_fix on a directory (or an empty path) names it relative to the workspace.
+func TestQuickFixDirectoryPathIsRelative(t *testing.T) {
+	cs, root := session(t, nil)
+	for _, p := range []string{"", "shapes"} {
+		out := call(t, cs, "quick_fix", map[string]any{"file_path": p, "apply": false})
+		mustHave(t, "dir "+p, out, "is a directory, not a Go file")
+		if strings.Contains(out, root) || strings.Contains(out, "Cannot read") {
+			t.Errorf("path %q: no absolute path or raw read error expected:\n%s", p, out)
+		}
+	}
+}
