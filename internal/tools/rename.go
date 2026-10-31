@@ -311,9 +311,43 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	// A parameter or local variable is fully resolved by gopls; same-named text elsewhere is unrelated.
 	if in.Parameter == "" && kind != 0 {
-		notes = append(notes, mentions.Notes(mentions.FindScoped(w.Root, oldName, after, "", couldRefer(root.path, oldName)), oldName)...)
+		ms := mentions.FindScoped(w.Root, oldName, after, "", couldRefer(root.path, oldName))
+		notes = append(notes, mentions.Notes(otherObjects(ctx, w, ms, after), oldName)...)
+	} else if ptext, ok := after[root.path]; ok {
+		// A local, parameter or type parameter lives inside one declaration: only that span can
+		// still mention the old name.
+		off := edits.Offset(text, rng.Start.Line, rng.Start.Character)
+		if a, b, ok := gosrc.EnclosingDecl(root.path, text, off); ok {
+			from, to := 1+strings.Count(text[:a], "\n"), 1+strings.Count(text[:b], "\n")
+			var inScope []mentions.Mention
+			for _, m := range mentions.FindScoped(w.Root, oldName, map[string]string{root.path: ptext}, root.path, nil) {
+				if m.Line >= from && m.Line <= to {
+					inScope = append(inScope, m)
+				}
+			}
+			notes = append(notes, mentions.Notes(inScope, oldName)...)
+		}
 	}
 	return edits.NewPlan(desc, changes, notes...), nil
+}
+
+// otherObjects drops the code mentions that gopls resolves to a declaration: after the rename every
+// reference to the symbol is gone, so a name that still resolves is some other, unrelated object.
+// Files the rename changes are kept (their positions no longer match what gopls has).
+func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, after map[string]string) []mentions.Mention {
+	out := ms[:0:0]
+	checked := 0
+	for _, m := range ms {
+		abs := filepath.Join(w.Root, m.Path)
+		if _, changed := after[abs]; m.Kind == "code" && !changed && m.Col > 0 && checked < 40 {
+			checked++
+			if defs, err := w.Client.Definition(ctx, abs, m.Line, m.Col); err == nil && len(defs) > 0 {
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // couldRefer accepts the Go files that could name the symbol declared in declFile: the files of its

@@ -2277,3 +2277,24 @@ func TestMoveCgoCallersRefusedAndCgoPackageMoveHasNoFalseErrors(t *testing.T) {
 		t.Errorf("moving a cgo package must not report artefacts as new errors:\n%s", out)
 	}
 }
+
+func TestRenameLocalListsLeftoverMentionsInItsFunctionOnly(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/loc.go", "package shapes\n\nfunc Loc() int {\n\ttotal := 1\n\t// total is the answer\n\treturn total\n}\n\n// total elsewhere is unrelated.\nfunc Other() int { return 2 }\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"file_path": "shapes/loc.go", "line": 4, "column": 2, "new_name": "sum", "apply": false})
+	if !strings.Contains(out, "loc.go:5") {
+		t.Errorf("the comment inside the function must be listed:\n%s", out)
+	}
+	if strings.Contains(out, "loc.go:9") {
+		t.Errorf("a comment outside the function must not be listed:\n%s", out)
+	}
+}
+
+func TestRenameFieldIgnoresOtherFieldsTags(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "shapes/tags.go", "package shapes\n\ntype One struct {\n\tTitle string `json:\"title\"`\n}\n\ntype Two struct {\n\tOwner string `db:\"owner\" json:\"Title2\"`\n\tNote  string `json:\"Titles\"`\n}\n")
+	out := call(t, cs, "rename_symbol", map[string]any{"name": "One.Title", "new_name": "Heading", "apply": false})
+	if strings.Contains(out, "tags.go:8") || strings.Contains(out, "tags.go:9") {
+		t.Errorf("another field's struct tag must not be listed:\n%s", out)
+	}
+}

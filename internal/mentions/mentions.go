@@ -26,6 +26,7 @@ var textSuffixes = map[string]bool{".md": true, ".rst": true, ".txt": true, ".to
 type Mention struct {
 	Path    string
 	Line    int
+	Col     int    // 1-based byte column of a code mention, else 0
 	Kind    string // code | string | comment | text
 	Snippet string
 }
@@ -68,16 +69,19 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 			if codeIn != nil && !codeIn(path, text) {
 				continue
 			}
-			found = append(found, Mention{rel, p.Line, "code", snippet(lines, p.Line)})
+			found = append(found, Mention{rel, p.Line, p.Column, "code", snippet(lines, p.Line)})
 		case tok == token.COMMENT && prose.MatchString(lit):
-			found = append(found, Mention{rel, p.Line, "comment", snippet(lines, p.Line)})
+			found = append(found, Mention{rel, p.Line, 0, "comment", snippet(lines, p.Line)})
 		case (tok == token.STRING || tok == token.CHAR) && word.MatchString(lit):
 			if shortName(name) {
 				if v, err := strconv.Unquote(lit); err != nil || v != name {
 					continue
 				}
 			}
-			found = append(found, Mention{rel, p.Line, "string", snippet(lines, p.Line)})
+			if tagLike(lit) && !tagNames(lit, name) {
+				continue // another field's struct tag
+			}
+			found = append(found, Mention{rel, p.Line, 0, "string", snippet(lines, p.Line)})
 		}
 	}
 	return found
@@ -147,7 +151,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 		}
 		for i, line := range strings.Split(text, "\n") {
 			if prose.MatchString(line) {
-				found = append(found, Mention{rel, i + 1, "text", snippet([]string{line}, 1)})
+				found = append(found, Mention{rel, i + 1, 0, "text", snippet([]string{line}, 1)})
 			}
 		}
 		return nil
@@ -213,3 +217,20 @@ func Notes(ms []Mention, old string) []string {
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+var tagRE = regexp.MustCompile(`\w+:"([^"]*)"`)
+
+// tagLike: a raw string made of key:"value" pairs, i.e. a struct tag.
+func tagLike(lit string) bool {
+	return strings.HasPrefix(lit, "`") && tagRE.MatchString(lit)
+}
+
+// tagNames: some value of the struct tag is name (ignoring case), as in `json:"name,omitempty"` for field Name.
+func tagNames(lit, name string) bool {
+	for _, m := range tagRE.FindAllStringSubmatch(lit, -1) {
+		if strings.EqualFold(strings.Split(m[1], ",")[0], name) {
+			return true
+		}
+	}
+	return false
+}

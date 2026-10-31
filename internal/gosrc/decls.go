@@ -765,3 +765,30 @@ func ConstShift(filename, src string, start, end int) bool {
 	}
 	return false
 }
+
+// EnclosingDecl returns the byte span of the top-level declaration (doc comment included) that
+// contains offset off: the scope of a local variable, a parameter or a type parameter.
+func EnclosingDecl(filename, src string, off int) (start, end int, ok bool) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, d := range f.Decls {
+		s, e := d.Pos(), d.End()
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if d.Doc != nil {
+				s = d.Doc.Pos()
+			}
+		case *ast.GenDecl:
+			if d.Doc != nil {
+				s = d.Doc.Pos()
+			}
+		}
+		a, b := fset.Position(s).Offset, fset.Position(e).Offset
+		if off >= a && off <= b {
+			return a, b, true
+		}
+	}
+	return 0, 0, false
+}
