@@ -1251,7 +1251,7 @@ func TestNotFoundHints(t *testing.T) {
 	// With a sibling module that imports it, the note appears.
 	writeFile(t, root, "subuser/go.mod", "module example.com/subuser\n\ngo 1.24\n\nrequire example.com/sub v0.0.0\n\nreplace example.com/sub => ../sub\n")
 	writeFile(t, root, "subuser/u.go", "package subuser\n\nimport \"example.com/sub\"\n\nvar _ = sub.SubOnly\n")
-	out = call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() int { return 1 }", "new_string": "func SubOnly() int { return 2 }"})
+	out = call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() int { return 1 }", "new_string": "func SubOnly() int64 { return 2 }"})
 	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "NOT rewritten") {
 		t.Errorf("an edit in a nested module with a sibling importer must say its importers are not rewritten:\n%s", out)
 	}

@@ -53,7 +53,7 @@ func TestSiblingModuleNoteOnlyWhenUsed(t *testing.T) {
 	noWorkFixture(t, root)
 	writeFile(t, root, "lonely/go.mod", "module example.com/lonely\n\ngo 1.24\n")
 	writeFile(t, root, "lonely/l.go", "package lonely\n\nfunc Alone() int { return 1 }\n")
-	out := call(t, cs, "edit", map[string]any{"file_path": "outdep/o.go", "old_string": `"hi"`, "new_string": `"hello"`, "apply": false})
+	out := call(t, cs, "edit", map[string]any{"file_path": "outdep/o.go", "old_string": `func Hello() string {`, "new_string": `func Hello() (string, error) {`, "apply": false})
 	mustHave(t, "used module", out, "belongs to module example.com/outdep", note)
 	// Unused: no other module imports lonely, so nothing is left unedited.
 	out = call(t, cs, "edit", map[string]any{"file_path": "lonely/l.go", "old_string": "return 1", "new_string": "return 2", "apply": false})

@@ -222,3 +222,34 @@ func TestRenameMentionsIgnoreFieldsSelectorsAndMethods(t *testing.T) {
 		t.Errorf("fields, selectors, keyed literals and methods named foo are other objects than the func:\n%s", out)
 	}
 }
+
+// Item 7: the "NOT rewritten" note appears only when a sibling module (no go.work) uses what the edit
+// changes. Used and unused symbols of the same module, and a body-only edit of the used one.
+func TestSiblingNoteOnlyForSymbolsTheSiblingUses(t *testing.T) {
+	const note = "NOT rewritten"
+	cs, root := session(t, nil)
+	noWorkFixture(t, root)
+	writeFile(t, root, "outdep/o.go", "package outdep\n\nfunc Hello() string { return \"hi\" }\n\nfunc Unref() int { return 1 }\n\nfunc Other() int { return 2 }\n")
+	for name, c := range map[string]struct {
+		tool string
+		args map[string]any
+		note bool
+	}{
+		"rename used":         {"rename_symbol", map[string]any{"name": "outdep.Hello", "new_name": "Hello2", "apply": false}, true},
+		"rename unused":       {"rename_symbol", map[string]any{"name": "outdep.Unref", "new_name": "Unref2", "apply": false}, false},
+		"signature used":      {"change_signature", map[string]any{"name": "outdep.Hello", "add": []any{map[string]any{"name": "n", "type": "int", "value": "1"}}, "apply": false}, true},
+		"signature unused":    {"change_signature", map[string]any{"name": "outdep.Unref", "add": []any{map[string]any{"name": "n", "type": "int", "value": "1"}}, "apply": false}, false},
+		"move unused":         {"move", map[string]any{"name": "outdep.Other", "to_file": "outdep/other.go", "apply": false}, false},
+		"edit body of unused": {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "return 2", "new_string": "return 3", "apply": false}, false},
+		"edit body of used":   {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": `"hi"`, "new_string": `"hello"`, "apply": false}, false},
+		"edit signature used": {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func Hello() string", "new_string": "func Hello() (string, error)", "apply": false}, true},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		if has := strings.Contains(out, note); has != c.note {
+			t.Errorf("%s: note shown = %v, want %v:\n%s", name, has, c.note, out)
+		}
+		if c.note {
+			mustHave(t, name, out, "belongs to module example.com/outdep")
+		}
+	}
+}
