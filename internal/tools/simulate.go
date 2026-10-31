@@ -105,6 +105,20 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 		}
 	}
 	d := diagdelta.Diff(keepDiagnostics(be, errDirs), keepDiagnostics(ae, errDirs))
+	// Warnings of a directory with errors are left out of the comparison (analyzers do not run on a package
+	// that fails to type-check); say so instead of silently reporting fewer warnings than `diagnostics` shows.
+	hidden := func(es []diagdelta.Entry) []diagdelta.Entry {
+		var out []diagdelta.Entry
+		for _, e := range es {
+			if e.Severity == diagdelta.WarningSeverity && errDirs[filepath.Dir(e.Path)] {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	if n := len(diagdelta.Diff(hidden(be), hidden(ae)).New); n > 0 {
+		ignored = append(ignored, fmt.Sprintf("%d new warning(s) in packages that have errors (analyzers such as vet do not run until they compile; `diagnostics` lists them)", n))
+	}
 	d.Ignored = ignored
 	seen := map[string]bool{}
 	_ = ub // A file only the before side could not check is checked after the edit, which is what the report is about

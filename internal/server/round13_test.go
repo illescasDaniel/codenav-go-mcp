@@ -297,3 +297,18 @@ func TestMoveFromBrokenPackageMessageIsClean(t *testing.T) {
 		t.Errorf("each error once, got %d:\n%s", n, out)
 	}
 }
+
+// Item 11 (b): a new warning in a package that also has a new error is counted in the edit diagnostics
+// instead of silently dropped.
+func TestEditReportsWarningsHiddenByErrors(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "lk/a.go", "package lk\n\nimport \"sync\"\n\ntype T struct{ mu sync.Mutex }\n\nfunc F(t *T) int { return 1 }\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "lk/a.go", "old_string": "func F(t *T) int { return 1 }", "new_string": "func F(t T) int { return 1 }\n\nfunc G() { var x int }", "apply": false})
+	mustHave(t, "edit", out, "1 new error(s)", "1 new warning(s) in packages that have errors")
+	// Without a new error the warning itself is listed, as before.
+	out = call(t, cs, "edit", map[string]any{"file_path": "lk/a.go", "old_string": "func F(t *T) int { return 1 }", "new_string": "func F(t T) int { return 1 }", "apply": false})
+	mustHave(t, "warning only", out, "1 new warning(s)", "passes lock by value")
+	if strings.Contains(out, "in packages that have errors") {
+		t.Errorf("no hidden warnings expected:\n%s", out)
+	}
+}
