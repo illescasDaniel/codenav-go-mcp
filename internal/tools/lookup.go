@@ -7,7 +7,10 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +26,9 @@ import (
 
 // resolveSymbol is resolve.Resolve with a Go-aware explanation when nothing matches.
 func resolveSymbol(ctx context.Context, w *Workspace, name, file string) (resolve.Symbol, error) {
+	if strings.TrimSpace(name) == "_" || strings.HasSuffix(strings.TrimSpace(name), "._") {
+		return resolve.Symbol{}, toolerr.Inputf("`_` is the blank identifier: it declares nothing and nothing refers to it, so there is nothing to rename, move or change. Name the declaration you mean (Type.Field, pkg.Func).")
+	}
 	sym, err := resolve.ResolveExact(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if errors.As(err, &nf) {
@@ -170,6 +176,12 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, s
 		msg += fmt.Sprintf(": package %s declares no %s.", first, strings.Join(parts[1:], "."))
 	case isStdlib(first):
 		msg += fmt.Sprintf(": %s is in the standard library, outside the workspace%s", first, outside)
+	case suggestsQualifier(suggest, first, false):
+		// Only the member is miscased (main.Init1 for main.init1): the package itself exists, even when it
+		// is no directory of that name (package main at the root).
+		msg += fmt.Sprintf(": package %s declares no %s.", first, strings.Join(parts[1:], "."))
+	case suggestsQualifier(suggest, first, true):
+		msg += fmt.Sprintf(": no type or package named %s in the workspace (the qualifier is case-sensitive too).", first)
 	default:
 		msg += fmt.Sprintf(": no type or package named %s in the workspace%s", first, outside)
 	}
@@ -180,7 +192,13 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, s
 		}
 		msg += fmt.Sprintf(" Did you mean %s? (names are case-sensitive; write tools never guess the case)", strings.Join(quoted, " or "))
 	}
-	if nested := gomod.UncoveredModules(w.Root, exclude.IsDirName, 3); len(nested) > 0 {
+	var nested []gomod.Nested
+	for _, n := range gomod.UncoveredModules(w.Root, exclude.IsDirName, 3) {
+		if mayLiveIn(n, query) {
+			nested = append(nested, n)
+		}
+	}
+	if len(nested) > 0 {
 		var names []string
 		for _, n := range nested {
 			rel := edits.RelativeName(n.Dir, w.Root)
@@ -192,6 +210,59 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, s
 		msg += fmt.Sprintf("\nNote: module(s) %s sit below the workspace without a go.work listing them; gopls indexes each as a separate folder, so other modules importing them are not seen. A go.work (go work init . ./<dir>) joins them.", strings.Join(names, ", "))
 	}
 	return msg
+}
+
+// suggestsQualifier reports whether a suggested spelling ("cs.Foo") has the qualifier first spelled exactly
+// (fold false) or only equal to it ignoring case (fold true).
+func suggestsQualifier(suggest []string, first string, fold bool) bool {
+	for _, sg := range suggest {
+		q, _, ok := strings.Cut(sg, ".")
+		if ok && (!fold && q == first || fold && q != first && strings.EqualFold(q, first)) {
+			return true
+		}
+	}
+	return false
+}
+
+// mayLiveIn: the missing name could be declared in the nested module n - its qualifier names the module or
+// one of its directories, or the name's last part appears in its Go files. Otherwise the module has
+// nothing to do with the failed lookup.
+func mayLiveIn(n gomod.Nested, query string) bool {
+	parts := strings.Split(query, ".")
+	last := parts[len(parts)-1]
+	if last == "" {
+		return false
+	}
+	if len(parts) > 1 {
+		first := parts[0]
+		if path.Base(n.Path) == first || filepath.Base(n.Dir) == first || strings.Contains(n.Path, "/"+first+"/") {
+			return true
+		}
+		if packageDir(n.Dir, first) != "" {
+			return true
+		}
+	}
+	word := regexp.MustCompile(`\b` + regexp.QuoteMeta(last) + `\b`)
+	seen, found := 0, false
+	_ = filepath.WalkDir(n.Dir, func(p string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil || found:
+			return nil
+		case d.IsDir():
+			if p != n.Dir && (exclude.IsDirName(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+		case strings.HasSuffix(p, ".go"):
+			if seen++; seen > 300 {
+				return filepath.SkipAll
+			}
+			if b, rerr := os.ReadFile(p); rerr == nil && word.Match(b) {
+				found = true
+			}
+		}
+		return nil
+	})
+	return found
 }
 
 func isStdlib(qualifier string) bool {

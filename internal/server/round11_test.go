@@ -47,7 +47,6 @@ func noWorkFixture(t *testing.T, root string) {
 
 func TestSiblingModuleWithoutGoWorkIsTypeChecked(t *testing.T) {
 	cs, root := session(t, nil)
-	writeFile(t, root, "go.work", "go 1.24\n\nuse .\n")
 	noWorkFixture(t, root)
 	// appmod sits in the tree as an uncovered module: its callers must be type-checked.
 	out := call(t, cs, "rename_symbol", map[string]any{"name": "outdep.Hello", "new_name": "Greet", "apply": false})

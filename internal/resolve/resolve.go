@@ -354,7 +354,7 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 					sug = append(sug, f)
 				}
 			}
-			sort.Strings(sug)
+			sug = closestSpellings(sug, query)
 			return Symbol{}, &NotFoundError{Query: query, Suggest: sug, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q (names are case-sensitive).", query), Hint: sug}}
 		}
 		cands = loose
@@ -434,4 +434,33 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		hint = "these all live in the same file; use search_symbol to get exact line/column, then hover/definition/references with that position"
 	}
 	return Symbol{}, toolerr.Inputf("%d symbols match %q; %s:\n%s", len(cands), query, hint, candidateLines(cands, root))
+}
+
+// closestSpellings keeps the suggestions that differ from query in the fewest characters (the same length
+// as query, as they equal it ignoring case): "cs.Foo" for "Cs.Foo", not also "cs.foo". Sorted.
+func closestSpellings(sug []string, query string) []string {
+	diff := func(a string) int {
+		n := 0
+		ra, rq := []rune(a), []rune(query)
+		for i := range ra {
+			if i >= len(rq) || ra[i] != rq[i] {
+				n++
+			}
+		}
+		return n
+	}
+	best := -1
+	for _, s := range sug {
+		if d := diff(s); best < 0 || d < best {
+			best = d
+		}
+	}
+	var out []string
+	for _, s := range sug {
+		if diff(s) == best {
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

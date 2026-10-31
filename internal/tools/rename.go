@@ -114,6 +114,9 @@ func packageDir(root, name string) string {
 	return found
 }
 
+// maxIdentLen is the longest identifier a rename accepts.
+const maxIdentLen = 255
+
 func packageRenameError(w *Workspace, pkg, file string) error {
 	dir := edits.RelativeName(filepath.Dir(file), w.Root)
 	return toolerr.Inputf("%s is a package, not a symbol; renaming packages is not supported - use move on the package directory (file_path=%s, to_file=<new dir>)", pkg, dir)
@@ -123,11 +126,14 @@ func packageRenameError(w *Workspace, pkg, file string) error {
 // would break the program: implementations of an interface method, and the interface methods a
 // concrete method satisfies, followed transitively.
 func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan, error) {
+	if len(in.NewName) > maxIdentLen {
+		return nil, toolerr.Argf("new_name is %d characters long; identifiers over %d characters are refused (a mistake, and the answer would be enormous).", len(in.NewName), maxIdentLen)
+	}
 	if !token.IsIdentifier(in.NewName) {
-		return nil, toolerr.Inputf("%q is not a valid Go identifier (it must not be a keyword either).", in.NewName)
+		return nil, toolerr.Argf("%q is not a valid Go identifier (it must not be a keyword either).", in.NewName)
 	}
 	if in.Name != "" && (in.Line > 0 || in.Column > 0) {
-		return nil, toolerr.Inputf("pass either name or file_path + line + column, not both (line/column would be ignored for name=%q).", in.Name)
+		return nil, toolerr.Argf("pass either name or file_path + line + column, not both (line/column would be ignored for name=%q).", in.Name)
 	}
 	var root member
 	var kind int
@@ -172,7 +178,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			kind = kindAt(syms, root.line, root.col)
 		}
 	default:
-		return nil, toolerr.Inputf("pass `name` (e.g. Square.Area) or `file_path` + `line` + `column`.")
+		return nil, toolerr.Argf("pass `name` (e.g. Square.Area) or `file_path` + `line` + `column`.")
 	}
 
 	if in.Parameter != "" {

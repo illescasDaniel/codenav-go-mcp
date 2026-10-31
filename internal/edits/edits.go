@@ -8,11 +8,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"unicode/utf16"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
@@ -247,10 +247,7 @@ func ChangesFromEdits(by map[string][]lsp.TextEdit) ([]FileChange, error) {
 }
 
 func RelativeName(path, root string) string {
-	if r, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(r, "..") {
-		return filepath.ToSlash(r)
-	}
-	return filepath.ToSlash(path)
+	return exclude.RelativeTo(path, root)
 }
 
 // EditPlan is a set of whole-file changes previewed first and written later.

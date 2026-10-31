@@ -99,3 +99,21 @@ func TestFindScopedSkipsFilesDeclaringTheName(t *testing.T) {
 		}
 	}
 }
+
+// N1: a local variable or parameter that shadows the renamed package-level name is another object, not a
+// leftover; a use of the package-level name is still listed.
+func TestFindSkipsShadowingLocals(t *testing.T) {
+	root := t.TempDir()
+	src := "package p\n\nfunc g(foo int) int { return foo }\n\nfunc h() int {\n\tfoo := 5\n\tfoo++\n\treturn foo\n}\n\nfunc k() { foo() }\n"
+	_ = os.WriteFile(filepath.Join(root, "a.go"), []byte(src), 0o644)
+	ms := Find(root, "foo", nil, "")
+	var code []Mention
+	for _, m := range ms {
+		if m.Kind == "code" {
+			code = append(code, m)
+		}
+	}
+	if len(code) != 1 || code[0].Line != 11 {
+		t.Fatalf("only the call foo() on line 11 is a leftover: %+v", code)
+	}
+}

@@ -112,7 +112,7 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 		return moveDirectory(ctx, w, in.FilePath, in.ToFile, in)
 	}
 	if in.Name == "" || in.ToFile == "" {
-		return "", toolerr.Inputf("move needs name + to_file (a symbol), or file_path + to_file as directories (a package).")
+		return "", toolerr.Argf("move needs name + to_file (a symbol), or file_path + to_file as directories (a package).")
 	}
 	l, err := locate(ctx, w, in.Name, in.FilePath)
 	if err != nil {

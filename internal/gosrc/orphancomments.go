@@ -15,6 +15,61 @@ import (
 // glued onto another line, and blank lines left behind are tidied. after is returned unchanged when
 // either text does not parse.
 func DropOrphanImportComments(filename, before, after string) string {
+	return dropNewBlankBeforeHeading(dropOrphanImportComments(filename, before, after), before)
+}
+
+// dropNewBlankBeforeHeading removes a blank line inside an import block that the edit introduced right
+// above a comment line: before, no blank line separated that comment from the import above it (the
+// import between them, or its attached comment, was removed). Blank lines that were already there, and
+// the ones goimports puts between groups of imports, stay.
+func dropNewBlankBeforeHeading(after, before string) string {
+	bl := strings.Split(before, "\n")
+	al := strings.Split(after, "\n")
+	inBlock := false
+	var out []string
+	for i, l := range al {
+		t := strings.TrimSpace(l)
+		switch {
+		case strings.HasPrefix(l, "import ("):
+			inBlock = true
+		case inBlock && l == ")":
+			inBlock = false
+		}
+		if inBlock && t == "" && i > 0 && i+1 < len(al) && len(out) > 0 {
+			prev, next := strings.TrimSpace(out[len(out)-1]), strings.TrimSpace(al[i+1])
+			if prev != "" && (strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/*")) && adjacentInBefore(bl, prev, next) {
+				continue
+			}
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
+}
+
+// adjacentInBefore: line prev precedes line next in lines with no blank line between them.
+func adjacentInBefore(lines []string, prev, next string) bool {
+	p := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l) == prev {
+			p = i
+			break
+		}
+	}
+	if p < 0 {
+		return false
+	}
+	for j := p + 1; j < len(lines); j++ {
+		switch t := strings.TrimSpace(lines[j]); {
+		case t == "":
+			return false
+		case t == next:
+			return true
+		}
+	}
+	return false
+}
+
+func dropOrphanImportComments(filename, before, after string) string {
 	fset := token.NewFileSet()
 	bf, err := parser.ParseFile(fset, filename, before, parser.ParseComments)
 	if bf == nil || err != nil {

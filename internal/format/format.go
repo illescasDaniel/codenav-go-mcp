@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
@@ -32,10 +32,7 @@ func Relative(uri, root string) string {
 	if p == "" {
 		return uri
 	}
-	if rel, err := filepath.Rel(root, p); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel)
-	}
-	return p
+	return exclude.RelativeTo(p, root)
 }
 
 type lineKey struct {

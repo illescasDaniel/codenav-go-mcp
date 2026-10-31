@@ -82,7 +82,6 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 	if err != nil {
 		return "", "", err
 	}
-	plan.Notes = append(plan.Notes, nestedModuleNotes(w.Root, planPaths(plan))...)
 	plan.Notes = append(plan.Notes, unformattedNotes(w.Root, plan)...)
 	return conclude(w, plan, delta, apply, maxNew, allowLarge)
 }
@@ -105,7 +104,10 @@ func unformattedNotes(root string, plan *edits.EditPlan) []string {
 // nestedModuleNotes warns when edited files belong to a module the workspace does not build (a
 // nested go.mod with no go.work listing it): the edit rewrites only workspace code, so callers in other
 // modules are type-checked (their errors are listed) but never edited.
-func nestedModuleNotes(root string, paths []string) []string {
+//
+// checked lists the files the simulation type-checked: the note is only worth showing when one of them
+// lies outside the module (a real caller or importer in a sibling module) - otherwise nothing is left unedited.
+func nestedModuleNotes(root string, paths, checked []string) []string {
 	seen := map[string]bool{}
 	var notes []string
 	for _, p := range paths {
@@ -114,6 +116,16 @@ func nestedModuleNotes(root string, paths []string) []string {
 			continue
 		}
 		seen[n.Dir] = true
+		outside := false
+		for _, f := range checked {
+			if rel, err := filepath.Rel(n.Dir, f); err != nil || strings.HasPrefix(rel, "..") {
+				outside = true
+				break
+			}
+		}
+		if !outside {
+			continue
+		}
 		name := n.Path
 		if name == "" {
 			name = edits.RelativeName(n.Dir, root)
@@ -160,7 +172,11 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q%s) to write it anyway.", newErrs, maxErrors(maxNew), id, id, largeArg(w, plan)))
 		out = append(out, "", plan.Diff(w.Root, 2, 120))
 	case readOnly:
-		out = append(out, "", "Preview only (apply=false); write tools are disabled ("+ReadOnlyEnv+").", "", plan.Diff(w.Root, 2, 200))
+		out = append(out, "", "Preview only (apply=false); write tools are disabled ("+ReadOnlyEnv+").")
+		if maxNew >= 0 && newErrs > maxNew {
+			out = append(out, fmt.Sprintf("Warning: with apply=true this edit would be refused, because its %d new error(s) exceed max_new_errors=%s; it would apply with max_new_errors=%d (or -1 for no limit) - if write tools were enabled.", newErrs, maxErrors(maxNew), newErrs))
+		}
+		out = append(out, "", plan.Diff(w.Root, 2, 200))
 	default:
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
@@ -246,17 +262,8 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 				out, err = fn(ctx, w, in)
 			}
 		}
-		if err != nil {
-			t, ok := toolerr.Format(err)
-			if !ok {
-				return nil, nil, err
-			}
-			out = t
-			if w != nil {
-				out = w.scrub(out)
-			}
-		}
-		return text(h.Notes().Annotate(w.withConfigProblem(ctx, out))), nil, nil
+		res, rerr := finishResult(ctx, h, w, out, err)
+		return res, nil, rerr
 	})
 }
 
@@ -271,7 +278,7 @@ func checkMaxNewErrors(in any) error {
 		Max *int `json:"max_new_errors"`
 	}
 	if json.Unmarshal(b, &f) == nil && f.Max != nil && *f.Max < -1 {
-		return toolerr.Inputf("max_new_errors=%d is invalid: use a count >= 0, or -1 for no limit.", *f.Max)
+		return toolerr.Argf("max_new_errors=%d is invalid: use a count >= 0, or -1 for no limit.", *f.Max)
 	}
 	return nil
 }
@@ -284,7 +291,7 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		return nil, err
 	}
 	if filepath.Ext(abs) != ".go" {
-		return nil, toolerr.Inputf("%q is not a .go file.", in.FilePath)
+		return nil, toolerr.Argf("%q is not a .go file.", in.FilePath)
 	}
 	old, bom, rerr := edits.ReadSource(abs)
 	exists := rerr == nil
@@ -295,15 +302,15 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 	switch {
 	case in.NewText != "":
 		if in.OldString != "" {
-			return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text, not both.")
+			return nil, toolerr.Argf("pass either old_string + new_string or the complete new_text, not both.")
 		}
 		next = in.NewText
 	case in.OldString != "":
 		if !exists {
-			return nil, toolerr.Inputf("%s does not exist; pass new_text to create it.", in.FilePath)
+			return nil, toolerr.Argf("%s does not exist; pass new_text to create it.", in.FilePath)
 		}
 		if in.NewString == nil {
-			return nil, toolerr.Inputf("old_string needs new_string; pass new_string=\"\" to delete the text.")
+			return nil, toolerr.Argf("old_string needs new_string; pass new_string=\"\" to delete the text.")
 		}
 		// Match on LF-normalised text, so an old_string written with LF finds CRLF (or mixed) lines;
 		// fileChange gives the result the file's line endings back, line by line.
@@ -311,9 +318,9 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		n := strings.Count(hay, needle)
 		switch {
 		case n == 0:
-			return nil, toolerr.Inputf("old_string was not found in %s (it must match exactly, including whitespace).", in.FilePath)
+			return nil, toolerr.Argf("old_string was not found in %s (it must match exactly, including whitespace).", in.FilePath)
 		case n > 1 && !in.ReplaceAll:
-			return nil, toolerr.Inputf("old_string matches %d times in %s; add context to make it unique or pass replace_all=true.", n, in.FilePath)
+			return nil, toolerr.Argf("old_string matches %d times in %s; add context to make it unique or pass replace_all=true.", n, in.FilePath)
 		}
 		count := 1
 		if in.ReplaceAll {
@@ -324,6 +331,72 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
 	}
 	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
+}
+
+// pkgOfFile is the package a file belongs to: its package clause, minus the _test suffix of an external
+// test package (cs_test in cs_test.go is cs's own test package).
+func pkgOfFile(path, src string) string {
+	name := gosrc.PackageName(src)
+	if strings.HasSuffix(path, "_test.go") {
+		name = strings.TrimSuffix(name, "_test")
+	}
+	return name
+}
+
+// packageClauseRefusal refuses, with one message, an edit that gives a file of an existing package a
+// package clause that differs from the other files of its directory: the type checker would report the
+// same cause twice and the package would stop building. maxNew < 0 or >= 2 means the caller accepts the
+// errors (renaming the package file by file).
+func packageClauseRefusal(w *Workspace, plan *edits.EditPlan, maxNew int) error {
+	if maxNew < 0 || maxNew >= 2 {
+		return nil
+	}
+	inPlan := map[string]bool{}
+	for _, c := range plan.Changes {
+		inPlan[c.Path] = true
+	}
+	for _, c := range plan.Changes {
+		if c.New == nil || filepath.Ext(c.Path) != ".go" {
+			continue
+		}
+		next := pkgOfFile(c.Path, *c.New)
+		if next == "" {
+			continue
+		}
+		if c.Old != nil && pkgOfFile(c.Path, *c.Old) == next {
+			continue // the package clause is not what changes
+		}
+		ents, err := os.ReadDir(filepath.Dir(c.Path))
+		if err != nil {
+			continue
+		}
+		others := map[string][]string{}
+		for _, e := range ents {
+			p := filepath.Join(filepath.Dir(c.Path), e.Name())
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || inPlan[p] {
+				continue
+			}
+			src, _, rerr := edits.ReadSource(p)
+			if rerr != nil || strings.Contains(src[:min(len(src), 400)], "go:build ignore") {
+				continue
+			}
+			if n := pkgOfFile(p, src); n != "" {
+				others[n] = append(others[n], e.Name())
+			}
+		}
+		if len(others) != 1 {
+			continue // a new directory, or one that already mixes packages
+		}
+		for name, files := range others {
+			if name == next {
+				continue
+			}
+			rel := edits.RelativeName(c.Path, w.Root)
+			return toolerr.Inputf("%s would declare `package %s`, but the other files of %s declare `package %s` (%s): one directory is one package. Keep `package %s`, or change the package clause of all its files; to do that file by file pass max_new_errors=-1.",
+				rel, next, edits.RelativeName(filepath.Dir(c.Path), w.Root), name, strings.Join(files[:min(len(files), 3)], ", "), name)
+		}
+	}
+	return nil
 }
 
 // isGofmted reports whether text (any line endings) is what gofmt would leave unchanged. (goimports'
@@ -391,6 +464,9 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 		func(ctx context.Context, w *Workspace, in editIn) (string, error) {
 			plan, err := planEdit(w, in)
 			if err != nil {
+				return "", err
+			}
+			if err := packageClauseRefusal(w, plan, limit(in.MaxNewErrors)); err != nil {
 				return "", err
 			}
 			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)

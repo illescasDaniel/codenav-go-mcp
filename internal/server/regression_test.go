@@ -248,10 +248,9 @@ func TestConfigWarningOnlyWhenBroken(t *testing.T) {
 // B12: in a read-only server the preview should warn too (README: "An apply=false preview warns when its
 // new errors exceed max_new_errors").
 func TestReadOnlyPreviewWarnsWhenMaxNewErrorsWouldRefuse(t *testing.T) {
-	t.Skip("BUG: with CODENAV_GO_MCP_READ_ONLY=1 an apply=false preview ends with \"Preview only (apply=false); write tools are disabled\" and never gets the \"would be refused ... max_new_errors\" warning that the normal preview has (internal/tools/write.go, `case readOnly:` has no warning; README says any apply=false preview warns). Remove the Skip once it is wired.")
 	cs, _ := session(t, map[string]string{EnvReadOnly: "1"})
 	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": scaleSig, "new_string": "func Scale(s Shape, k float64)", "apply": false})
-	mustHave(t, "read-only preview", out, "would be refused", "max_new_errors=")
+	mustHave(t, "read-only preview", out, "would be refused", "max_new_errors=0", "exceed max_new_errors")
 }
 
 // B11: a choice that matches a fix for a diagnostic is reported as held back (default) or as "its fix was not

@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf16"
+
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 )
 
 // PushDiagnosticsTimeout bounds the wait for a push-only publishDiagnostics.
@@ -823,7 +825,23 @@ func (c *Client) locationRequest(ctx context.Context, method, path string, line,
 	for k, v := range extra {
 		p[k] = v
 	}
-	return locations(c.Request(ctx, method, p))
+	locs, err := locations(c.Request(ctx, method, p))
+	if method == "textDocument/definition" || method == "textDocument/typeDefinition" {
+		return locs, err // callers explain a declaration in cgo glue
+	}
+	return dropGenerated(locs, func(l Location) string { return l.URI }), err
+}
+
+// dropGenerated removes the entries in cgo's generated glue (go build cache), which no results should list.
+func dropGenerated[T any](xs []T, uri func(T) string) []T {
+	out := xs[:0:0]
+	for _, x := range xs {
+		if p := URIToPath(uri(x)); p != "" && exclude.IsCgoGenerated(p) {
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
 }
 
 func (c *Client) Definition(ctx context.Context, path string, line, column int) ([]Location, error) {
@@ -844,7 +862,13 @@ func (c *Client) References(ctx context.Context, path string, line, column int, 
 }
 
 func (c *Client) WorkspaceSymbol(ctx context.Context, query string) ([]Symbol, error) {
-	return decode[[]Symbol](c.Request(ctx, "workspace/symbol", map[string]any{"query": query}))
+	syms, err := decode[[]Symbol](c.Request(ctx, "workspace/symbol", map[string]any{"query": query}))
+	return dropGenerated(syms, func(s Symbol) string {
+		if s.Location == nil {
+			return ""
+		}
+		return s.Location.URI
+	}), err
 }
 
 func (c *Client) DocumentSymbol(ctx context.Context, path string) ([]Symbol, error) {

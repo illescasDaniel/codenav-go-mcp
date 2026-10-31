@@ -10,17 +10,16 @@ import (
 	"go/parser"
 	"go/token"
 	"net/url"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"sync"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
@@ -65,18 +64,45 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 				out, err = fn(ctx, w, in)
 			}
 		}
-		if err != nil {
-			t, ok := toolerr.Format(err)
-			if !ok {
-				return nil, nil, err
-			}
-			out = t
-			if w != nil {
-				out = w.scrub(out)
-			}
-		}
-		return text(h.Notes().Annotate(w.withConfigProblem(ctx, out))), nil, nil
+		res, rerr := finishResult(ctx, h, w, out, err)
+		return res, nil, rerr
 	})
+}
+
+// finishResult turns a handler's outcome into the tool result, the one place every answer passes: an
+// unexpected error is returned as is; the text is shown with workspace-relative paths and a bounded size,
+// plus the broken-configuration warning (not for plain argument mistakes) and pending notices.
+func finishResult(ctx context.Context, h Host, w *Workspace, out string, err error) (*mcp.CallToolResult, error) {
+	trivial := false
+	if err != nil {
+		t, ok := toolerr.Format(err)
+		if !ok {
+			return nil, err
+		}
+		out, trivial = t, toolerr.IsTrivial(err)
+	}
+	if w != nil {
+		out = w.scrub(out)
+	}
+	out = capOutput(out)
+	if !trivial {
+		out = w.withConfigProblem(ctx, out)
+	}
+	return text(h.Notes().Annotate(out)), nil
+}
+
+// maxOutputBytes bounds one answer; the rest is dropped with a note saying how much.
+const maxOutputBytes = 400_000
+
+func capOutput(out string) string {
+	if len(out) <= maxOutputBytes {
+		return out
+	}
+	cut := strings.LastIndex(out[:maxOutputBytes], "\n")
+	if cut < maxOutputBytes/2 {
+		cut = maxOutputBytes
+	}
+	return fmt.Sprintf("%s\n... %d more byte(s) omitted (the answer is over %d bytes; narrow the request).", out[:cut], len(out)-cut, maxOutputBytes)
 }
 
 // withConfigProblem appends the go command's complaint about a broken go.mod / go.work, which otherwise
@@ -118,26 +144,8 @@ func addIndexed(w *Workspace, q string, have []*lsp.Symbol) []*lsp.Symbol {
 	return have
 }
 
-var (
-	goCacheOnce sync.Once
-	goCacheDir  string
-)
-
-// goCache is the go build cache directory (`go env GOCACHE`), "" when unknown.
-func goCache() string {
-	goCacheOnce.Do(func() {
-		if out, err := exec.Command("go", "env", "GOCACHE").Output(); err == nil {
-			goCacheDir = strings.TrimSpace(string(out))
-		}
-	})
-	return goCacheDir
-}
-
 // isCgoGenerated: a file cgo wrote into the go build cache.
-func isCgoGenerated(p string) bool {
-	cache := goCache()
-	return cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) || strings.Contains(filepath.ToSlash(p), "/go-build/")
-}
+func isCgoGenerated(p string) bool { return exclude.IsCgoGenerated(p) }
 
 var cgoNameRE = regexp.MustCompile(`\b_C(?:func|type|var|const|macro)_(\w+)`)
 
@@ -204,7 +212,7 @@ var generatedPrefixes = []string{"_Cfunc_", "_Ctype_", "_Cvar_", "_Cmacro_", "_C
 // dropNoise removes symbols from files the go tool never compiles (`_x.go`, `//go:build ignore`) and
 // the generated ones cgo leaves in the build cache.
 func dropNoise(syms []*lsp.Symbol) []*lsp.Symbol {
-	cache := goCache()
+	cache := exclude.GoCache()
 	unbuildable := map[string]bool{}
 	kept := syms[:0:0]
 	for _, s := range syms {

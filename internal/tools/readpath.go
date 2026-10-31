@@ -107,11 +107,37 @@ func filePathOf(in any) string {
 	return f.FilePath
 }
 
-// scrub shows the workspace-relative form of the paths in an error message: parser and tool errors
-// carry the absolute file name.
+// scrub shows the workspace-relative form of the paths in a message: parser, gopls and tool messages
+// carry absolute file names. Only a path that starts at a word boundary is rewritten, so
+// "/other/<root>/x" stays as it is.
 func (w *Workspace) scrub(msg string) string {
 	if w.Root == "" {
 		return msg
 	}
-	return strings.ReplaceAll(msg, strings.TrimRight(w.Root, "/")+"/", "")
+	roots := []string{strings.TrimRight(w.Root, "/")}
+	if real, err := filepath.EvalSymlinks(w.Root); err == nil && strings.TrimRight(real, "/") != roots[0] {
+		roots = append(roots, strings.TrimRight(real, "/"))
+	}
+	for _, r := range roots {
+		msg = stripPathPrefix(msg, r+"/")
+	}
+	return msg
+}
+
+// stripPathPrefix removes prefix wherever it starts a path (not preceded by a path character).
+func stripPathPrefix(msg, prefix string) string {
+	var sb strings.Builder
+	for {
+		i := strings.Index(msg, prefix)
+		if i < 0 {
+			break
+		}
+		sb.WriteString(msg[:i])
+		if i > 0 && strings.ContainsRune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/~", rune(msg[i-1])) {
+			sb.WriteString(prefix)
+		}
+		msg = msg[i+len(prefix):]
+	}
+	sb.WriteString(msg)
+	return sb.String()
 }

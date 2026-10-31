@@ -193,6 +193,11 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 	if r.plain || (len(r.titles) == 0 && len(r.notFixed) == 0 && !r.wrote) {
 		return r.out, nil
 	}
+	if !r.wrote && len(r.notFixed) == 0 {
+		// A preview (or a refusal) where everything targeted is fixable: "Applied: nothing (not written ...)" and
+		// "Not fixed: none" would only repeat what the Preview / Not written line says.
+		return r.out, nil
+	}
 	applied := "nothing"
 	switch {
 	case r.wrote && len(r.titles) > 0:

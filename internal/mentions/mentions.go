@@ -69,8 +69,51 @@ func codeContext(name string) *regexp.Regexp {
 	return regexp.MustCompile("`" + q + "`|\\[" + q + "\\]|(?:^|[^\\w])" + q + `\(|\.` + q + `(?:[^\w]|$)`)
 }
 
-func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string, codeIn func(path, text string) bool) []Mention {
+// localIdents returns the byte offsets of the identifiers called name that the parser resolves to a
+// declaration inside a function (a local variable, parameter, named result or local type): they are
+// different objects than a package-level symbol of that name, which they shadow.
+func localIdents(path, text, name string) map[int]bool {
+	f, err := parser.ParseFile(token.NewFileSet(), path, text, 0)
+	if f == nil || err != nil && len(f.Decls) == 0 {
+		return nil
+	}
+	fset := token.NewFileSet()
+	f, _ = parser.ParseFile(fset, path, text, 0)
+	type span struct{ a, b token.Pos }
+	var funcs []span
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok {
+			funcs = append(funcs, span{fd.Pos(), fd.End()})
+		}
+	}
+	local := map[int]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || id.Name != name || id.Obj == nil || !id.Obj.Pos().IsValid() {
+			return true
+		}
+		if id.Obj.Kind == ast.Typ {
+			if _, isSpec := id.Obj.Decl.(*ast.TypeSpec); !isSpec {
+				return true // a type parameter keeps being listed
+			}
+		}
+		for _, sp := range funcs {
+			if id.Obj.Pos() >= sp.a && id.Obj.Pos() < sp.b {
+				local[fset.Position(id.Pos()).Offset] = true
+				break
+			}
+		}
+		return true
+	})
+	return local
+}
+
+func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string, codeIn func(path, text string) bool, skipLocals bool) []Mention {
 	lines := strings.Split(text, "\n")
+	var locals map[int]bool
+	if skipLocals {
+		locals = localIdents(path, text, name)
+	}
 	var found []Mention
 	// A name of one or two letters is mostly prose elsewhere, but inside the package of the renamed symbol
 	// a whole-word mention in a string or comment is likely about it.
@@ -97,6 +140,9 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 		case tok == token.IDENT && lit == name:
 			if codeIn != nil && !codeIn(path, text) {
 				continue
+			}
+			if locals[p.Offset] {
+				continue // a local variable or parameter that shadows the symbol: another object
 			}
 			found = append(found, Mention{rel, p.Line, p.Column, "code", snippet(lines, p.Line), false})
 		case outOfScope && (tok == token.COMMENT || tok == token.STRING || tok == token.CHAR):
@@ -213,7 +259,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 		}
 		rel := edits.RelativeName(p, root)
 		if isGo {
-			found = append(found, goMentions(p, rel, name, word, prose, text, codeIn)...)
+			found = append(found, goMentions(p, rel, name, word, prose, text, codeIn, only == "")...)
 			return nil
 		}
 		for i, line := range strings.Split(text, "\n") {

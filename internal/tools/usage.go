@@ -120,6 +120,31 @@ func friendlyTypeError(text string) string {
 	return ""
 }
 
+// decodeErrRE: the JSON decoder's refusal of a value that does not fit the Go field ("json: cannot unmarshal
+// number 9223372036854775808 into Go struct field tools.refsIn.line of type int").
+var decodeErrRE = regexp.MustCompile(`json: cannot unmarshal (?:(\w+) )?(.*?) into Go struct field (?:\w+\.)*(\w+) of type (\w+)`)
+
+// friendlyDecodeError rewrites such a refusal into a sentence naming the parameter; "" when text is not one.
+func friendlyDecodeError(text string) string {
+	m := decodeErrRE.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	kind, param, goType := m[1], m[3], m[4]
+	val := strings.TrimSuffix(strings.Trim(m[2], `"`), "} overflows")
+	val = strings.TrimSuffix(val, " overflows")
+	if len(val) > 40 {
+		val = val[:40] + "..."
+	}
+	if strings.HasPrefix(goType, "int") || strings.HasPrefix(goType, "uint") {
+		if kind == "" || kind == "number" {
+			return fmt.Sprintf("%s must be a whole number of reasonable size (got %s, which does not fit).", param, val)
+		}
+		return fmt.Sprintf("%s must be an integer (got %s %s).", param, kind, val)
+	}
+	return fmt.Sprintf("%s has the wrong type (got %s).", param, strings.TrimSpace(kind+" "+val))
+}
+
 func strconvQuote(s string) string { return strconv.Quote(s) }
 
 var missingRE = regexp.MustCompile(`(?:validating /properties/([^:]*): )?required: missing properties: \[([^\]]*)\]`)
@@ -151,7 +176,11 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 		}
 		m := missingRE.FindStringSubmatch(tc.Text)
 		if m == nil {
-			if msg := friendlyTypeError(tc.Text); msg != "" {
+			msg := friendlyTypeError(tc.Text)
+			if msg == "" {
+				msg = friendlyDecodeError(tc.Text)
+			}
+			if msg != "" {
 				if usage != "" {
 					msg += " Usage: " + usage + " (parameters in brackets are optional)."
 				}

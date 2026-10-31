@@ -1245,16 +1245,27 @@ func TestNotFoundHints(t *testing.T) {
 	writeFile(t, root, "sub/go.mod", "module example.com/sub\n\ngo 1.24\n")
 	writeFile(t, root, "sub/s.go", "package sub\n\nfunc SubOnly() {}\n")
 	out := call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() {}", "new_string": "func SubOnly() int { return 1 }"})
-	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "NOT rewritten") {
-		t.Errorf("an edit in a nested module must say its importers are not checked:\n%s", out)
+	if strings.Contains(out, "NOT rewritten") {
+		t.Errorf("no module imports sub: nothing is left unedited, so no note:\n%s", out)
 	}
-	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})
+	// With a sibling module that imports it, the note appears.
+	writeFile(t, root, "subuser/go.mod", "module example.com/subuser\n\ngo 1.24\n\nrequire example.com/sub v0.0.0\n\nreplace example.com/sub => ../sub\n")
+	writeFile(t, root, "subuser/u.go", "package subuser\n\nimport \"example.com/sub\"\n\nvar _ = sub.SubOnly\n")
+	out = call(t, cs, "edit", map[string]any{"file_path": "sub/s.go", "old_string": "func SubOnly() int { return 1 }", "new_string": "func SubOnly() int { return 2 }"})
+	if !strings.Contains(out, "belongs to module example.com/sub") || !strings.Contains(out, "NOT rewritten") {
+		t.Errorf("an edit in a nested module with a sibling importer must say its importers are not rewritten:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "NoSuchThingZZZ", "new_name": "X"})
+	if strings.Contains(out, "example.com/sub (sub)") {
+		t.Errorf("a name nothing links to the nested module is no reason to mention it:\n%s", out)
+	}
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "sub.NoSuchThingZZZ", "new_name": "X"})
 	if !strings.Contains(out, "example.com/sub (sub)") || !strings.Contains(out, "go.work") {
-		t.Errorf("a failed lookup must mention the uncovered nested module:\n%s", out)
+		t.Errorf("a failed lookup of a name the nested module could declare must mention it:\n%s", out)
 	}
 	writeFile(t, root, "go.work", "go 1.24\n\nuse (\n\t.\n\t./sub\n)\n")
-	out = call(t, cs, "symbol_info", map[string]any{"name": "NoSuchThingZZZ"})
-	if strings.Contains(out, "example.com/sub") {
+	out = call(t, cs, "rename_symbol", map[string]any{"name": "sub.NoSuchThingZZZ", "new_name": "X"})
+	if strings.Contains(out, "example.com/sub (sub)") {
 		t.Errorf("a module listed in go.work is covered:\n%s", out)
 	}
 }

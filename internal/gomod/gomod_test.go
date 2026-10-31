@@ -211,3 +211,18 @@ func TestWorkModules(t *testing.T) {
 		t.Errorf("no go.work: %v", got)
 	}
 }
+
+// Round 12: several problems of one config are separated, not run together.
+func TestConfigProblemSeparatesErrors(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	two := t.TempDir()
+	writeTree(t, two, map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./gone1\n\t./gone2\n)\n",
+	})
+	p := ConfigProblem(context.Background(), two)
+	if !strings.Contains(p, "gone1/go.mod: no such file or directory; go: cannot load module gone2") {
+		t.Errorf("two errors must be separated by \"; \": %q", p)
+	}
+}

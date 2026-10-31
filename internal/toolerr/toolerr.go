@@ -16,12 +16,26 @@ type InputError struct {
 	Msg string
 	// Hint lists names the caller probably meant (case-insensitive matches), when there are any.
 	Hint []string
+	// Trivial marks a mistake in the arguments themselves (a bad identifier, an old_string that is not in the
+	// file): the Go configuration of the workspace has nothing to do with it.
+	Trivial bool
 }
 
 func (e *InputError) Error() string { return e.Msg }
 
 // Inputf builds an InputError.
 func Inputf(format string, args ...any) error { return &InputError{Msg: fmt.Sprintf(format, args...)} }
+
+// Argf builds an InputError for a mistake in the call's arguments, unrelated to the workspace.
+func Argf(format string, args ...any) error {
+	return &InputError{Msg: fmt.Sprintf(format, args...), Trivial: true}
+}
+
+// IsTrivial reports whether err is an argument mistake (see InputError.Trivial).
+func IsTrivial(err error) bool {
+	var ie *InputError
+	return errors.As(err, &ie) && ie.Trivial
+}
 
 // Format turns err into the text a tool returns; ok is false for unexpected errors.
 func Format(err error) (text string, ok bool) {

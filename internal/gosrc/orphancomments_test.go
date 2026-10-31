@@ -68,3 +68,18 @@ func TestTidyImportBlanks(t *testing.T) {
 		}
 	}
 }
+
+// Round 12: removing an import and its comment must not leave a blank line above the heading of the next
+// import (there was none before); blank lines that were already there stay.
+func TestDropOrphanImportCommentsNoNewBlankBeforeHeading(t *testing.T) {
+	before := "package p\n\nimport (\n\t\"fmt\"\n\t/* multi\n\t   line */\n\t\"errors\"\n\t// end\n\t\"os\"\n)\n\nvar _ = fmt.Sprint\nvar _ = os.Args\n"
+	gopls := "package p\n\nimport (\n\t\"fmt\"\n\n\t// end\n\t\"os\"\n)\n\nvar _ = fmt.Sprint\nvar _ = os.Args\n"
+	want := "package p\n\nimport (\n\t\"fmt\"\n\t// end\n\t\"os\"\n)\n\nvar _ = fmt.Sprint\nvar _ = os.Args\n"
+	if got := DropOrphanImportComments("p.go", before, gopls); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+	kept := "package p\n\nimport (\n\t\"fmt\"\n\n\t// end\n\t\"os\"\n)\n\nvar _ = fmt.Sprint\nvar _ = os.Args\n"
+	if got := DropOrphanImportComments("p.go", kept, kept); got != kept {
+		t.Errorf("a blank line that was already there stays:\n%s", got)
+	}
+}

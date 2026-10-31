@@ -88,5 +88,5 @@ func probeConfig(ctx context.Context, root string) string {
 	if len(lines) > 4 {
 		lines = append(lines[:4], "...")
 	}
-	return strings.Join(lines, " ")
+	return strings.Join(lines, "; ")
 }

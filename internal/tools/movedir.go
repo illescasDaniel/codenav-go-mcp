@@ -46,7 +46,9 @@ func moveDirectory(ctx context.Context, w *Workspace, from, to string, in moveIn
 	if err != nil {
 		return "", err
 	}
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+	if st, err := os.Stat(src); err == nil && !st.IsDir() {
+		return "", toolerr.Inputf("%s is a file, and file_path + to_file without name moves a whole directory (a package). To move a symbol out of it pass name=<symbol> with to_file=<.go file>; moving a single file is not supported.", from)
+	} else if err != nil || !st.IsDir() {
 		return "", toolerr.Inputf("%s is not a directory.", from)
 	}
 	if src == w.Root {
