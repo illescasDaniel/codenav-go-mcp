@@ -67,3 +67,35 @@ func TestFindListsALineOnce(t *testing.T) {
 		t.Errorf("want lines 3 and 5, got %v", lines)
 	}
 }
+
+// A file that cannot refer to the symbol (codeIn false) but declares a same-named top-level name: its comments
+// and strings are about that declaration, not leftovers of the rename.
+func TestFindScopedSkipsFilesDeclaringTheName(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, src string) {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("decl.go", "package q\n\n// Widget is q's own.\nfunc Widget() {}\n\nvar s = \"Widget\"\n")
+	write("declvar.go", "package q\n\n// Widget is q's own var.\nvar Widget = 1\n")
+	write("decltype.go", "package q\n\n// Widget is q's own type.\ntype Widget struct{}\n")
+	write("declmethod.go", "package q\n\n// Widget is a method here.\nfunc (T) Widget() {}\n\ntype T struct{}\n")
+	write("talks.go", "package q\n\n// Widget is only talked about.\nvar s = \"Widget\"\n")
+	write("refers.go", "package q\n\n// Widget is a real use.\nfunc g() { Widget() }\n")
+	codeIn := func(path, text string) bool { return filepath.Base(path) == "refers.go" }
+	files := map[string]bool{}
+	for _, m := range FindScoped(root, "Widget", nil, "", codeIn) {
+		files[m.Path] = true
+	}
+	for _, f := range []string{"decl.go", "declvar.go", "decltype.go", "declmethod.go"} {
+		if files[f] {
+			t.Errorf("%s declares its own Widget; its comments/strings must not be listed: %v", f, files)
+		}
+	}
+	for _, f := range []string{"talks.go", "refers.go"} {
+		if !files[f] {
+			t.Errorf("%s must still be listed: %v", f, files)
+		}
+	}
+}

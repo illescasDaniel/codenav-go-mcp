@@ -136,3 +136,78 @@ func TestRelatedWithCgoFiles(t *testing.T) {
 		t.Errorf("a plain file must relate to the cgo file and the importers: %v", files)
 	}
 }
+
+func TestConfigProblem(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go not installed")
+	}
+	ctx := context.Background()
+
+	healthy := t.TempDir()
+	writeTree(t, healthy, map[string]string{"go.mod": "module example.com/h\n\ngo 1.21\n", "h.go": "package h\n"})
+	if p := ConfigProblem(ctx, healthy); p != "" {
+		t.Errorf("healthy module: %q", p)
+	}
+
+	healthyWork := t.TempDir()
+	writeTree(t, healthyWork, map[string]string{
+		"go.mod": "module example.com/w\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./sub\n)\n",
+		"sub/go.mod": "module example.com/w/sub\n\ngo 1.21\n",
+	})
+	if p := ConfigProblem(ctx, healthyWork); p != "" {
+		t.Errorf("healthy go.work workspace: %q", p)
+	}
+
+	noMod := t.TempDir()
+	if p := ConfigProblem(ctx, noMod); p != "" {
+		t.Errorf("a directory without any go.mod is not a problem: %q", p)
+	}
+
+	broken := t.TempDir()
+	writeTree(t, broken, map[string]string{"go.mod": "this is not a go.mod\n"})
+	p := ConfigProblem(ctx, broken)
+	if p == "" || strings.Contains(p, broken) || strings.Contains(p, "\n") {
+		t.Errorf("garbled go.mod: want a one-line problem relative to the workspace, got %q", p)
+	}
+	// Cached answer follows the file: fixing it clears the problem.
+	writeTree(t, broken, map[string]string{"go.mod": "module example.com/fixed\n\ngo 1.21\n\n// fixed and longer so the stamp changes\n"})
+	if p := ConfigProblem(ctx, broken); p != "" {
+		t.Errorf("after fixing go.mod the problem must be gone: %q", p)
+	}
+
+	missingUse := t.TempDir()
+	writeTree(t, missingUse, map[string]string{
+		"go.mod": "module example.com/m\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./missing\n)\n",
+	})
+	p = ConfigProblem(ctx, missingUse)
+	if p == "" || !strings.Contains(p, "missing") || strings.Contains(p, missingUse) {
+		t.Errorf("go.work with a missing use directory: %q", p)
+	}
+}
+
+func TestWorkModules(t *testing.T) {
+	root := t.TempDir()
+	writeTree(t, root, map[string]string{
+		"go.mod":       "module example.com/r\n\ngo 1.21\n",
+		"go.work":      "go 1.21\n\nuse (\n\t.\n\t./zeta\n\t./alpha\n\t./nogomod\n\t./missing\n)\n",
+		"zeta/go.mod":  "module example.com/zeta\n\ngo 1.21\n",
+		"alpha/go.mod": "module example.com/alpha\n\ngo 1.21\n",
+		"nogomod/x.go": "package x\n",
+	})
+	got := WorkModules(root)
+	want := []string{filepath.Join(root, "alpha"), filepath.Join(root, "zeta")}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("sorted use modules without root, dirs lacking a go.mod: got %v want %v", got, want)
+	}
+	// From a member module, the others (including the go.work's own directory module) are listed.
+	got = WorkModules(filepath.Join(root, "alpha"))
+	want = []string{root, filepath.Join(root, "zeta")}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("from member alpha: got %v want %v", got, want)
+	}
+	plain := t.TempDir()
+	writeTree(t, plain, map[string]string{"go.mod": "module example.com/p\n\ngo 1.21\n"})
+	if got := WorkModules(plain); len(got) != 0 {
+		t.Errorf("no go.work: %v", got)
+	}
+}

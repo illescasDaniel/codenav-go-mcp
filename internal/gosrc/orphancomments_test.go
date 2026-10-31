@@ -52,3 +52,19 @@ func TestDropOrphanImportCommentsRound11(t *testing.T) {
 		}
 	}
 }
+
+func TestTidyImportBlanks(t *testing.T) {
+	for _, c := range []struct{ name, in, want string }{
+		{"blank after paren", "package p\n\nimport (\n\n\t\"fmt\"\n)\n", "package p\n\nimport (\n\t\"fmt\"\n)\n"},
+		{"blank before paren", "package p\n\nimport (\n\t\"fmt\"\n\n)\n", "package p\n\nimport (\n\t\"fmt\"\n)\n"},
+		{"runs collapse to one", "package p\n\nimport (\n\t\"fmt\"\n\n\n\n\t\"os\"\n)\n", "package p\n\nimport (\n\t\"fmt\"\n\n\t\"os\"\n)\n"},
+		{"single blank between groups stays", "package p\n\nimport (\n\t\"fmt\"\n\n\t\"os\"\n)\n", "package p\n\nimport (\n\t\"fmt\"\n\n\t\"os\"\n)\n"},
+		{"unparenthesised import untouched", "package p\n\nimport \"fmt\"\n\n\nvar _ = fmt.Sprint\n", "package p\n\nimport \"fmt\"\n\n\nvar _ = fmt.Sprint\n"},
+		{"code after the block untouched", "package p\n\nimport (\n\t\"fmt\"\n)\n\n\nvar _ = fmt.Sprint\n", "package p\n\nimport (\n\t\"fmt\"\n)\n\n\nvar _ = fmt.Sprint\n"},
+		{"unparsable source returned as is", "package p\n\nimport (\n\n\n", "package p\n\nimport (\n\n\n"},
+	} {
+		if got := tidyImportBlanks("x.go", c.in); got != c.want {
+			t.Errorf("%s:\n got  %q\n want %q", c.name, got, c.want)
+		}
+	}
+}
