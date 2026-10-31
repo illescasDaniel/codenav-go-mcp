@@ -117,6 +117,52 @@ func goCache() string {
 	return goCacheDir
 }
 
+// maxDefinitions caps the locations `definition` lists.
+const maxDefinitions = 10
+
+// cgoDefinition answers `definition` on the X of `C.X` in a file importing "C": gopls would point into
+// generated code in the build cache. It names the line of the cgo preamble that declares X, or says
+// where X must live. "" when the position is not a C.X reference.
+func cgoDefinition(w *Workspace, in posIn) string {
+	abs := in.FilePath
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(w.Root, abs)
+	}
+	src, _, err := edits.ReadSource(abs)
+	if err != nil || !strings.Contains(src, `import "C"`) {
+		return ""
+	}
+	name := identAt(abs, in.Line-1, in.Column-1)
+	if name == "" {
+		return ""
+	}
+	off := edits.Offset(src, in.Line-1, in.Column-1)
+	for off > 0 && (src[off-1] == '_' || src[off-1] >= '0' && src[off-1] <= '9' || src[off-1] >= 'a' && src[off-1] <= 'z' || src[off-1] >= 'A' && src[off-1] <= 'Z') {
+		off--
+	}
+	if off < 2 || src[off-2:off] != "C." || (off > 2 && (src[off-3] == '_' || src[off-3] >= 'a' && src[off-3] <= 'z' || src[off-3] >= 'A' && src[off-3] <= 'Z' || src[off-3] >= '0' && src[off-3] <= '9')) {
+		return ""
+	}
+	pre := src[:strings.Index(src, `import "C"`)]
+	word := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	call := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\s*\(`)
+	best := 0
+	for i, l := range strings.Split(pre, "\n") {
+		if call.MatchString(l) {
+			best = i + 1
+			break
+		}
+		if best == 0 && word.MatchString(l) && !strings.HasPrefix(strings.TrimSpace(l), "#include") {
+			best = i + 1
+		}
+	}
+	rel := edits.RelativeName(abs, w.Root)
+	if best > 0 {
+		return fmt.Sprintf("C.%s is C code, declared in the cgo preamble: %s:%d\n    %s", name, rel, best, strings.TrimSpace(strings.Split(pre, "\n")[best-1]))
+	}
+	return fmt.Sprintf("C.%s is a C symbol with no Go declaration; look for it in the headers included by the cgo preamble of %s (or in a .c/.h file of the package).", name, rel)
+}
+
 // generatedPrefixes start the names cgo generates (`_Cfunc_add`, `_cgo_...`).
 var generatedPrefixes = []string{"_Cfunc_", "_Ctype_", "_Cvar_", "_Cmacro_", "_Cconst_", "_cgo_", "__cgofn__"}
 
@@ -313,6 +359,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err := checkGoFile(in.FilePath); err != nil {
 				return "", err
 			}
+			if msg := cgoDefinition(w, in); msg != "" {
+				return msg, nil
+			}
 			locs, err := w.Client.Definition(ctx, in.FilePath, in.Line, in.Column)
 			if err != nil {
 				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
@@ -320,7 +369,17 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if len(locs) == 0 {
 				return "No definition found at that position.", nil
 			}
-			return format.FormatLocations(locs, w.Root), nil
+			more := 0
+			if len(locs) > maxDefinitions {
+				// An import path has one location per file of the package.
+				more = len(locs) - maxDefinitions
+				locs = locs[:maxDefinitions]
+			}
+			out := format.FormatLocations(locs, w.Root)
+			if more > 0 {
+				out += fmt.Sprintf("\n(+%d more files)", more)
+			}
+			return out, nil
 		})
 
 	add(s, h, "references", "All usages of the symbol at a position across the workspace. Hits in _test.go files are listed separately.",

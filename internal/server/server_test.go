@@ -2326,3 +2326,18 @@ func TestReadToolsRefuseFilesOutsideTheWorkspace(t *testing.T) {
 		}
 	}
 }
+
+func TestDefinitionOnCgoCallAndImportPath(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "cg/cg.go", cgoSrc)
+	out := call(t, cs, "definition", map[string]any{"file_path": "cg/cg.go", "line": 11, "column": 40})
+	if !strings.Contains(out, "cgo preamble") || !strings.Contains(out, "cg/cg.go:6") || strings.Contains(out, "go-build") {
+		t.Errorf("definition of C.add:\n%s", out)
+	}
+	writeFile(t, root, "web/w.go", "package web\n\nimport \"net/http\"\n\nvar _ = http.StatusOK\n")
+	out = call(t, cs, "definition", map[string]any{"file_path": "web/w.go", "line": 3, "column": 14})
+	if !strings.Contains(out, "more files)") {
+		t.Errorf("definition of an import path must be capped:\n%s", out)
+	}
+}
