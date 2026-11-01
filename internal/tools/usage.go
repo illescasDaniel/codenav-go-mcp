@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,7 +20,9 @@ import (
 var usages = struct {
 	sync.Mutex
 	m map[string]string
-}{m: map[string]string{}}
+	// ints maps a tool name to its integer-typed top-level parameters.
+	ints map[string]map[string]bool
+}{m: map[string]string{}, ints: map[string]map[string]bool{}}
 
 // registerUsage records the parameters of tool name from its input struct: required ones bare, the
 // others in brackets.
@@ -29,6 +33,7 @@ func registerUsage[In any](name string) {
 		return
 	}
 	var req, opt []string
+	ints := map[string]bool{}
 	var walk func(t reflect.Type)
 	walk = func(t reflect.Type) {
 		for i := 0; i < t.NumField(); i++ {
@@ -45,6 +50,14 @@ func registerUsage[In any](name string) {
 			if n == "" {
 				n = f.Name
 			}
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			switch ft.Kind() {
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				ints[n] = true
+			}
 			if strings.Contains(rest, "omitempty") || strings.Contains(rest, "omitzero") {
 				opt = append(opt, "["+n+"]")
 			} else {
@@ -55,6 +68,7 @@ func registerUsage[In any](name string) {
 	walk(t)
 	usages.Lock()
 	usages.m[name] = name + "(" + strings.Join(append(req, opt...), ", ") + ")"
+	usages.ints[name] = ints
 	usages.Unlock()
 }
 
@@ -122,7 +136,7 @@ func friendlyTypeError(text string) string {
 
 // decodeErrRE: the JSON decoder's refusal of a value that does not fit the Go field ("json: cannot unmarshal
 // number 9223372036854775808 into Go struct field tools.refsIn.line of type int").
-var decodeErrRE = regexp.MustCompile(`json: cannot unmarshal (?:(\w+) )?(.*?) into Go struct field (?:\w+\.)*(\w+) of type (\w+)`)
+var decodeErrRE = regexp.MustCompile(`json: cannot unmarshal (?:(\w+) )?(.*?) into Go struct field (?:[\w\[\]{} ]+\.)*(\w+) of type (\w+)`)
 
 var numberTokenRE = regexp.MustCompile(`^-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?`)
 
@@ -168,6 +182,9 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && method == "tools/call" {
 			params.Arguments = dropNulls(params.Arguments)
+			if msg := hugeIntegerArg(params.Name, params.Arguments); msg != "" {
+				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil
+			}
 		}
 		res, err := next(ctx, method, req)
 		ctr, ok := res.(*mcp.CallToolResult)
@@ -225,6 +242,48 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 		tc.Text = msg
 		return res, err
 	}
+}
+
+// maxSafeInt is the largest integer a JSON number carries exactly through the float64 the schema validator
+// reads it as (2^53): beyond it the digits the caller wrote are not the ones the tool would act on.
+const maxSafeInt = 1 << 53
+
+// hugeIntegerArg answers, for an integer parameter whose JSON number is beyond +-2^53 (or does not even fit
+// a float64, like 1e400), the one message every out-of-range number gets, echoing the number as written;
+// "" when no integer argument is that large.
+func hugeIntegerArg(tool string, raw json.RawMessage) string {
+	usages.Lock()
+	ints := usages.ints[tool]
+	usage := usages.m[tool]
+	usages.Unlock()
+	var args map[string]json.RawMessage
+	if len(ints) == 0 || json.Unmarshal(raw, &args) != nil {
+		return ""
+	}
+	names := make([]string, 0, len(args))
+	for n := range args {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		tok := strings.TrimSpace(string(args[n]))
+		if !ints[n] || numberTokenRE.FindString(tok) != tok || tok == "" {
+			continue
+		}
+		f, _, err := big.ParseFloat(tok, 10, 512, big.ToNearestEven)
+		if err == nil && f.IsInt() && new(big.Float).Abs(f).Cmp(big.NewFloat(maxSafeInt)) <= 0 || err == nil && !f.IsInt() {
+			continue
+		}
+		if len(tok) > 40 {
+			tok = tok[:40] + "..."
+		}
+		msg := fmt.Sprintf("%s must be a whole number of reasonable size (got %s, which does not fit).", n, tok)
+		if usage != "" {
+			msg += " Usage: " + usage + " (parameters in brackets are optional)."
+		}
+		return msg
+	}
+	return ""
 }
 
 // dropNulls removes top-level arguments whose value is JSON null, so an explicit null counts as

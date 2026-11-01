@@ -57,3 +57,11 @@ func TestFriendlyDecodeErrorOverflowEchoesNoJSONTail(t *testing.T) {
 		t.Errorf("plain values keep their echo: %q", got)
 	}
 }
+
+// Round 14 (item 1): the decoder names a field of the argument map as "map[string]interface {}.column".
+func TestFriendlyDecodeErrorMapField(t *testing.T) {
+	got := friendlyDecodeError(`validating "arguments": unmarshaling arguments: json: cannot unmarshal "1e400" into Go struct field map[string]interface {}.column of type float64`)
+	if !strings.HasPrefix(got, "column has the wrong type") && !strings.HasPrefix(got, "column must be") {
+		t.Errorf("raw decoder text not rewritten: %q", got)
+	}
+}
