@@ -243,7 +243,7 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 	if err != nil {
 		return d, err
 	}
-	for _, n := range nestedModuleNotes(w.Root, plan, planPaths(plan), check) {
+	for _, n := range nestedModuleNotes(ctx, w.Root, plan, planPaths(plan), check) {
 		plan.Notes = appendUnique(plan.Notes, n)
 	}
 	if len(leftOut) > 0 {

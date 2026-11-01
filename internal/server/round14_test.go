@@ -159,3 +159,45 @@ func TestCgoHoverShowsCTypeNames(t *testing.T) {
 	out := call(t, cs, "hover", map[string]any{"file_path": "exp/exp.go", "line": 11, "column": 20})
 	mustHave(t, "param type", out, "C.int")
 }
+
+// Item 5: the "NOT rewritten" note needs a sibling module that really refers to what the edit changes,
+// resolved by types: an unrelated method or function of the same name in a sibling does not count, and a
+// sibling that does use it counts whichever sibling it is.
+func TestSiblingNoteIsResolvedByTypeNotName(t *testing.T) {
+	const note = "NOT rewritten"
+	cs, root := session(t, nil)
+	noWorkFixture(t, root)
+	writeFile(t, root, "outdep/o.go", "package outdep\n\nfunc Hello() string { return \"hi\" }\n\ntype zz struct{}\n\nfunc (zz) NoCaller() {}\n\nfunc Unref() int { return 1 }\n\nfunc New() zz { return zz{} }\n")
+	// appmod has lookalikes of the edited names (own type with NoCaller, own Unref) and uses Hello.
+	writeFile(t, root, "appmod/main.go", "package main\n\nimport \"example.com/outdep\"\n\ntype zz struct{}\n\nfunc (zz) NoCaller() {}\n\nfunc Unref() int { return 2 }\n\nfunc main() { _ = outdep.Hello(); zz{}.NoCaller(); _ = Unref() }\n")
+	// libmod only has lookalikes and imports outdep without using the changed names.
+	writeFile(t, root, "libmod/go.mod", "module example.com/libmod\n\ngo 1.24\n\nrequire example.com/outdep v0.0.0\n\nreplace example.com/outdep => ../outdep\n")
+	writeFile(t, root, "libmod/l.go", "package libmod\n\nimport \"example.com/outdep\"\n\ntype zz struct{}\n\nfunc (zz) NoCaller() {}\n\nfunc Unref() int { return 3 }\n\nvar _ = outdep.Hello\n\nfunc L() { zz{}.NoCaller(); _ = Unref() }\n")
+	for name, c := range map[string]struct {
+		tool string
+		args map[string]any
+		note bool
+	}{
+		"rename lookalike method":   {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func (zz) NoCaller() {}", "new_string": "func (zz) NoCaller2() {}", "apply": false}, false},
+		"change lookalike method":   {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func (zz) NoCaller() {}", "new_string": "func (zz) NoCaller(n int) {}", "apply": false}, false},
+		"change lookalike function": {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func Unref() int", "new_string": "func Unref(n int) int", "apply": false}, false},
+		"rename lookalike function": {"rename_symbol", map[string]any{"name": "outdep.Unref", "new_name": "Unref2", "apply": false}, false},
+		"change used function":      {"edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func Hello() string", "new_string": "func Hello() (string, error)", "apply": false}, true},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		if has := strings.Contains(out, note); has != c.note {
+			t.Errorf("%s: note shown = %v, want %v:\n%s", name, has, c.note, out)
+		}
+	}
+	// The sibling that really uses the symbol decides, in whatever order the siblings are checked.
+	writeFile(t, root, "appmod/main.go", "package main\n\nfunc main() {}\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func Hello() string", "new_string": "func Hello() (string, error)", "apply": false})
+	if !strings.Contains(out, note) {
+		t.Errorf("libmod uses Hello (var _ = outdep.Hello):\n%s", out)
+	}
+	writeFile(t, root, "libmod/l.go", "package libmod\n\nimport \"example.com/outdep\"\n\nvar _ = outdep.New\n")
+	out = call(t, cs, "edit", map[string]any{"file_path": "outdep/o.go", "old_string": "func Hello() string", "new_string": "func Hello() (string, error)", "apply": false})
+	if strings.Contains(out, note) {
+		t.Errorf("no sibling uses Hello now:\n%s", out)
+	}
+}

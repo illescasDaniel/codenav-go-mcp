@@ -125,7 +125,7 @@ func unformattedNotes(root string, plan *edits.EditPlan) []string {
 // checked lists the files the simulation type-checked: the note is only worth showing when one of them
 // lies outside the module and uses a declaration the edit changes (a real caller in a sibling module) -
 // otherwise nothing is left unedited.
-func nestedModuleNotes(root string, plan *edits.EditPlan, paths, checked []string) []string {
+func nestedModuleNotes(ctx context.Context, root string, plan *edits.EditPlan, paths, checked []string) []string {
 	seen := map[string]bool{}
 	var notes []string
 	for _, p := range paths {
@@ -136,12 +136,45 @@ func nestedModuleNotes(root string, plan *edits.EditPlan, paths, checked []strin
 		seen[n.Dir] = true
 		// Only what a caller can depend on matters: the declarations the edit adds, removes or changes (a
 		// function body is not one). With those known, a sibling module counts only when its files use one.
-		changed, known := changedDeclNames(plan, n.Dir)
+		changed, changedObjs, known := changedDecls(plan, n.Dir)
+		// By name first (cheap), then by type: a file that merely has a method or function of the same name
+		// as a changed one, or whose package never refers to the edited one, uses nothing the edit changes.
+		wanted := map[string]bool{}
+		for dir, keys := range changedObjs {
+			if rel, err := filepath.Rel(n.Dir, dir); err == nil && n.Path != "" {
+				pkg := n.Path
+				if rel != "." {
+					pkg += "/" + filepath.ToSlash(rel)
+				}
+				for k := range keys {
+					wanted[pkg+"|"+k] = true
+				}
+			}
+		}
+		typed := map[string]map[string]map[string]bool{} // directory -> file -> objects used
 		outside := false
 		for _, f := range checked {
 			if rel, err := filepath.Rel(n.Dir, f); err != nil || strings.HasPrefix(rel, "..") {
 				if known && !mentionsAny(f, changed) {
 					continue
+				}
+				if known && n.Path != "" {
+					dir := filepath.Dir(f)
+					if _, done := typed[dir]; !done {
+						typed[dir] = usedObjects(ctx, dir)
+					}
+					if used, ok := typed[dir][f]; ok {
+						hit := false
+						for k := range used {
+							if wanted[k] {
+								hit = true
+								break
+							}
+						}
+						if !hit {
+							continue
+						}
+					}
 				}
 				outside = true
 				break
