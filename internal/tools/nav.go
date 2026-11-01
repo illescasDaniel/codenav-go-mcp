@@ -390,11 +390,13 @@ const maxHoverBytes = 4096
 // fileLink: the file:// URLs gopls puts into stdlib doc links; the plain path reads better.
 var fileLink = regexp.MustCompile(`file://[^\s)\]>"]+`)
 
+// A workspace without a go.mod makes gopls print `pkg.go.dev/_/<absolute dir>#Name` (the path of a GOPATH-style
+// directory package): it leaks the directory and leads nowhere.
 // A replaced module (directory) has no version, so gopls prints `pkg.go.dev/../dir@#Name`; those go too.
 // So do links to a dotted import path without a version (example.com/x#Name): that is a module of the
 // workspace itself (the main module, a go.work "use", a local replace), which pkg.go.dev does not know.
 // The stdlib (no dot in the first element) and versioned module-cache dependencies keep theirs.
-var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@|[^/)\s@]*\.[^/)\s@]*(?:/[^)\s@]*)?)\)[ \t]*`)
+var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|_/[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@|[^/)\s@]*\.[^/)\s@]*(?:/[^)\s@]*)?)\)[ \t]*`)
 
 // tidyHover drops useless links and caps the length, keeping the head (signature and summary).
 func tidyHover(t string) string {

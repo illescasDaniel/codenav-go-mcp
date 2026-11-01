@@ -97,3 +97,24 @@ func TestOutsideWorkspaceMessagesDoNotPrintTheRoot(t *testing.T) {
 		}
 	}
 }
+
+// Item 4: a workspace without a go.mod has packages without an import path; hover and symbol_info print no
+// pkg.go.dev link (gopls makes up `pkg.go.dev/_/<absolute dir>#F`).
+func TestNoGoModHoverHasNoBogusLink(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "nomod/f.go", "package nomod\n\n// F does a thing.\nfunc F() {}\n\nfunc G() { F() }\n")
+	cs, _ := sessionAt(t, root)
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"hover", map[string]any{"file_path": "nomod/f.go", "line": 4, "column": 6}},
+		{"symbol_info", map[string]any{"name": "nomod.F"}},
+	} {
+		out := call(t, cs, c.tool, c.args)
+		mustHave(t, c.tool, out, "F does a thing")
+		if strings.Contains(out, "pkg.go.dev") || strings.Contains(out, root) {
+			t.Errorf("%s: bogus link or absolute path:\n%s", c.tool, out)
+		}
+	}
+}

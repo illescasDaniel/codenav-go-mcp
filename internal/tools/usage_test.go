@@ -21,6 +21,7 @@ func TestTidyHoverDropsBogusLinks(t *testing.T) {
 		"[`outdep.Hello` on pkg.go.dev](https://pkg.go.dev/../outdep@#Hello)",
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/./x@#F)",
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x@#F)",
+		"[`nomod.F` on pkg.go.dev](https://pkg.go.dev/_/tmp/work/nomod#F)",
 		"[`main.F` on pkg.go.dev](https://pkg.go.dev/command-line-arguments#F)",
 		"[`x.F` on pkg.go.dev](https://pkg.go.dev/example.com/x#F)",
 		"[`x` on pkg.go.dev](https://pkg.go.dev/example.com/x/sub)",
