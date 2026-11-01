@@ -2,7 +2,7 @@ package exclude
 
 import "testing"
 
-// Round 13 (item 4): a path sharing an ancestor with the root is shown with "../" for up to three levels.
+// Round 13 (item 4): a path sharing an ancestor with the root is shown with "../" however many levels up the shared ancestor is (round 14 item 2).
 func TestRelativeToAncestors(t *testing.T) {
 	root := "/work/proj/_deps/dep"
 	for path, want := range map[string]string{
@@ -17,8 +17,8 @@ func TestRelativeToAncestors(t *testing.T) {
 			t.Errorf("RelativeTo(%q) = %q, want %q", path, got, want)
 		}
 	}
-	// More than three levels up stays absolute.
-	if got, want := RelativeTo("/a/b/x.go", "/a/b/c/d/e/f"), "/a/b/x.go"; got != want {
+	// Deep roots are no exception: relative at any depth, never a mix of both spellings.
+	if got, want := RelativeTo("/a/b/x.go", "/a/b/c/d/e/f"), "../../../../x.go"; got != want {
 		t.Errorf("got %q want %q", got, want)
 	}
 	// One level, as before.

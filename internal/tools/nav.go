@@ -549,7 +549,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 				abs = filepath.Join(w.Root, abs)
 			}
 			if rel, err := filepath.Rel(w.Root, abs); err != nil || strings.HasPrefix(rel, "..") {
-				return "", toolerr.Inputf("%s is outside the workspace (%s): diagnostics only cover files of the workspace's own modules. Files of the standard library, the module cache and replaced modules elsewhere can be read (outline, hover, references) but are not type-checked as part of this workspace.", in.FilePath, w.Root)
+				return "", toolerr.Inputf("%s is outside the workspace: diagnostics only cover files of the workspace's own modules. Files of the standard library, the module cache and replaced modules elsewhere can be read (outline, hover, references) but are not type-checked as part of this workspace.", in.FilePath)
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {

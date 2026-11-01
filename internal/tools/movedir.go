@@ -38,11 +38,11 @@ func importPathOf(m moduleInfo, dir string) (string, error) {
 
 // moveDirectory moves a package directory (with the packages below it) and rewrites every import of it.
 func moveDirectory(ctx context.Context, w *Workspace, from, to string, in moveIn) (string, error) {
-	src, err := w.absPath(from)
+	src, err := w.argPath(from)
 	if err != nil {
 		return "", err
 	}
-	dst, err := w.absPath(to)
+	dst, err := w.argPath(to)
 	if err != nil {
 		return "", err
 	}

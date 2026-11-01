@@ -37,6 +37,19 @@ func GoGuardRule(c edits.FileChange) error {
 	return nil
 }
 
+// argPath is absPath for a path the caller wrote (file_path, to_file): one that lies outside the workspace is
+// refused in terms of what was asked, as the file the tool was pointed at, not as an effect of the edit.
+func (w *Workspace) argPath(p string) (string, error) {
+	abs := p
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(w.Root, abs)
+	}
+	if rel, err := filepath.Rel(w.Root, filepath.Clean(abs)); err == nil && (rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		return "", toolerr.Inputf("%s is outside the workspace; the write tools only change files inside it.", p)
+	}
+	return w.absPath(p)
+}
+
 // absPath resolves a workspace-relative path and checks the guard's path rules.
 func (w *Workspace) absPath(p string) (string, error) {
 	if !filepath.IsAbs(p) {
@@ -297,7 +310,7 @@ func checkMaxNewErrors(in any) error {
 func boolPtr(b bool) *bool { return &b }
 
 func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
-	abs, err := w.absPath(in.FilePath)
+	abs, err := w.argPath(in.FilePath)
 	if err != nil {
 		return nil, err
 	}

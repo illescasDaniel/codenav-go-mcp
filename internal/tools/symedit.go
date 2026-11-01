@@ -303,7 +303,7 @@ func tagChangeNote(c gosrc.TagChange) string {
 }
 
 func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source string) (*edits.EditPlan, error) {
-	abs, err := w.absPath(in.FilePath)
+	abs, err := w.argPath(in.FilePath)
 	if err != nil {
 		return nil, err
 	}

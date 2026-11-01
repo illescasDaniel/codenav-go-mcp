@@ -70,21 +70,18 @@ func isToolchainPath(p string) bool {
 	return false
 }
 
-// maxAncestors is how many directories above the root a path may share with it to be shown as "../.."
-// (a workspace two levels below the go.work that joins it sees its siblings as "../../x").
-const maxAncestors = 3
-
 // RelativeTo renders an absolute path the way results show it: relative to root inside it, "../x" (or
-// "../../x", up to maxAncestors levels) for a file that shares an ancestor directory with the workspace
-// (e.g. a module the workspace replaces, or a go.work member above it), and the path itself for anything
-// else (GOROOT, the module cache, unrelated places).
+// "../../x", however many levels) for a file that shares an ancestor directory (other than "/") with the
+// workspace (e.g. a module the workspace replaces, or a go.work member above it), and the path itself for
+// anything else (GOROOT, the module cache, unrelated places). The form depends on where the file is, never
+// on how far up the shared ancestor lies, so one answer never mixes relative and absolute spellings.
 func RelativeTo(path, root string) string {
 	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
 		return filepath.ToSlash(rel)
 	}
 	if filepath.IsAbs(path) && !isToolchainPath(path) {
 		up := ""
-		for dir, i := root, 0; i < maxAncestors; i++ {
+		for dir := root; ; {
 			parent := filepath.Dir(dir)
 			if parent == dir || parent == string(filepath.Separator) {
 				break

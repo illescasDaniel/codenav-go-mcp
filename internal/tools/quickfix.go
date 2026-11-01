@@ -217,7 +217,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 }
 
 func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, error) {
-	abs, err := w.absPath(in.FilePath)
+	abs, err := w.argPath(in.FilePath)
 	if err != nil {
 		return qfResult{}, err
 	}

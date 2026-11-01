@@ -154,7 +154,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		root = member{lsp.URIToPath(sym.URI), sym.Line, sym.Column}
 		kind = sym.Kind
 	case in.FilePath != "" && in.Line > 0 && in.Column > 0:
-		abs, err := w.absPath(in.FilePath)
+		abs, err := w.argPath(in.FilePath)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +211,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			if dp := lsp.URIToPath(defs[0].URI); dp != "" && isCgoGenerated(dp) {
 				return nil, toolerr.Inputf("%s is declared in cgo-generated code (it is C.%s); rename the C symbol in the cgo preamble or C sources instead.", identAt(root.path, root.line, root.col), identAt(root.path, root.line, root.col))
 			} else if dp != "" && !w.inWorkspace(dp) {
-				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace %s; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), dp, defs[0].Range.Start.Line+1, w.Root)
+				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), edits.RelativeName(dp, w.Root), defs[0].Range.Start.Line+1)
 			}
 		}
 	}

@@ -79,6 +79,7 @@ func (w *Workspace) checkReadable(p string) error {
 	if p == "" {
 		return nil
 	}
+	given := p
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(w.Root, p)
 	}
@@ -91,7 +92,7 @@ func (w *Workspace) checkReadable(p string) error {
 			return nil
 		}
 	}
-	return toolerr.Inputf("%s is outside the workspace (%s), the Go root, the module cache and the replaced modules; only files in those places can be read.", p, w.Root)
+	return toolerr.Inputf("%s is outside the workspace, the Go root, the module cache and the replaced modules; only files in those places can be read.", given)
 }
 
 // filePathOf returns the "file_path" field of a tool's input ("" when it has none).

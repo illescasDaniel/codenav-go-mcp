@@ -119,7 +119,7 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 		return "", err
 	}
 	d := l.decl
-	dest, err := w.absPath(in.ToFile)
+	dest, err := w.argPath(in.ToFile)
 	if err != nil {
 		return "", err
 	}

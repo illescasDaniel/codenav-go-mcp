@@ -94,7 +94,7 @@ func outsideMessage(path, given, root string) string {
 	if rel, err := filepath.Rel(given, path); err == nil {
 		shown = filepath.ToSlash(rel)
 	}
-	msg := fmt.Sprintf("this edit would change %s, which is outside the workspace %s (a reference or declaration in a module or directory above the workspace root)", shown, root)
+	msg := fmt.Sprintf("this edit would change %s, which is outside the workspace (a reference or declaration in a module or directory above the workspace root)", shown)
 	for d := filepath.Dir(root); ; d = filepath.Dir(d) {
 		if _, err := os.Stat(filepath.Join(d, "go.work")); err == nil {
 			return msg + fmt.Sprintf("; a go.work in %s covers it - set CODENAV_GO_MCP_WORKSPACE to %s so that the whole workspace is navigated", d, d)
