@@ -356,10 +356,34 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 
 // otherObjects drops the code mentions that are some other, unrelated object. For a field or method,
 // a bare identifier (a package-level func or variable of the same name, a local) can never be the
-// member, so it goes whether or not its file changed. For the rest, a name gopls still resolves after
-// the rename is another object; that needs the file's positions to be unchanged, so files the rename
-// edits are kept.
+// member, so it goes before anything is asked of the type checker.
+//
+// What survives is asked of the type checker with the renamed files in place (positions of the changed
+// files are those of the new text): an identifier it resolves to a declaration is another object (a
+// parameter of a func type, another type's field or method, a method of another package), whatever file
+// it is in; one it cannot resolve is genuinely unlinked.
 func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, after map[string]string, name, declFile string, member bool) []mentions.Mention {
+	overlay := map[string]string{}
+	for p, t := range after {
+		if strings.HasSuffix(p, ".go") {
+			overlay[p] = t
+		}
+	}
+	var out []mentions.Mention
+	done := false
+	if len(overlay) > 0 {
+		_ = w.Client.Overlay(ctx, overlay, func() error {
+			out, done = otherObjectsIn(ctx, w, ms, after, name, declFile, member), true
+			return nil
+		})
+	}
+	if !done {
+		out = otherObjectsIn(ctx, w, ms, after, name, declFile, member)
+	}
+	return out
+}
+
+func otherObjectsIn(ctx context.Context, w *Workspace, ms []mentions.Mention, after map[string]string, name, declFile string, member bool) []mentions.Mention {
 	out := ms[:0:0]
 	checked := 0
 	bare := map[string]map[int]bool{}      // abs path -> positions of non-member identifiers
@@ -411,7 +435,7 @@ func otherObjects(ctx context.Context, w *Workspace, ms []mentions.Mention, afte
 				continue
 			}
 		}
-		if _, changed := after[abs]; !changed && checked < maxDefinitionChecks {
+		if checked < maxDefinitionChecks {
 			checked++
 			if defs, err := w.Client.Definition(ctx, abs, m.Line, m.Col); err == nil && len(defs) > 0 {
 				continue

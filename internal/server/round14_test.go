@@ -201,3 +201,56 @@ func TestSiblingNoteIsResolvedByTypeNotName(t *testing.T) {
 		t.Errorf("no sibling uses Hello now:\n%s", out)
 	}
 }
+
+// Item 6: the leftover scan of rename_symbol lists only what the type checker did not link: identifiers
+// that resolve to a different object (func-type parameters, other types' fields and methods, methods of
+// other packages) are not leftovers.
+func TestRenameLeftoverScanIgnoresOtherObjects(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "lo/lo.go", `package lo
+
+import "sync"
+
+func name(x int) int { return x }
+
+type Handler struct {
+	cb func(name string)
+}
+
+func Use() int { return name(1) }
+
+type Conf struct {
+	name string
+	mu   sync.Mutex
+}
+
+func (c *Conf) Lock()   { c.mu.Lock() }
+func (c *Conf) Unlock() { c.mu.Unlock() }
+
+type Other struct{ name string }
+
+type Iface interface{ name() string }
+
+type Impl struct{ name string }
+
+func (Impl) Name() string { return "" }
+
+func Read(c *Conf, o Other, i Impl) (string, string, string) { return c.name, o.name, i.name }
+`)
+	writeFile(t, root, "lo/other.go", "package lo\n\nimport \"sync\"\n\ntype Box struct{ mu sync.Mutex }\n\nfunc (b *Box) Do(c *Conf) { b.mu.Lock(); defer b.mu.Unlock(); c.Lock(); c.mu.Lock() }\n")
+	writeFile(t, root, "lo2/use.go", "package lo2\n\nimport (\n\t\"sync\"\n\n\t\"example.com/fx/lo\"\n)\n\ntype Wrap struct{ mu sync.Mutex }\n\nfunc (w *Wrap) Do(c *lo.Conf) { c.Lock(); w.mu.Lock(); w.mu.Unlock(); c.Unlock() }\n")
+	for label, c := range map[string]map[string]any{
+		"package func": {"name": "lo.name", "new_name": "label"},
+		"Conf.name":    {"name": "lo.Conf.name", "new_name": "label"},
+		"Other.name":   {"name": "lo.Other.name", "new_name": "label"},
+		"Impl.name":    {"name": "lo.Impl.name", "new_name": "label"},
+		"Conf.Lock":    {"name": "lo.Conf.Lock", "new_name": "Acquire"},
+		"Conf.Unlock":  {"name": "lo.Conf.Unlock", "new_name": "Release"},
+	} {
+		c["apply"] = false
+		out := call(t, cs, "rename_symbol", c)
+		if strings.Contains(out, "did not link") || strings.Contains(out, "still appears") {
+			t.Errorf("%s: false leftover:\n%s", label, out)
+		}
+	}
+}
