@@ -22,7 +22,9 @@ var usages = struct {
 	m map[string]string
 	// ints maps a tool name to its integer-typed top-level parameters.
 	ints map[string]map[string]bool
-}{m: map[string]string{}, ints: map[string]map[string]bool{}}
+	// reqs maps a tool name to its required top-level parameters.
+	reqs map[string]map[string]bool
+}{m: map[string]string{}, ints: map[string]map[string]bool{}, reqs: map[string]map[string]bool{}}
 
 // registerUsage records the parameters of tool name from its input struct: required ones bare, the
 // others in brackets.
@@ -33,7 +35,7 @@ func registerUsage[In any](name string) {
 		return
 	}
 	var req, opt []string
-	ints := map[string]bool{}
+	ints, required := map[string]bool{}, map[string]bool{}
 	var walk func(t reflect.Type)
 	walk = func(t reflect.Type) {
 		for i := 0; i < t.NumField(); i++ {
@@ -62,6 +64,7 @@ func registerUsage[In any](name string) {
 				opt = append(opt, "["+n+"]")
 			} else {
 				req = append(req, n)
+				required[n] = true
 			}
 		}
 	}
@@ -69,6 +72,7 @@ func registerUsage[In any](name string) {
 	usages.Lock()
 	usages.m[name] = name + "(" + strings.Join(append(req, opt...), ", ") + ")"
 	usages.ints[name] = ints
+	usages.reqs[name] = required
 	usages.Unlock()
 }
 
@@ -182,6 +186,9 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && method == "tools/call" {
 			params.Arguments = dropNulls(params.Arguments)
+			if msg := badPathArg(params.Name, params.Arguments); msg != "" {
+				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil
+			}
 			if msg := hugeIntegerArg(params.Name, params.Arguments); msg != "" {
 				return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}, nil
 			}
@@ -242,6 +249,41 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 		tc.Text = msg
 		return res, err
 	}
+}
+
+// pathParams are the parameters that name a file or directory.
+var pathParams = []string{"file_path", "to_file", "path"}
+
+// badPathArg answers a path argument that cannot name anything: one holding a NUL byte (which the file
+// system would show as a space in its own errors), or an empty required file_path/to_file. "" otherwise.
+func badPathArg(tool string, raw json.RawMessage) string {
+	var args map[string]json.RawMessage
+	if json.Unmarshal(raw, &args) != nil {
+		return ""
+	}
+	usages.Lock()
+	required, usage := usages.reqs[tool], usages.m[tool]
+	usages.Unlock()
+	for _, n := range pathParams {
+		var v string
+		if json.Unmarshal(args[n], &v) != nil {
+			continue
+		}
+		msg := ""
+		switch {
+		case strings.ContainsRune(v, 0):
+			msg = n + " contains a NUL byte: it is not a path."
+		case v == "" && required[n] && n != "path":
+			msg = n + " is empty: pass a path relative to the workspace root."
+		}
+		if msg != "" {
+			if usage != "" {
+				msg += " Usage: " + usage + " (parameters in brackets are optional)."
+			}
+			return msg
+		}
+	}
+	return ""
 }
 
 // maxSafeInt is the largest integer a JSON number carries exactly through the float64 the schema validator

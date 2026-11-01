@@ -267,10 +267,11 @@ func TestPackageClauseRefusalNamesClausesAsWritten(t *testing.T) {
 	}
 }
 
-// Item 11 (e): quick_fix on a directory (or an empty path) names it relative to the workspace.
+// Item 11 (e): quick_fix on a directory names it relative to the workspace (an empty path is reported as
+// empty since round 14, see TestNulAndEmptyPathArguments).
 func TestQuickFixDirectoryPathIsRelative(t *testing.T) {
 	cs, root := session(t, nil)
-	for _, p := range []string{"", "shapes"} {
+	for _, p := range []string{"shapes"} {
 		out := call(t, cs, "quick_fix", map[string]any{"file_path": p, "apply": false})
 		mustHave(t, "dir "+p, out, "is a directory, not a Go file")
 		if strings.Contains(out, root) || strings.Contains(out, "Cannot read") {

@@ -118,3 +118,29 @@ func TestNoGoModHoverHasNoBogusLink(t *testing.T) {
 		}
 	}
 }
+
+// Item 9: a NUL byte in a path is refused as such (it used to print as a space in "Cannot read a b.go"), and an
+// empty required file_path is reported as empty (quick_fix used to echo ".").
+func TestNulAndEmptyPathArguments(t *testing.T) {
+	cs, _ := session(t, nil)
+	for _, tool := range []string{"outline", "hover", "quick_fix", "edit", "diagnostics"} {
+		out := callRaw(t, cs, tool, `{"file_path":"a\u0000b.go","line":1,"column":1,"old_string":"x","new_string":"y"}`)
+		mustHave(t, tool+" NUL", out, "file_path contains a NUL byte")
+		if strings.Contains(out, "Cannot read") {
+			t.Errorf("%s: raw read error:\n%s", tool, out)
+		}
+	}
+	out := callRaw(t, cs, "move", `{"name":"shapes.Scale","to_file":"x\u0000.go"}`)
+	mustHave(t, "move NUL", out, "to_file contains a NUL byte")
+	for _, tool := range []string{"quick_fix", "outline", "hover"} {
+		out := callRaw(t, cs, tool, `{"file_path":"","line":1,"column":1}`)
+		mustHave(t, tool+" empty", out, "file_path is empty")
+		if strings.Contains(out, `"."`) {
+			t.Errorf("%s: echoes \".\":\n%s", tool, out)
+		}
+	}
+	// Optional file_path: "" still means "not given".
+	if out := callRaw(t, cs, "rename_symbol", `{"name":"shapes.Scale","new_name":"S2","file_path":"","apply":false}`); strings.Contains(out, "file_path is empty") {
+		t.Errorf("an optional file_path may be empty:\n%s", out)
+	}
+}
