@@ -254,3 +254,17 @@ func Read(c *Conf, o Other, i Impl) (string, string, string) { return c.name, o.
 		}
 	}
 }
+
+// Item 12: gopls' vet-style analyzers (printf) are part of `diagnostics` and of the edit comparison while the
+// package type-checks; in a package with errors gopls runs none, and the edit output says how many it hid.
+func TestPrintfWarningIsReported(t *testing.T) {
+	cs, root := session(t, nil)
+	writeFile(t, root, "pf/pf.go", "package pf\n\nimport \"fmt\"\n\nfunc P() { fmt.Println(1) }\n")
+	out := call(t, cs, "edit", map[string]any{"file_path": "pf/pf.go", "old_string": "fmt.Println(1)", "new_string": "fmt.Printf(\"%d\", \"s\")", "apply": false})
+	mustHave(t, "edit", out, "1 new warning(s)", "fmt.Printf format %d has arg")
+	writeFile(t, root, "pf/pf.go", "package pf\n\nimport \"fmt\"\n\nfunc P() { fmt.Printf(\"%d\", \"s\") }\n")
+	out = call(t, cs, "diagnostics", map[string]any{"file_path": "pf/pf.go"})
+	mustHave(t, "diagnostics", out, "fmt.Printf format %d has arg")
+	out = call(t, cs, "edit", map[string]any{"file_path": "pf/pf.go", "old_string": "func P()", "new_string": "func Q() { var x int }\n\nfunc P()", "apply": false})
+	mustHave(t, "package with errors", out, "1 new error(s)")
+}
