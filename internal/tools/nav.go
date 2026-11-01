@@ -147,7 +147,8 @@ func addIndexed(w *Workspace, q string, have []*lsp.Symbol) []*lsp.Symbol {
 // isCgoGenerated: a file cgo wrote into the go build cache.
 func isCgoGenerated(p string) bool { return exclude.IsCgoGenerated(p) }
 
-var cgoNameRE = regexp.MustCompile(`\b_C(?:func|type|var|const|macro)_(\w+)`)
+// gopls's hover is markdown, which writes the underscores of such a name as `\_Ctype\_int`.
+var cgoNameRE = regexp.MustCompile(`(?:\b_|\\_)C(?:func|type|var|const|macro)\\?_((?:\w|\\_)+)`)
 
 // cgoHover shows cgo's generated names the way the source spells them: `_Cfunc_add` is `C.add`.
 func cgoHover(path, text string) string {

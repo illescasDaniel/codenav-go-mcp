@@ -144,3 +144,18 @@ func TestNulAndEmptyPathArguments(t *testing.T) {
 		t.Errorf("an optional file_path may be empty:\n%s", out)
 	}
 }
+
+// Item 7: hover on a cgo call site shows C.int, not the markdown-escaped \_Ctype\_int.
+func TestCgoHoverShowsCTypeNames(t *testing.T) {
+	skipWithoutCgo(t)
+	cs, root := session(t, nil)
+	writeFile(t, root, "exp/exp.go", "package exp\n\n/*\n#include <stdint.h>\nextern int goCallback(int);\nstatic int callit(int x) { return goCallback(x); }\n*/\nimport \"C\"\n\n//export goCallback\nfunc goCallback(x C.int) C.int { return x * 2 }\n\nfunc Run() int { return int(C.callit(3)) }\n")
+	for col := 20; col <= 42; col++ {
+		out := call(t, cs, "hover", map[string]any{"file_path": "exp/exp.go", "line": 13, "column": col})
+		if strings.Contains(out, "_Ctype") || strings.Contains(out, "_Cfunc") {
+			t.Errorf("column %d shows cgo's generated names:\n%s", col, out)
+		}
+	}
+	out := call(t, cs, "hover", map[string]any{"file_path": "exp/exp.go", "line": 11, "column": 20})
+	mustHave(t, "param type", out, "C.int")
+}
