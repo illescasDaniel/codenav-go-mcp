@@ -210,6 +210,13 @@ func Find(root, name string, after map[string]string, only string) []Mention {
 // FindScoped is Find with code mentions limited to the Go files codeIn accepts (the files that could
 // refer to the renamed symbol); comments, strings and docs are still searched everywhere.
 func FindScoped(root, name string, after map[string]string, only string, codeIn func(path, text string) bool) []Mention {
+	found, _ := FindScopedLimited(root, name, after, only, codeIn)
+	return found
+}
+
+// FindScopedLimited is FindScoped that also reports whether the scan stopped at maxFiles files: the rest of the tree
+// was not searched.
+func FindScopedLimited(root, name string, after map[string]string, only string, codeIn func(path, text string) bool) ([]Mention, bool) {
 	word := regexp.MustCompile(`(?:^|[^\w])` + regexp.QuoteMeta(name) + `(?:[^\w]|$)`)
 	prose := word // what counts in comments and text files
 	if shortName(name) {
@@ -217,6 +224,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 	}
 	var found []Mention
 	seen := 0
+	truncated := false
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -235,6 +243,9 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 			}
 			return nil
 		}
+		if !d.Type().IsRegular() {
+			return nil // a FIFO, a device or a symlink: reading it can block or leave the tree
+		}
 		ext := strings.ToLower(filepath.Ext(p))
 		isGo := ext == ".go"
 		if !isGo && !textSuffixes[ext] {
@@ -244,6 +255,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 			return nil
 		}
 		if seen++; seen > maxFiles {
+			truncated = true
 			return filepath.SkipAll
 		}
 		text, ok := after[p]
@@ -303,7 +315,7 @@ func FindScoped(root, name string, after map[string]string, only string, codeIn 
 		}
 		kept = append(kept, m)
 	}
-	return kept
+	return kept, truncated
 }
 
 // Notes renders one note per kind: a heading plus a few example lines.

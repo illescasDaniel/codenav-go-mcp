@@ -258,6 +258,10 @@ func moveWithinPackage(l *located, dest, header string, embed bool) (*edits.Edit
 	if err != nil {
 		return nil, err
 	}
+	var notes []string
+	if onlyPackageClause(l.path, srcText) {
+		notes = append(notes, emptiedNote(l.path)) // BUG-DET-002
+	}
 	var dc edits.FileChange
 	if exists {
 		old, _, _ := edits.ReadSource(dest)
@@ -271,7 +275,7 @@ func moveWithinPackage(l *located, dest, header string, embed bool) (*edits.Edit
 	if err != nil {
 		return nil, err
 	}
-	return edits.NewPlan("move "+d.Name+" to "+filepath.Base(dest), []edits.FileChange{src, dc}), nil
+	return edits.NewPlan("move "+d.Name+" to "+filepath.Base(dest), []edits.FileChange{src, dc}, notes...), nil
 }
 
 func goDeps(root, pkg string) map[string]bool {
@@ -284,6 +288,88 @@ func goDeps(root, pkg string) map[string]bool {
 		m[p] = true
 	}
 	return m
+}
+
+// goImportGraph maps each package below pkg (pkg included) to the packages it imports, from go list.
+func goImportGraph(root, pkg string) map[string][]string {
+	out, err := exec.Command("go", "list", "-C", root, "-deps", "-f", "{{.ImportPath}} {{join .Imports \" \"}}", pkg).Output()
+	if err != nil {
+		return nil
+	}
+	g := map[string][]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			g[f[0]] = f[1:]
+		}
+	}
+	return g
+}
+
+// importPathFrom is a shortest import path from `from` to `to` in graph, both included; nil when there is none.
+func importPathFrom(graph map[string][]string, from, to string) []string {
+	prev := map[string]string{from: ""}
+	queue := []string{from}
+	for len(queue) > 0 && queue[0] != to {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, next := range graph[cur] {
+			if _, seen := prev[next]; !seen {
+				prev[next] = cur
+				queue = append(queue, next)
+			}
+		}
+	}
+	if _, ok := prev[to]; !ok {
+		return nil
+	}
+	var path []string
+	for p := to; ; p = prev[p] {
+		path = append([]string{p}, path...)
+		if p == from {
+			return path
+		}
+	}
+}
+
+// onlyPackageClause: text is a Go file with nothing but its package clause (no declarations, imports or comments).
+func onlyPackageClause(path, text string) bool {
+	f, err := parser.ParseFile(token.NewFileSet(), path, text, parser.ParseComments)
+	return err == nil && len(f.Decls) == 0 && len(f.Comments) == 0
+}
+
+// emptiedNote says that the file a move leaves with nothing but its package clause is still there: the move does not
+// delete files, so the answer tells the user (BUG-DET-002: an untracked empty file is then visible, not silent).
+func emptiedNote(path string) string {
+	return fmt.Sprintf("%s is left with nothing but its package clause (the move took its only declaration out); delete it if it is not wanted.", filepath.Base(path))
+}
+
+// enclosingDeclName names the top-level declaration of f that holds pos: the func, or the first name of the
+// var, const or type spec. "" when none does.
+func enclosingDeclName(f *ast.File, pos token.Pos) string {
+	for _, d := range f.Decls {
+		if pos < d.Pos() || pos >= d.End() {
+			continue
+		}
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			return d.Name.Name
+		case *ast.GenDecl:
+			for _, sp := range d.Specs {
+				if pos < sp.Pos() || pos >= sp.End() {
+					continue
+				}
+				switch sp := sp.(type) {
+				case *ast.ValueSpec:
+					if len(sp.Names) > 0 {
+						return sp.Names[0].Name
+					}
+				case *ast.TypeSpec:
+					return sp.Name.Name
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func pkgLevel(o types.Object) bool { return o.Pkg() != nil && o.Parent() == o.Pkg().Scope() }
@@ -401,6 +487,11 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		bName, bPath = packageFor(dest), A.Module.Path+"/"+filepath.ToSlash(rel)
 	default:
 		return nil, toolerr.Inputf("cannot work out the import path of %s.", destDir)
+	}
+	// BUG-MOVE-006: a new package takes its name from the directory; a name that is not an identifier is refused here
+	// (the rewrite would otherwise produce code that does not parse, and the error would name an importer).
+	if B == nil && !token.IsIdentifier(bName) {
+		return nil, toolerr.Inputf("directory `%s` gives no valid Go package name; choose another directory", filepath.Base(destDir))
 	}
 	if B != nil && B.Types != nil && B.Types.Scope().Lookup(d.Name) != nil {
 		return nil, toolerr.Inputf("package %s already declares %s.", bPath, d.Name)
@@ -527,6 +618,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	usesM := false                // code left in A refers to the moved declaration
 	dotMoved := map[string]bool{} // files that dot-import A and use the moved declaration
 	dotOther := map[string]bool{} // files that dot-import A and still use something else from it
+	users := map[string]bool{}    // packages other than A and B that will import B for the moved declaration
 	done := map[string]bool{}
 	where := func(file string, o int) string {
 		t, _, _ := read(file)
@@ -579,6 +671,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 							} else {
 								fileEdits[fname] = append(fileEdits[fname], tedit{off(x.Pos()), off(x.End()), bName})
 								addImport[fname] = append(addImport[fname], bPath)
+								users[p.PkgPath] = true
 							}
 						} else if !obj.Exported() {
 							refuse("%s uses unexported %s", where(fname, off(n.Sel.Pos())), obj.Name())
@@ -603,6 +696,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 							dotMoved[fname] = true
 							if !isB {
 								addImport[fname] = append(addImport[fname], ". "+strconv.Quote(bPath))
+								users[p.PkgPath] = true
 							}
 						} else {
 							dotOther[fname] = true
@@ -623,6 +717,14 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 					} else if inM(obj.Pos()) {
 						switch {
 						case pkgLevel(obj) && isA:
+							if !obj.Exported() {
+								// BUG-LANG-004: the qualified name is unexported in its new package, so the code that stays would not compile.
+								user := enclosingDeclName(f, n.Pos())
+								if user == "" {
+									user = "code"
+								}
+								refuse("`%s` is unexported and still used by `%s` (%s); export it or move %s too", obj.Name(), user, where(fname, o), user)
+							}
 							usesM = true
 							fileEdits[fname] = append(fileEdits[fname], tedit{o, o + len(n.Name), bName + "." + n.Name})
 							addImport[fname] = append(addImport[fname], bPath)
@@ -663,6 +765,26 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		}
 		if (usesM && (depsB[A.PkgPath] || anyNeedA)) || (anyNeedA && depsA[bPath]) {
 			refuse("the move would create an import cycle between %s and %s", A.PkgPath, bPath)
+		}
+	}
+	// BUG-MOVE-005: a package that will import the destination must not be one the destination already imports,
+	// directly or through others. The cycle is named with the packages it runs through.
+	if B != nil && len(users) > 0 {
+		depsB := goDeps(w.Root, bPath) // nil when go list fails: this check is then skipped and the simulation decides
+		names := make([]string, 0, len(users))
+		for u := range users {
+			names = append(names, u)
+		}
+		sort.Strings(names)
+		for _, u := range names {
+			if !depsB[u] {
+				continue
+			}
+			if cyc := importPathFrom(goImportGraph(w.Root, bPath), bPath, u); cyc != nil {
+				refuse("the move would create an import cycle: %s (%s would import %s)", strings.Join(append(cyc, bPath), " -> "), u, bPath)
+			} else {
+				refuse("the move would create an import cycle between %s and %s", bPath, u)
+			}
 		}
 	}
 	if len(refusals) > 0 {
@@ -736,6 +858,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		paths = append(paths, f)
 	}
 	sort.Strings(paths)
+	var emptied []string // notes for the source files left with only a package clause (BUG-DET-002)
 	for _, f := range paths {
 		r := changed[f]
 		next, err := gosrc.EditImports(f, r.next, r.old, addImport[f], true)
@@ -754,6 +877,9 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		c, err := fileChange(f, next, &old, r.bom)
 		if err != nil {
 			return nil, err
+		}
+		if f == l.path && onlyPackageClause(f, next) {
+			emptied = append(emptied, emptiedNote(f)) // BUG-DET-002
 		}
 		if !c.IsNoop() {
 			out = append(out, c)
@@ -806,6 +932,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	if crossModule {
 		notes = append(notes, fmt.Sprintf("%s moved to another module (%s -> %s): packages of %s resolve %s only through a go.work that joins both modules, or a require/replace in their go.mod.", display, A.Module.Path, destMod.Path, A.Module.Path, bPath))
 	}
+	notes = append(notes, emptied...)
 	plan := edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...)
 	if !d.Method {
 		plan.Holds = append(clashWithExcluded(w, dest, d.Name, bName), excludedMentionHolds(w, l, d.Name, A.PkgPath)...)
