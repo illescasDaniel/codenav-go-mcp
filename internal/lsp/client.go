@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -119,6 +120,7 @@ type Client struct {
 	open     map[string]*openFile
 	overlays map[string]string
 	started  bool
+	stopping bool // Stop was asked for: its exit is expected and not logged
 	stderr   []string
 	exited   chan struct{}
 	snapshot map[string]fileStamp // watched files on disk at the last Refresh
@@ -175,6 +177,7 @@ func (c *Client) reset() {
 	c.open = map[string]*openFile{}
 	c.overlays = map[string]string{}
 	c.stderr = nil
+	c.stopping = false
 	c.nextID = 0
 	c.exited = make(chan struct{})
 }
@@ -231,8 +234,8 @@ func (c *Client) Start(ctx context.Context) error {
 		case <-stderrDone:
 		case <-time.After(500 * time.Millisecond):
 		}
+		c.failPending() // before exited closes: a Stop that returns has seen everything it logs
 		close(exited)
-		c.failPending()
 		_ = cmd.Wait()
 	}()
 
@@ -372,6 +375,7 @@ func (c *Client) Stop() error {
 		return nil
 	}
 	cmd, stdin, exited := c.cmd, c.stdin, c.exited
+	c.stopping = true
 	c.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), stopRequestTimeout)
@@ -502,11 +506,20 @@ func (c *Client) failPending() {
 	c.mu.Lock()
 	pending := c.pending
 	c.pending = map[int]chan response{}
-	msg := "language server exited: " + strings.Join(c.opts.Command, " ")
-	if len(c.stderr) > 0 {
-		msg += "\nIts last stderr output:\n" + strings.Join(c.stderr, "\n")
-	}
+	tail := append([]string(nil), c.stderr...)
+	unexpected := !c.stopping
 	c.mu.Unlock()
+	// The stderr tail goes to the log (it may name the binary; agents never see it). A stop that Stop asked
+	// for is expected and stays quiet.
+	if unexpected {
+		msg := "language server exited unexpectedly"
+		if len(tail) > 0 {
+			msg += "; its last stderr output:\n" + strings.Join(tail, "\n")
+		}
+		log.Print(msg)
+	}
+	// The message names no binary path: the agent sees it, and the next call starts a new server (Acquire).
+	const msg = "the language server stopped and is restarting; retry"
 	for _, ch := range pending {
 		ch <- response{Err: &RequestError{Code: -1, Message: msg}}
 	}
@@ -595,6 +608,9 @@ func (c *Client) requestOnce(ctx context.Context, method string, params any) (js
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, fmt.Errorf("%s: %w", method, ctx.Err())
+		}
 		return nil, fmt.Errorf("%s timed out: %w", method, ctx.Err())
 	}
 }
@@ -838,6 +854,14 @@ func (c *Client) docPath(p string) string {
 
 // -- position helpers --------------------------------------------------------
 
+// lineCount words a line count for an out-of-range message: "1 line", "27 lines".
+func lineCount(n int) string {
+	if n == 1 {
+		return "1 line"
+	}
+	return fmt.Sprintf("%d lines", n)
+}
+
 // Utf16Len is the length of s in UTF-16 code units.
 func Utf16Len(s string) int {
 	n := 0
@@ -858,8 +882,11 @@ func (c *Client) checkPosition(abs string, line, column int) error {
 		}
 	}
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	if n := len(lines); n > 1 && lines[n-1] == "" {
+		lines = lines[:n-1] // the empty element after a final newline is not a line
+	}
 	if line < 1 || line > len(lines) {
-		return &InvalidPositionError{fmt.Sprintf("line %d is outside the file (it has %d lines)", line, len(lines))}
+		return &InvalidPositionError{fmt.Sprintf("line %d is outside the file (it has %s)", line, lineCount(len(lines)))}
 	}
 	if width := Utf16Len(lines[line-1]); column < 1 || column > width+1 {
 		return &InvalidPositionError{fmt.Sprintf("column %d is outside line %d (it has %d UTF-16 columns)", column, line, width)}

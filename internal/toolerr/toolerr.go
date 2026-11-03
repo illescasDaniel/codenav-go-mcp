@@ -76,8 +76,10 @@ func Format(err error) (text string, ok bool) {
 		return ie.Msg, true
 	case errors.As(err, &ip):
 		return ip.Msg, true
+	case errors.Is(err, context.Canceled):
+		return "request cancelled", true
 	case errors.Is(err, dle):
-		return "Language server timed out (it may still be loading packages); retry shortly.", true
+		return "the language server did not answer in time (it may be loading packages or stuck); retry shortly, or restart the server if this repeats", true
 	case errors.Is(err, os.ErrNotExist) && errors.As(err, &pe):
 		return fmt.Sprintf("File not found: %s (relative paths resolve against the workspace root).", pe.Path), true
 	case errors.As(err, &pe):
@@ -89,6 +91,10 @@ func Format(err error) (text string, ok bool) {
 var (
 	noPackageRE = regexp.MustCompile(`no package (?:metadata|data) for (?:file )?(file://\S+)`)
 	fileURIRE   = regexp.MustCompile(`file://[^\s"'<>)]+`)
+	// nonGoDefRE matches gopls' failure for a bodyless declaration (//go:linkname or assembly without a .s file).
+	nonGoDefRE = regexp.MustCompile(`can't find non-Go definition of (\S+)`)
+	// invalidIdentRE matches gopls' rename refusal for a name that is not an identifier; the name is quoted.
+	invalidIdentRE = regexp.MustCompile(`invalid identifier to rename: ("[^"]*")`)
 )
 
 // probeDir is the scratch directory name resolve.Probe uses for lookups outside the workspace; it never
@@ -100,6 +106,19 @@ const probeDir = ".codenav_probe"
 // for the scratch file of a name lookup that means no package is loaded at all. Any other failure keeps
 // its message with URIs shown as plain paths (the caller makes them workspace-relative).
 func FriendlyLSP(re *lsp.RequestError) string {
+	// gopls' rename fallbacks: its internal type name ("*ast.Ident") and its wording are never shown.
+	if strings.Contains(re.Message, "parsed signature is ") && strings.HasSuffix(re.Message, ", not a function type") {
+		return "nothing renameable at this position"
+	}
+	if m := invalidIdentRE.FindStringSubmatch(re.Message); m != nil {
+		if m[1] == `"_"` {
+			return `"_" is the blank identifier and cannot be a new name; pick a name.`
+		}
+		return m[1] + " is not a valid Go identifier."
+	}
+	if m := nonGoDefRE.FindStringSubmatch(re.Message); m != nil {
+		return fmt.Sprintf("%s is declared without a body (//go:linkname or assembly); no definition to show.", strings.TrimRight(m[1], ".:,"))
+	}
 	if m := noPackageRE.FindStringSubmatch(re.Message); m != nil {
 		p := lsp.URIToPath(m[1])
 		if strings.Contains(p, "/"+probeDir+"/") {
