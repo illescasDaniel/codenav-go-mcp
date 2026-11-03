@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -47,6 +48,14 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	var nf *resolve.NotFoundError
 	if !errors.As(err, &nf) {
 		return sym, err
+	}
+	if cgoQualified(nf.Query) {
+		// NAVN-007: C is the pseudo-package of cgo, which go list cannot load, so no probe is launched for it. A
+		// workspace type called C still gets its own not-found answer.
+		if !isWorkspaceType(ctx, w, "C") {
+			return sym, toolerr.NotFoundf("No symbol found matching %q: %s is a cgo name, not a Go package symbol; use hover or definition at a use of it.", nf.Query, nf.Query)
+		}
+		return sym, toolerr.NotFoundf("%s", notFoundMessage(ctx, w, nf.Query, false, nil))
 	}
 	psym, perr := resolve.Probe(ctx, w.Client, w.Root, nf.Query, workspaceImports(w.Root, file))
 	switch {
@@ -175,7 +184,7 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, s
 	case len(parts) == 1:
 		msg += " (struct fields and methods are named Type.Name)."
 	case isWorkspaceType(ctx, w, first):
-		msg += fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols; query the embedded type's method instead).", first, last)
+		msg += promotedRefusal(ctx, w, first, last)
 	case packageDir(w.Root, first) != "":
 		msg += fmt.Sprintf(": package %s declares no %s.", first, strings.Join(parts[1:], "."))
 	case importAlias(w.Root, first) != "":
@@ -300,14 +309,143 @@ func isStdlib(qualifier string) bool {
 
 // isWorkspaceType reports whether a type called name is declared in the workspace.
 func isWorkspaceType(ctx context.Context, w *Workspace, name string) bool {
+	return len(workspaceTypeFiles(ctx, w, name)) > 0
+}
+
+// workspaceTypeFiles lists the distinct files that declare a type called name in the workspace.
+func workspaceTypeFiles(ctx context.Context, w *Workspace, name string) []string {
 	syms, err := w.Client.WorkspaceSymbol(ctx, name)
 	if err != nil {
-		return false
+		return nil
 	}
+	var files []string
+	seen := map[string]bool{}
 	for _, s := range syms {
-		if s.Name == name && typeKinds[s.Kind] && s.Location != nil && w.inWorkspace(filepath.Clean(lsp.URIToPath(s.Location.URI))) {
-			return true
+		if s.Name == name && typeKinds[s.Kind] && s.Location != nil {
+			if p := filepath.Clean(lsp.URIToPath(s.Location.URI)); w.inWorkspace(p) && !seen[p] {
+				seen[p] = true
+				files = append(files, p)
+			}
 		}
 	}
-	return false
+	return files
+}
+
+// cgoQualified reports whether query names a member of the cgo pseudo-package C (C.malloc, C.int).
+func cgoQualified(query string) bool {
+	first, rest, ok := strings.Cut(query, ".")
+	return ok && first == "C" && rest != ""
+}
+
+// promotedRefusal explains "typ.member" when typ declares no member. A method promoted through embedding is not
+// a declared symbol, so the answer names the embedded type that declares it (ESYM-008). The owner is named only when
+// one workspace type carries the name: with two packages each declaring typ, which one is meant is unknown, so the
+// general hint stands. When the embedded types of the package carry no such member, the general hint stands too.
+func promotedRefusal(ctx context.Context, w *Workspace, typ, member string) string {
+	if files := workspaceTypeFiles(ctx, w, typ); len(files) == 1 {
+		dir := filepath.Dir(files[0])
+		if owners := promotedFrom(dir, typ, declaresMember(ctx, w, dir, member)); len(owners) > 0 {
+			uses := make([]string, len(owners))
+			for i, o := range owners {
+				uses[i] = o + "." + member
+			}
+			return fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols): %s is declared on %s (embedded in %s); use %s.",
+				typ, member, member, strings.Join(owners, ", "), typ, strings.Join(uses, " or "))
+		}
+	}
+	return fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols; query the embedded type's method instead).", typ, member)
+}
+
+// declaresMember returns, for a type name N, whether the package in dir declares the member N.member. The
+// workspace symbols named member are read once. gopls caps its answer, so a cut list can only miss an owner.
+func declaresMember(ctx context.Context, w *Workspace, dir, member string) func(string) bool {
+	have := map[string]bool{}
+	if syms, err := w.Client.WorkspaceSymbol(ctx, member); err == nil {
+		for _, s := range syms {
+			if s.Location != nil && filepath.Dir(lsp.URIToPath(s.Location.URI)) == dir {
+				have[s.Name] = true
+			}
+		}
+	}
+	return func(name string) bool { return have[name+"."+member] }
+}
+
+// maxEmbedDepth bounds how far promotedFrom follows embedded types.
+const maxEmbedDepth = 8
+
+// promotedFrom names the types that member is promoted to typ from: the embedded fields of typ, read from the Go
+// files of dir (its package), breadth first, so the shallowest types that carry the member are the answer. hasMember
+// says which types carry it. A qualified embedded type (fmt.Stringer) is not followed: it lies in another package.
+func promotedFrom(dir, typ string, hasMember func(string) bool) []string {
+	embeds := embeddedTypes(dir)
+	level := []string{typ}
+	seen := map[string]bool{typ: true}
+	for depth := 0; len(level) > 0 && depth < maxEmbedDepth; depth++ {
+		var next, found []string
+		for _, t := range level {
+			for _, e := range embeds[t] {
+				if seen[e] {
+					continue
+				}
+				seen[e] = true
+				if hasMember(e) {
+					found = append(found, e)
+				} else {
+					next = append(next, e)
+				}
+			}
+		}
+		if len(found) > 0 {
+			return found
+		}
+		level = next
+	}
+	return nil
+}
+
+// embeddedTypes maps each struct type declared in the non-test Go files of dir to the types it embeds by bare
+// name (Inner, *Inner).
+func embeddedTypes(dir string) map[string][]string {
+	out := map[string][]string{}
+	ents, _ := os.ReadDir(dir)
+	fset := token.NewFileSet()
+	for _, e := range ents {
+		n := e.Name()
+		if e.IsDir() || filepath.Ext(n) != ".go" || strings.HasSuffix(n, "_test.go") {
+			continue
+		}
+		f, _ := parser.ParseFile(fset, filepath.Join(dir, n), nil, parser.SkipObjectResolution)
+		if f == nil {
+			continue
+		}
+		for _, d := range f.Decls {
+			g, ok := d.(*ast.GenDecl)
+			if !ok || g.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range g.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				for _, field := range st.Fields.List {
+					if len(field.Names) > 0 {
+						continue
+					}
+					t := field.Type
+					if star, ok := t.(*ast.StarExpr); ok {
+						t = star.X
+					}
+					if id, ok := t.(*ast.Ident); ok {
+						out[ts.Name.Name] = append(out[ts.Name.Name], id.Name)
+					}
+				}
+			}
+		}
+	}
+	return out
 }

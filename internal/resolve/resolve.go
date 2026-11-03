@@ -63,14 +63,16 @@ func matches(s *lsp.Symbol, q string) int {
 }
 
 // foldedForm is the spelling of s that equals q ignoring case ("Gen" for q "gen", "gen.Box" for "gen.box"),
-// "" when none does.
+// "" when none does. It accepts both foldings the matches use: EqualFold (matches) and strings.ToLower (the index,
+// which takes "İndex", U+0130, to Index). The case note must name the spelling for either (ENV-012).
 func foldedForm(s *lsp.Symbol, q string) string {
 	cands := []string{s.Name}
 	if s.ContainerName != "" {
 		cands = append(cands, pkgBase(s.ContainerName)+"."+s.Name, s.ContainerName+"."+s.Name)
 	}
+	lq := strings.ToLower(q)
 	for _, c := range cands {
-		if strings.EqualFold(c, q) {
+		if strings.EqualFold(c, q) || strings.ToLower(c) == lq {
 			return c
 		}
 	}
@@ -137,12 +139,22 @@ func pkgLabel(c *lsp.Symbol) string {
 	return c.ContainerName
 }
 
+// maxCandidates caps an ambiguity listing (SCALE-002): a name declared by thousands of symbols is answered with a
+// sample of the first candidates in order, and the total.
+const maxCandidates = 50
+
 // candidateLines lists ambiguous candidates alike: package by import path and, as soon as one of them
-// sits behind a build constraint, the constraint (or its absence) on every line.
+// sits behind a build constraint, the constraint (or its absence) on every line. The list is capped at
+// maxCandidates lines; the rest are counted.
 func candidateLines(cands []*lsp.Symbol, root string) string {
 	constrained := false
 	for _, c := range cands {
 		constrained = constrained || c.Detail != ""
+	}
+	more := ""
+	if len(cands) > maxCandidates {
+		more = fmt.Sprintf("\n  ... and %d more; pass file_path or a qualified name", len(cands)-maxCandidates)
+		cands = cands[:maxCandidates]
 	}
 	lines := make([]string, len(cands))
 	for i, c := range cands {
@@ -159,7 +171,7 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 			lines[i] += "  (no build constraint)"
 		}
 	}
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n") + more
 }
 
 // NotFoundError is a name that matches no workspace symbol. Its Err is an InputError marked NotFound
