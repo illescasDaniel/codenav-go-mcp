@@ -776,7 +776,7 @@ func FormatReferences(locs []lsp.Location, root string, snippetLimit int) string
 	if len(locs) <= snippetLimit {
 		return FormatLocations(locs, root)
 	}
-	return fmt.Sprintf("(compact list: %d > %d hits)\n%s", len(locs), snippetLimit, FormatReferencesGrouped(locs, root, DefaultReferenceFileLimit, true))
+	return fmt.Sprintf("(compact list: %d > %d hits, so they are grouped by file and line with no source snippets)\n%s", len(locs), snippetLimit, FormatReferencesGrouped(locs, root, DefaultReferenceFileLimit, true))
 }
 
 // SplitTests separates locations in _test.go files from the rest.

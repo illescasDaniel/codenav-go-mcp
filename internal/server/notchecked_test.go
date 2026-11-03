@@ -36,7 +36,7 @@ func TestNotCheckedHoldsEditUntilApplyEdit(t *testing.T) {
 	if isErr {
 		t.Fatalf("apply_edit should write past the NOT CHECKED hold:\n%s", applied)
 	}
-	check := strings.Index(applied, "Check not complete: ")
+	check := strings.Index(applied, "NOT CHECKED: ")
 	written := strings.Index(applied, "Applied (edit id")
 	if check < 0 || written < 0 || check > written {
 		t.Errorf("apply_edit reply must restate the not-checked reason before Applied:\n%s", applied)

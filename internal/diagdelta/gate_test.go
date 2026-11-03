@@ -31,3 +31,33 @@ func TestFormatCappedCountIsAtLeast(t *testing.T) {
 		t.Errorf("uncapped delta: want the exact count, got:\n%s", got)
 	}
 }
+
+// EDIT-001: include_dependents=false says the importers were not checked, next to the count, without holding the write.
+func TestFormatDependentsOffSaysImportersNotChecked(t *testing.T) {
+	d := Delta{FilesChecked: 1, DependentsOff: true}
+	got := Format(d, 15)
+	if !strings.Contains(got, "Diagnostics: 0 new error(s), 0 fixed (1 file(s) checked, 0 diagnostic(s) unchanged; importing packages NOT checked because include_dependents=false - run verify_changes(include_dependents=true) before relying on this)") {
+		t.Errorf("dependents off: want the importers named as not checked, got:\n%s", got)
+	}
+	if strings.HasPrefix(got, "NOT CHECKED") {
+		t.Errorf("dependents off is a disclosure, not a hold:\n%s", got)
+	}
+}
+
+// LEAK-006: "unchanged" counts diagnostics; the label says so instead of reading as a file count.
+func TestFormatUnchangedCountsDiagnostics(t *testing.T) {
+	d := Delta{FilesChecked: 1, Unchanged: 1}
+	if got := Format(d, 15); !strings.Contains(got, "(1 file(s) checked, 1 diagnostic(s) unchanged)") {
+		t.Errorf("unchanged label: got:\n%s", got)
+	}
+}
+
+// VERIFY-004: a capped check with no new errors does not read as an exact "0 new error(s)", nor "at least 0".
+func TestNewCountTextCappedZero(t *testing.T) {
+	if got := (Delta{Capped: 240}).NewCountText(); got != "0 new error(s) in the checked files" {
+		t.Errorf("capped zero: got %q", got)
+	}
+	if got := (Delta{}).NewCountText(); got != "0 new error(s)" {
+		t.Errorf("uncapped zero: got %q", got)
+	}
+}

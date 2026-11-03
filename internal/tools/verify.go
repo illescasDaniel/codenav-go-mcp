@@ -70,12 +70,14 @@ func verifyChanges(ctx context.Context, w *Workspace, includeDeps bool) (string,
 		return "", err
 	}
 	d.NotChecked = gateReasons(gomod.Health(ctx, w.Root), incomplete, d.FilesChecked)
+	d.Capped = len(left)
+	d.DependentsOff = !includeDeps
 	out := "Uncommitted changes vs HEAD in " + strconv.Itoa(len(edited)) + " Go file(s).\n" + diagdelta.Format(d, 15)
 	if len(moduleFiles) > 0 {
 		out += "\nModule file(s) changed too: " + strings.Join(moduleFiles, ", ") + " (a broken Go configuration is reported in the warning, if any)."
 	}
 	if len(left) > 0 {
-		out += "\n(" + leftOutNote(w, left) + ")"
+		out += "\n(" + leftOutNote(w, left, edited) + ")"
 	}
 	return out, nil
 }

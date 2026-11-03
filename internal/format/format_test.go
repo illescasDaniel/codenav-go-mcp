@@ -120,3 +120,15 @@ func TestExplainCycleRewritesMissingMetadata(t *testing.T) {
 		t.Errorf("without a cycle the wording stays: %s", out)
 	}
 }
+
+// LEAK-006: a compact references list says why it dropped the snippets.
+func TestCompactReferenceListSaysWhy(t *testing.T) {
+	var locs []lsp.Location
+	for i := 0; i < 9; i++ {
+		locs = append(locs, lsp.Location{URI: "file:///r/a.go", Range: lsp.Range{Start: lsp.Position{Line: i}, End: lsp.Position{Line: i}}})
+	}
+	out := FormatReferences(locs, "/r", 8)
+	if !strings.Contains(out, "(compact list: 9 > 8 hits, so they are grouped by file and line with no source snippets)") {
+		t.Errorf("compact label: got:\n%s", out)
+	}
+}

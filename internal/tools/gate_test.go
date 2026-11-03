@@ -41,3 +41,18 @@ func TestNewErrorsTextCapped(t *testing.T) {
 		t.Errorf("capped: got %q", got)
 	}
 }
+
+// VERIFY-004: the cap note names the edited files left out apart from the dependents, and never calls them dependents.
+func TestLeftOutNoteSplitsEditedFromDependents(t *testing.T) {
+	w := &Workspace{Root: "/r"}
+	left := []string{"/r/big/f060.go", "/r/app/use.go", "/r/big/f061.go"}
+	edited := []string{"/r/big/f060.go", "/r/big/f061.go"}
+	got := leftOutNote(w, left, edited)
+	want := "2 edited file(s) and 1 dependent file(s) beyond the 60-file limit were not type-checked: big/f060.go, app/use.go, big/f061.go"
+	if got != want {
+		t.Errorf("leftOutNote:\n got %q\nwant %q", got, want)
+	}
+	if only := leftOutNote(w, []string{"/r/big/f060.go"}, edited); !strings.HasPrefix(only, "1 edited file(s) beyond the 60-file limit were not type-checked: ") {
+		t.Errorf("edited only: got %q", only)
+	}
+}

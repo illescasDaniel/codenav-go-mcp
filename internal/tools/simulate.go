@@ -144,13 +144,19 @@ func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDep
 	}
 	files := goEdited
 	var incomplete []string
-	if includeDependents && len(goEdited) > 0 {
+	if len(goEdited) > 0 {
+		// The edited packages are loaded even without dependents: a package that does not load is not checked
+		// whatever the importers are (include_dependents only decides whether the importers are type-checked).
 		rel, problems, err := gomod.RelatedLoad(ctx, w.Root, goEdited)
-		if len(rel) > 0 {
+		if includeDependents && len(rel) > 0 {
 			files = rel
 		}
 		if err != nil {
-			incomplete = append(incomplete, "the packages that import the edited files could not be listed ("+goErrText(err.Error(), w.Root)+")")
+			what := "the packages that import the edited files could not be listed"
+			if !includeDependents {
+				what = "the packages of the edited files could not be listed"
+			}
+			incomplete = append(incomplete, what+" ("+goErrText(err.Error(), w.Root)+")")
 		}
 		if len(problems) > 0 {
 			shown := problems
@@ -202,17 +208,35 @@ func gateReasons(health string, incomplete []string, checked int) []string {
 	return out
 }
 
-// leftOutNote says exactly which files the CheckLimit cap skipped.
-func leftOutNote(w *Workspace, left []string) string {
+// leftOutNote says exactly which files the CheckLimit cap skipped: the edited ones (the changed files
+// themselves, which the answer must not present as dependents) and the dependent ones.
+func leftOutNote(w *Workspace, left, edited []string) string {
+	isEdited := map[string]bool{}
+	for _, e := range edited {
+		isEdited[e] = true
+	}
+	nEdited := 0
 	var names []string
+	for _, f := range left {
+		if isEdited[f] {
+			nEdited++
+		}
+	}
 	for _, f := range left[:min(len(left), 6)] {
 		names = append(names, edits.RelativeName(f, w.Root))
+	}
+	var parts []string
+	if nEdited > 0 {
+		parts = append(parts, fmt.Sprintf("%d edited file(s)", nEdited))
+	}
+	if nDep := len(left) - nEdited; nDep > 0 {
+		parts = append(parts, fmt.Sprintf("%d dependent file(s)", nDep))
 	}
 	more := ""
 	if len(left) > len(names) {
 		more = fmt.Sprintf(", +%d more", len(left)-len(names))
 	}
-	return fmt.Sprintf("%d dependent file(s) beyond the %d-file limit were not type-checked: %s%s", len(left), CheckLimit, strings.Join(names, ", "), more)
+	return fmt.Sprintf("%s beyond the %d-file limit were not type-checked: %s%s", strings.Join(parts, " and "), CheckLimit, strings.Join(names, ", "), more)
 }
 
 // packageStub is what a deleted Go file leaves in the type-check: only its package clause, so the
@@ -290,9 +314,10 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 		plan.Notes = appendUnique(plan.Notes, n)
 	}
 	if len(leftOut) > 0 {
-		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
+		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut, changed))
 	}
 	d.Capped = len(leftOut)
+	d.DependentsOff = !includeDependents
 	d.NotChecked = gateReasons(gomod.Health(ctx, w.Root), incomplete, d.FilesChecked)
 	seenConstraint := map[string]bool{}
 	for _, c := range plan.Changes {

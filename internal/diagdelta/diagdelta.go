@@ -123,8 +123,11 @@ type Delta struct {
 	// NotChecked gives the reasons the check is not complete (the Go configuration does not load, an edited package
 	// does not load, no file was checked, ...). A delta with reasons says nothing clean, whatever it counted.
 	NotChecked []string
-	// Capped counts the dependent files past the check limit, which were not type-checked.
+	// Capped counts the edited and dependent files past the check limit, which were not type-checked.
 	Capped int
+	// DependentsOff is set when include_dependents=false: the packages importing the edited files were not
+	// checked on purpose. Not a hold; the answer says so next to the count.
+	DependentsOff bool
 }
 
 const cgoListFailure = "go list failed to return CompiledGoFiles"
@@ -251,17 +254,31 @@ func dedupe(es []Entry) []Entry {
 	return out
 }
 
+// NewCountText is the count of new errors as the answer words it: exact, a lower bound when files were left
+// out by the check limit, and never a bare "0" in that case (the files left out may hold errors too).
+func (d Delta) NewCountText() string {
+	ne := len(d.NewErrors())
+	switch {
+	case d.Capped > 0 && ne == 0:
+		return "0 new error(s) in the checked files"
+	case d.Capped > 0:
+		return fmt.Sprintf("at least %d new error(s)", ne)
+	}
+	return fmt.Sprintf("%d new error(s)", ne)
+}
+
 func Format(d Delta, limit int) string {
 	ne, fe := len(d.NewErrors()), len(d.FixedErrors())
-	newText := fmt.Sprintf("%d new error(s)", ne)
-	if d.Capped > 0 {
-		newText = fmt.Sprintf("at least %d new error(s)", ne) // the files left out may hold more
-	}
-	head := fmt.Sprintf("Diagnostics: %s, %d fixed", newText, fe)
+	head := fmt.Sprintf("Diagnostics: %s, %d fixed", d.NewCountText(), fe)
 	if other := len(d.New) - ne; other > 0 {
 		head += fmt.Sprintf(", %d new warning(s)", other)
 	}
-	head += fmt.Sprintf(" (%d file(s) checked, %d unchanged)", d.FilesChecked, d.Unchanged)
+	// "unchanged" counts diagnostics, not files: the label says so.
+	head += fmt.Sprintf(" (%d file(s) checked, %d diagnostic(s) unchanged", d.FilesChecked, d.Unchanged)
+	if d.DependentsOff {
+		head += "; importing packages NOT checked because include_dependents=false - run verify_changes(include_dependents=true) before relying on this"
+	}
+	head += ")"
 	if len(d.NotChecked) > 0 {
 		// Not a clean count: the check did not run where it had to, so the head says so instead of "0 new error(s)".
 		head = "NOT CHECKED: " + strings.Join(d.NotChecked, "; ")

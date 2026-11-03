@@ -112,7 +112,7 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 	// Recorded after the simulation, the state the check ran under: a Go configuration change before the write
 	// refuses the plan (txn.CheckFresh).
 	plan.ConfigFP = gomod.Fingerprint(w.Root)
-	return conclude(w, plan, delta, apply, maxNew, allowLarge)
+	return conclude(w, plan, delta, apply, maxNew, allowLarge, nil)
 }
 
 // unformattedNotes names the modified files that were not gofmt-clean before the edit and are not now:
@@ -211,7 +211,10 @@ func nestedModuleNotes(ctx context.Context, root string, plan *edits.EditPlan, p
 	return notes
 }
 
-func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool) (string, string, error) {
+// conclude writes plan when apply is set and its new errors stay within maxNew, and answers with the diagnostics,
+// the notes and the outcome. overridden are the holds a write past them (apply_edit) goes through: restated
+// before Applied, so the reply never reads as if nothing was held.
+func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool, overridden []string) (string, string, error) {
 	var out []string
 	editID := ""
 	out = append(out, plan.Description, plan.Summary(w.Root), "", diagdelta.Format(delta, 15))
@@ -242,9 +245,16 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		}
 		editID = e.ID
 		_ = w.Client.NoteWritten(planPaths(plan))
+		// The reply restates, before Applied, what the write went past: the NOT CHECKED reasons, the holds and the
+		// new errors (a lower bound when the check was capped).
 		if len(delta.NotChecked) > 0 {
-			// apply_edit wrote past the NOT CHECKED hold: the reply restates what was not checked before Applied.
-			out = append(out, "", "Check not complete: "+strings.Join(delta.NotChecked, "; ")+" (written anyway, as apply_edit was asked to).")
+			out = append(out, "", "NOT CHECKED: "+strings.Join(delta.NotChecked, "; ")+" (written anyway, as apply_edit was asked to).")
+		}
+		if len(overridden) > 0 {
+			out = append(out, "", "Held, written anyway (as apply_edit was asked to): "+strings.Join(overridden, " "))
+		}
+		if newErrs > 0 || delta.Capped > 0 {
+			out = append(out, "", "Written with "+delta.NewCountText()+".")
 		}
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
 	case apply && readOnly:
@@ -282,14 +292,10 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	return answer, editID, nil
 }
 
-// newErrorsText counts the new errors of a delta. When the check left dependent files out the count is only a
+// newErrorsText counts the new errors of a delta. When the check left files out the count is only a
 // lower bound, so it reads "at least N".
 func newErrorsText(delta diagdelta.Delta) string {
-	n := len(delta.NewErrors())
-	if delta.Capped > 0 {
-		return fmt.Sprintf("at least %d new error(s)", n)
-	}
-	return fmt.Sprintf("%d new error(s)", n)
+	return delta.NewCountText()
 }
 
 // largeArg is the extra apply_edit argument a preview over the file limit needs: none when
@@ -670,10 +676,16 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 				if err != nil {
 					return "", err
 				}
-				// apply_edit writes past every hold: the NOT CHECKED one and the signature holds, all shown with the preview.
-				// The CheckPlan refusals ran above and are not holds, so they still stand.
+				// apply_edit writes past every hold: the NOT CHECKED one (the fresh simulation above restates it) and the
+				// signature holds, which the reply restates. The CheckPlan refusals ran above and are not holds, so they still stand.
+				var overridden []string
+				for _, h := range plan.Holds {
+					if !strings.HasPrefix(h, "NOT CHECKED: ") {
+						overridden = append(overridden, h)
+					}
+				}
 				plan.Holds = nil
-				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge)
+				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge, overridden)
 				if err != nil {
 					return "", err
 				}
