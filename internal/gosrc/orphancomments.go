@@ -76,7 +76,7 @@ func dropOrphanImportComments(filename, before, after string) string {
 		return after
 	}
 	btf := fset.File(bf.Pos())
-	lineOf := func(p token.Pos) int { return fset.Position(p).Line }
+	lineOf := func(p token.Pos) int { return fset.PositionFor(p, false).Line }
 
 	// was: comment texts attached to an import in before.
 	was := map[string]bool{}

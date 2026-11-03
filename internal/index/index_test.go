@@ -136,3 +136,32 @@ func TestUncompiledFilesAreSkipped(t *testing.T) {
 		t.Error("Unbuildable disagrees with the index")
 	}
 }
+
+// A //line directive changes the line and file names the parser reports, not the text. The index keeps the
+// real position: a directive past the end of the file must not panic, a directive that renames the file or
+// a huge line number must not move the declaration, and the declaration is listed once.
+func TestLineDirectivesKeepRealPositions(t *testing.T) {
+	cases := map[string]string{
+		"past EOF":         "package p\n\n//line foo.y:10\nfunc fromY() int { return 3 }\n",
+		"renames the file": "package p\n\n//line foo.y:2\nfunc fromY() int { return 3 }\n",
+		"huge line":        "package p\n\n//line foo.y:1000000000\nfunc fromY() int { return 3 }\n", // go/scanner accepts up to 1<<30
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			write(t, root, "p/gen.go", src)
+			ix := New(root)
+			if err := ix.Refresh(); err != nil {
+				t.Fatal(err)
+			}
+			ex, loose := ix.Lookup("fromY")
+			if len(ex) != 1 || len(loose) != 0 {
+				t.Fatalf("fromY listed %d times (%d loose), want once: %+v", len(ex), len(loose), ex)
+			}
+			// The declaration is on line 4 (index 3), at column 6 (index 5), in the file that was read.
+			if got := ex[0]; got.File != filepath.Join(root, "p/gen.go") || got.Line != 3 || got.Col != 5 {
+				t.Errorf("fromY at %s %d:%d, want p/gen.go 3:5 (0-based)", got.File, got.Line, got.Col)
+			}
+		})
+	}
+}

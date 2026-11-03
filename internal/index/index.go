@@ -351,11 +351,12 @@ func parseFile(path string) []Entry {
 		if id == nil || id.Name == "_" {
 			return
 		}
-		off := tf.Offset(id.Pos())
-		line := tf.Line(id.Pos())
+		// The real position, not the one a //line directive in the file would rename: the directive can point
+		// past the end of the file, and src is the text of this file.
+		p := tf.PositionFor(id.Pos(), false)
 		out = append(out, Entry{
 			Name: id.Name, Recv: recv, Kind: kind, File: path,
-			Line: line - 1, Col: utf16Col(src, tf.Offset(tf.LineStart(line)), off),
+			Line: p.Line - 1, Col: utf16Col(src, tf.Offset(tf.LineStart(p.Line)), p.Offset),
 			Dir: dir, Pkg: f.Name.Name, Constraint: cons, Test: test,
 		})
 	}

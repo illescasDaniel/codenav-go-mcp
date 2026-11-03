@@ -61,7 +61,7 @@ func NonMemberIdents(path, text, name string) map[int]bool {
 	out := map[int]bool{}
 	ast.Inspect(f, func(n ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok && id.Name == name && !member[id] {
-			p := fset.Position(id.Pos())
+			p := fset.PositionFor(id.Pos(), false)
 			out[p.Line<<20|p.Column] = true
 		}
 		return true
@@ -90,7 +90,7 @@ func NonSelectorIdents(path, text, name string) map[int]bool {
 	out := map[int]bool{}
 	ast.Inspect(f, func(n ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok && id.Name == name && !sel[id] {
-			p := fset.Position(id.Pos())
+			p := fset.PositionFor(id.Pos(), false)
 			out[p.Line<<20|p.Column] = true
 		}
 		return true
@@ -154,7 +154,7 @@ func MemberIdentsInDir(files map[string]string, name string) map[string]map[int]
 				}
 			}
 			if member {
-				p := fset.Position(id.Pos())
+				p := fset.PositionFor(id.Pos(), false)
 				if out[p.Filename] == nil {
 					out[p.Filename] = map[int]bool{}
 				}

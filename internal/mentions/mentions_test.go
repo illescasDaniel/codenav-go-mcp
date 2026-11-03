@@ -1,6 +1,7 @@
 package mentions
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -115,5 +116,23 @@ func TestFindSkipsShadowingLocals(t *testing.T) {
 	}
 	if len(code) != 1 || code[0].Line != 11 {
 		t.Fatalf("only the call foo() on line 11 is a leftover: %+v", code)
+	}
+}
+
+// A //line directive past the end of the file must not move the reported lines of later code mentions:
+// they are listed at their real lines, with the real text of those lines.
+func TestFindIgnoresLineDirectives(t *testing.T) {
+	root := t.TempDir()
+	src := "package p\n\n//line foo.y:10\nfunc f() { Area() }\n\nfunc g() { Area() }\n"
+	_ = os.WriteFile(filepath.Join(root, "a.go"), []byte(src), 0o644)
+	var got []string
+	for _, m := range Find(root, "Area", nil, "") {
+		if m.Kind == "code" {
+			got = append(got, fmt.Sprintf("%d:%d %s", m.Line, m.Col, m.Snippet))
+		}
+	}
+	want := []string{"4:12 func f() { Area() }", "6:12 func g() { Area() }"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("code mentions %v, want %v", got, want)
 	}
 }

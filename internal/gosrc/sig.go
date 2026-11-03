@@ -172,7 +172,7 @@ func (f *File) Groups() []Group {
 		if !ok || d.Tok == token.IMPORT || !d.Lparen.IsValid() || len(d.Specs) < 2 {
 			continue
 		}
-		g := Group{Keyword: d.Tok.String(), Start: f.fset.Position(d.TokPos).Line - 1, End: f.fset.Position(d.Rparen).Line - 1}
+		g := Group{Keyword: d.Tok.String(), Start: f.fset.PositionFor(d.TokPos, false).Line - 1, End: f.fset.PositionFor(d.Rparen, false).Line - 1}
 		ast.Inspect(d, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok && id.Name == "iota" {
 				g.Iota = true

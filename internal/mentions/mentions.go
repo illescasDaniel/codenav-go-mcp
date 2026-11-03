@@ -135,7 +135,7 @@ func goMentions(path, rel, name string, word, prose *regexp.Regexp, text string,
 		if tok == token.EOF {
 			break
 		}
-		p := fset.Position(pos)
+		p := fset.PositionFor(pos, false) // not the //line-adjusted position: the lines are this file's own
 		switch {
 		case tok == token.IDENT && lit == name:
 			if codeIn != nil && !codeIn(path, text) {

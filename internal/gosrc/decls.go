@@ -67,7 +67,7 @@ func FindDeclAt(filename, src string, off int) (*Decl, error) {
 			end := at(d.End())
 			// A func has no trailing-comment field: a comment starting on the line where it ends belongs to it.
 			for _, cg := range f.Comments {
-				if cg.Pos() >= d.End() && fset.Position(cg.Pos()).Line == fset.Position(d.End()).Line {
+				if cg.Pos() >= d.End() && fset.PositionFor(cg.Pos(), false).Line == fset.PositionFor(d.End(), false).Line {
 					end = at(cg.End())
 					break
 				}

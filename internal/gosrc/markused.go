@@ -74,6 +74,9 @@ type marker struct {
 
 func (m *marker) off(p token.Pos) int { return m.tf.Offset(p) }
 
+// line is the real line of p: a //line directive in the file does not move it.
+func (m *marker) line(p token.Pos) int { return m.tf.PositionFor(p, false).Line }
+
 // afterOrIn places the use for the declaring statement stmt, whose ancestors (innermost first) are up.
 func (m *marker) afterOrIn(stmt ast.Stmt, up []ast.Node, use string) ([]Insertion, error) {
 	for len(up) > 0 {
@@ -177,13 +180,13 @@ func (m *marker) first(list []ast.Stmt, open, closeBrace token.Pos, use string) 
 	oo := m.off(open)
 	if len(list) > 0 {
 		so := m.off(list[0].Pos())
-		if m.tf.Line(list[0].Pos()) == m.tf.Line(open) {
+		if m.line(list[0].Pos()) == m.line(open) {
 			return []Insertion{{so, use + "; "}}
 		}
 		return []Insertion{{so, use + "\n" + m.lineIndent(so)}}
 	}
 	ind := m.lineIndent(oo)
-	if closeBrace.IsValid() && m.tf.Line(closeBrace) == m.tf.Line(open) {
+	if closeBrace.IsValid() && m.line(closeBrace) == m.line(open) {
 		return []Insertion{{oo + 1, "\n" + ind + "\t" + use + "\n" + ind}}
 	}
 	if m.restBlank(oo + 1) {

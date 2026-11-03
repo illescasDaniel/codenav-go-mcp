@@ -64,3 +64,11 @@ func TestMemberIdentsInDir(t *testing.T) {
 		t.Errorf("method vs func: %v", m)
 	}
 }
+
+// A //line directive does not move the keys: they are the real line and column of each identifier.
+func TestNonMemberIdentsIgnoresLineDirectives(t *testing.T) {
+	got := NonMemberIdents("p.go", "package p\n//line x.go:1\nfunc Area() {}\nvar v = Area\n", "Area")
+	if !got[3<<20|6] || !got[4<<20|9] || len(got) != 2 {
+		t.Errorf("Area at 3:6 and 4:9 expected, got %v", got)
+	}
+}
