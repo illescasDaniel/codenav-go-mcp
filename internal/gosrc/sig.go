@@ -88,6 +88,9 @@ type Call struct {
 	Args       [][2]int
 	Start, End int
 	Ellipsis   bool // f(xs...)
+	// XOff is the offset of the identifier that ends the qualifier of x.M(...): x, T in (*T).M(...), or the
+	// field T in u.T.M(...). -1 when the callee is not a selector on such an expression.
+	XOff int
 }
 
 func calleeIdent(e ast.Expr) *ast.Ident {
@@ -115,7 +118,12 @@ func (f *File) CallAt(off int) *Call {
 			return out == nil
 		}
 		if id := calleeIdent(c.Fun); id != nil && f.off(id.Pos()) == off {
-			out = &Call{Ellipsis: c.Ellipsis.IsValid()}
+			out = &Call{Ellipsis: c.Ellipsis.IsValid(), XOff: -1}
+			if sel, isSel := c.Fun.(*ast.SelectorExpr); isSel {
+				if qual := qualifierIdent(sel.X); qual != nil {
+					out.XOff = f.off(qual.Pos())
+				}
+			}
 			for _, a := range c.Args {
 				out.Args = append(out.Args, [2]int{f.off(a.Pos()), f.off(a.End())})
 			}

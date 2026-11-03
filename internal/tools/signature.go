@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"path/filepath"
@@ -299,6 +300,8 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	manualSeen := map[string]bool{} // linked members share references; count each use once
 	manualUses := 0
 	calls, dropped := 0, 0
+	var droppedComments []string // comments inside the arguments of removed arguments
+	var reorderSites []string    // calls whose side-effecting arguments the reorder runs in another order
 	for mi, m := range members {
 		fs, err := state(m.path)
 		if err != nil {
@@ -315,6 +318,22 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		}
 		if sig.Unnamed {
 			return "", toolerr.Inputf("%s:%d has unnamed parameters; name them first", edits.RelativeName(m.path, w.Root), m.line+1)
+		}
+		memberOff := edits.Offset(fs.text, m.line, m.col)
+		for _, e := range order {
+			if e.add == nil {
+				continue
+			}
+			if line := fs.parse.BodyDeclLine(memberOff, e.add.Name); line > 0 {
+				return "", toolerr.Inputf("parameter %q would clash with the local %q declared at %s:%d in the body of %s: choose another name for the parameter, or rename the local first", e.add.Name, e.add.Name, edits.RelativeName(m.path, w.Root), line, in.Name)
+			}
+			use, err := bodyCapture(ctx, w, fs, memberOff, e.add.Name)
+			if err != nil {
+				return "", err
+			}
+			if use != "" {
+				return "", toolerr.Inputf("parameter %q would take over the %q used at %s in the body of %s, and that use does not resolve to a local of the body: choose another name for the parameter", e.add.Name, e.add.Name, use, in.Name)
+			}
 		}
 		have := sig.Params
 		for _, e := range order {
@@ -360,11 +379,23 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 					ml.whys = append(ml.whys, why)
 				}
 			}
+			// A method expression (*T).M(t, args...) passes the receiver as argument 0, before the parameters.
+			shift := 0
+			if c != nil && c.XOff >= 0 {
+				isType, known := qualifierIsType(ctx, w, rfs, c)
+				if !known {
+					addManual("cannot tell whether the qualifier names a type: check by hand")
+					continue
+				}
+				if isType {
+					shift = 1
+				}
+			}
 			switch {
 			case c == nil:
 				addManual("used as a value, not called")
 				continue
-			case len(c.Args) < fixed || (!variadic && len(c.Args) != fixed):
+			case len(c.Args) < fixed+shift || (!variadic && len(c.Args) != fixed+shift):
 				addManual("argument count does not match: f(g()) or a spread of several results")
 				continue
 			case c.Ellipsis && (!variadic || len(order) == 0 || order[len(order)-1].old != nparams-1):
@@ -389,29 +420,45 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 					rfs.inserted = append(rfs.inserted, e.add.Value)
 				}
 			}
-			ord, fx := order, fixed
-			build := func(args []string) string {
-				var out []string
-				for _, e := range ord {
-					switch {
-					case e.old < 0:
-						out = append(out, strings.TrimSpace(e.add.Value))
-					case e.old < fx:
-						out = append(out, args[e.old])
-					default:
-						out = append(out, args[fx:]...)
-					}
-				}
-				return strings.Join(out, ", ")
-			}
 			argTexts := make([]string, len(c.Args))
 			for k, r := range c.Args {
 				argTexts[k] = rfs.text[r[0]:r[1]]
 			}
-			if build(argTexts) != strings.Join(argTexts, ", ") { // a no-op reorder leaves the call as it is
-				calls++
+			slots := callSlots(order, fixed, shift, len(c.Args))
+			identity := len(slots) == len(c.Args)
+			for i, s := range slots {
+				identity = identity && s.arg == i
 			}
-			rfs.es = append(rfs.es, sigEdit{start: c.Start, end: c.End, args: c.Args, build: build})
+			if identity { // nothing moves, is added or is removed: the call stays as it is
+				continue
+			}
+			if reordersEffects(slots, argTexts) {
+				reorderSites = append(reorderSites, fmt.Sprintf("%s:%d", edits.RelativeName(rfs.path, w.Root), r.Range.Start.Line+1))
+			}
+			if renderCall(slots, argTexts, callGaps{}, "") == strings.Join(argTexts, ", ") {
+				continue // the same texts in the same order: the call stays as written, layout and comments included
+			}
+			calls++
+			gaps := gapComments(rfs.text, c)
+			kept := map[int]bool{}
+			for _, s := range slots {
+				kept[s.arg] = true
+			}
+			for k, cm := range gaps.comments {
+				if kept[k] {
+					continue
+				}
+				droppedComments = append(droppedComments, cm.lead...)
+				if cm.trail != "" {
+					droppedComments = append(droppedComments, cm.trail)
+				}
+			}
+			indent := ""
+			if gaps.layout && len(c.Args) > 0 {
+				indent = argIndent(rfs.text, c.Args[0][0])
+			}
+			build := func(args []string) string { return renderCall(slots, args, gaps, indent) }
+			rfs.es = append(rfs.es, sigEdit{start: c.Start, end: gaps.end, args: c.Args, build: build})
 		}
 	}
 
@@ -473,8 +520,14 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		}
 		notes = append(notes, fmt.Sprintf("%d use(s) need manual work:\n    %s", manualUses, strings.Join(lines, "\n    ")))
 	}
+	if len(droppedComments) > 0 {
+		notes = append(notes, fmt.Sprintf("%d comment(s) inside a call were dropped with a removed argument: %s.", len(droppedComments), listing(droppedComments)))
+	}
 	holds, excluded := excludedCheck(w, root, identAt(root.path, root.line, root.col), sym.Kind == methodKind)
 	notes = append(notes, excluded...)
+	if len(reorderSites) > 0 {
+		holds = append(holds, fmt.Sprintf("The reorder changes the order in which %d call(s) evaluate their arguments: %s. Go evaluates the arguments of a call from left to right, so each call that has side effects now feeds another parameter.", len(reorderSites), listing(reorderSites)))
+	}
 	plan := edits.NewPlan("change_signature "+in.Name, changes, notes...)
 	plan.Holds = holds
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
@@ -577,6 +630,284 @@ func neededImports(w *Workspace, fs *fileState, given []string, declImports map[
 		}
 	}
 	return need, notes, nil
+}
+
+// callSlot is one argument of a rewritten call: the index of an existing argument, or -1 for an added
+// parameter, whose value is written instead.
+type callSlot struct {
+	arg   int
+	value string
+}
+
+// callSlots lists the arguments of a call of n arguments in the new parameter order. shift is 1 for a method
+// expression (T.M(recv, args...)): the receiver, argument 0, stays first and the parameters follow it.
+// fixed is the number of parameters before a variadic one.
+func callSlots(order []entry, fixed, shift, n int) []callSlot {
+	var out []callSlot
+	if shift == 1 {
+		out = append(out, callSlot{arg: 0})
+	}
+	for _, e := range order {
+		switch {
+		case e.add != nil:
+			out = append(out, callSlot{arg: -1, value: strings.TrimSpace(e.add.Value)})
+		case e.old < fixed:
+			out = append(out, callSlot{arg: e.old + shift})
+		default:
+			for k := fixed + shift; k < n; k++ {
+				out = append(out, callSlot{arg: k})
+			}
+		}
+	}
+	return out
+}
+
+// argComments are the comments written between a call's arguments: the comment after argument k's comma on
+// its line (trail), and the comments on their own lines before it (lead).
+type argComments struct {
+	lead  []string
+	trail string
+}
+
+// callGaps is what the text between a call's arguments holds besides the arguments.
+type callGaps struct {
+	comments []argComments
+	layout   bool // a line break or a comment sits between two arguments: one argument per line
+	// end is the end of the replaced range: the last argument, or the comment after its comma when that
+	// comment is on the same line (tailOpen). The comments before the first argument stay where they are.
+	end      int
+	tailOpen bool
+}
+
+// gapComments reads the comments between the arguments of call c (text is the file text).
+func gapComments(text string, c *gosrc.Call) callGaps {
+	n := len(c.Args)
+	g := callGaps{comments: make([]argComments, n), end: c.End}
+	add := func(a int, cm string, afterBreak bool) {
+		if afterBreak {
+			g.comments[a+1].lead = append(g.comments[a+1].lead, cm)
+		} else {
+			g.comments[a].trail = strings.TrimSpace(g.comments[a].trail + " " + cm)
+		}
+		g.layout = true
+	}
+	for a := 0; a+1 < n; a++ {
+		gap := text[c.Args[a][1]:c.Args[a+1][0]]
+		afterBreak := false
+		for i := 0; i < len(gap); {
+			switch {
+			case gap[i] == '\n':
+				afterBreak = true
+				g.layout = true
+				i++
+			case strings.HasPrefix(gap[i:], "//"):
+				end := strings.IndexByte(gap[i:], '\n')
+				if end < 0 {
+					end = len(gap) - i
+				}
+				add(a, strings.TrimRight(gap[i:i+end], " \t\r"), afterBreak)
+				i += end
+			case strings.HasPrefix(gap[i:], "/*"):
+				stop := len(gap)
+				if end := strings.Index(gap[i+2:], "*/"); end >= 0 {
+					stop = i + 2 + end + 2
+				}
+				add(a, gap[i:stop], afterBreak)
+				i = stop
+			default:
+				i++
+			}
+		}
+	}
+	if n > 0 {
+		if end, cm, ok := tailComment(text, c.Args[n-1][1]); ok {
+			g.end, g.tailOpen, g.layout = end, true, true
+			g.comments[n-1].trail = cm
+		}
+	}
+	return g
+}
+
+// tailComment finds a comment on the line of the last argument, after the comma that follows it. It returns
+// the end of that comment. The comma and the comment are replaced with the call, which writes its own comma.
+func tailComment(text string, from int) (end int, cm string, ok bool) {
+	i := from
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+		i++
+	}
+	if i >= len(text) || text[i] != ',' {
+		return 0, "", false
+	}
+	i++
+	for i < len(text) && (text[i] == ' ' || text[i] == '\t') {
+		i++
+	}
+	switch {
+	case strings.HasPrefix(text[i:], "//"):
+		stop := strings.IndexByte(text[i:], '\n')
+		if stop < 0 {
+			stop = len(text) - i
+		}
+		cm = strings.TrimRight(text[i:i+stop], " \t\r")
+		return i + len(cm), cm, true
+	case strings.HasPrefix(text[i:], "/*"):
+		stop := strings.Index(text[i:], "*/")
+		if stop < 0 {
+			return 0, "", false
+		}
+		cm = text[i : i+stop+2]
+		if strings.Contains(cm, "\n") {
+			return 0, "", false
+		}
+		return i + len(cm), cm, true
+	}
+	return 0, "", false
+}
+
+// renderCall writes the arguments of a rewritten call. Without layout they are joined on one line. With layout
+// each argument starts a line (indented by indent) with the comments written next to it. A comment after the
+// comma of the last argument would hide the closing text when it ends the line, so it moves in front of the
+// argument. A block comment may stay after the comma the rewritten text writes (tailOpen); a line comment may not,
+// because the closing parenthesis would follow it on the same line.
+func renderCall(slots []callSlot, args []string, g callGaps, indent string) string {
+	texts := make([]string, len(slots))
+	for i, s := range slots {
+		if s.arg < 0 {
+			texts[i] = s.value
+		} else {
+			texts[i] = args[s.arg]
+		}
+	}
+	if !g.layout {
+		return strings.Join(texts, ", ")
+	}
+	var b strings.Builder
+	for i, s := range slots {
+		var lead []string
+		trail := ""
+		if s.arg >= 0 {
+			lead, trail = g.comments[s.arg].lead, g.comments[s.arg].trail
+		}
+		last := i == len(slots)-1
+		// A line comment that ends the output needs a line break after it: the source after the range has one only
+		// when the comment is the tail of the original last argument.
+		if last && trail != "" && (!g.tailOpen || strings.HasPrefix(trail, "//") && s.arg != len(args)-1) {
+			lead, trail = append(slices.Clone(lead), trail), ""
+		}
+		if i > 0 {
+			b.WriteString("\n" + indent)
+		}
+		for _, cm := range lead {
+			b.WriteString(cm + "\n" + indent)
+		}
+		b.WriteString(texts[i])
+		if !last || g.tailOpen {
+			b.WriteString(",")
+		}
+		if trail != "" {
+			b.WriteString(" " + trail)
+		}
+	}
+	return b.String()
+}
+
+// argIndent is the indentation of the line where the argument at off starts. An argument that shares its line
+// with the call is indented one level further.
+func argIndent(text string, off int) string {
+	ls := strings.LastIndexByte(text[:off], '\n') + 1
+	end := ls
+	for end < off && (text[end] == ' ' || text[end] == '\t') {
+		end++
+	}
+	if end < off {
+		return text[ls:end] + "\t"
+	}
+	return text[ls:end]
+}
+
+// sideEffecting reports whether an argument calls a function or receives from a channel outside a function
+// literal: the operations Go evaluates left to right. Text that does not parse counts as having effects.
+func sideEffecting(text string) bool {
+	e, err := parser.ParseExpr(text)
+	if err != nil {
+		return true
+	}
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		switch t := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			found = true
+		case *ast.UnaryExpr:
+			found = found || t.Op == token.ARROW
+		}
+		return !found
+	})
+	return found
+}
+
+// reordersEffects reports whether the new order runs two arguments that have effects in another order than the
+// call wrote them (Go evaluates them left to right, so the value each one produces changes).
+func reordersEffects(slots []callSlot, argTexts []string) bool {
+	for p := range slots {
+		for q := p + 1; q < len(slots); q++ {
+			a, b := slots[p].arg, slots[q].arg
+			if a < 0 || b < 0 || a < b {
+				continue
+			}
+			if sideEffecting(argTexts[a]) && sideEffecting(argTexts[b]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// qualifierIsType reports whether the qualifier of call c names a type, as in T.M(recv, args...) or (*T).M(...),
+// which passes the receiver as argument 0. gopls resolves the qualifier, so a variable that shadows a type name is a
+// value. known is false when gopls does not resolve the qualifier to exactly one declaration.
+func qualifierIsType(ctx context.Context, w *Workspace, fs *fileState, c *gosrc.Call) (isType, known bool) {
+	line, ch := edits.PositionOf(fs.text, c.XOff)
+	locs, err := w.Client.Definition(ctx, fs.path, line+1, ch+1)
+	if err != nil || len(locs) != 1 {
+		return false, false
+	}
+	path, text, df := lsp.URIToPath(locs[0].URI), fs.text, fs.parse
+	if path != fs.path {
+		var rerr error
+		if text, _, rerr = edits.ReadSource(path); rerr != nil {
+			return false, false
+		}
+		if df, rerr = gosrc.ParseFile(path, text); rerr != nil {
+			return false, false
+		}
+	}
+	decl := edits.Offset(text, locs[0].Range.Start.Line, locs[0].Range.Start.Character)
+	return df.TypeNameAt(decl), true
+}
+
+// bodyCapture returns where the body of the function at memberOff uses name without a declaration of its own in the
+// body, so that an added parameter of that name would take the use over; "" when there is none. gopls resolves
+// each use: a declaration inside the body is a local, anything else (a package-level name, an import, a predeclared
+// name, a parameter being removed) is not, and a use gopls cannot resolve counts as one.
+func bodyCapture(ctx context.Context, w *Workspace, fs *fileState, memberOff int, name string) (string, error) {
+	start, end, uses, ok := fs.parse.BodyUses(memberOff, name)
+	if !ok {
+		return "", nil
+	}
+	for _, off := range uses {
+		line, ch := edits.PositionOf(fs.text, off)
+		locs, err := w.Client.Definition(ctx, fs.path, line+1, ch+1)
+		if err == nil && len(locs) == 1 && lsp.URIToPath(locs[0].URI) == fs.path {
+			decl := edits.Offset(fs.text, locs[0].Range.Start.Line, locs[0].Range.Start.Character)
+			if start <= decl && decl < end {
+				continue
+			}
+		}
+		return fmt.Sprintf("%s:%d", edits.RelativeName(fs.path, w.Root), line+1), nil
+	}
+	return "", nil
 }
 
 // withArticle puts "a" or "an" before word.
