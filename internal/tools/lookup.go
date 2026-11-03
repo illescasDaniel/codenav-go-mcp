@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
@@ -168,12 +169,21 @@ func notFoundMessage(ctx context.Context, w *Workspace, query string, ro bool, s
 	case len(parts) == 1 && packageDir(w.Root, query) != "":
 		dir := packageDir(w.Root, query)
 		msg += fmt.Sprintf(": %s is a package (directory %s), not a symbol; outline its files or use search_symbol with path=%s.", query, dir, dir)
+	case len(parts) == 1 && isLocalName(query):
+		// NAVN-005: a local or a parameter is in no index; only the position tools reach it.
+		msg += " (struct fields and methods are named Type.Name; local variables and parameters are not indexed by name: use hover, definition or references at one of their uses)."
 	case len(parts) == 1:
 		msg += " (struct fields and methods are named Type.Name)."
 	case isWorkspaceType(ctx, w, first):
 		msg += fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols; query the embedded type's method instead).", first, last)
 	case packageDir(w.Root, first) != "":
 		msg += fmt.Sprintf(": package %s declares no %s.", first, strings.Join(parts[1:], "."))
+	case importAlias(w.Root, first) != "":
+		// BED-002: the workspace imports the package under another name (metav1 for .../meta/v1).
+		path := importAlias(w.Root, first)
+		pkg, rest := gosrc.ImportName(path), strings.Join(parts[1:], ".")
+		msg += fmt.Sprintf(": %s is an import alias for %s, not a package name (the package is %s); write %s.%s, or the import path %s.%s",
+			first, path, pkg, pkg, rest, path, rest)
 	case isStdlib(first):
 		msg += fmt.Sprintf(": %s is in the standard library, outside the workspace%s", first, outside)
 	case suggestsQualifier(suggest, first, false):
@@ -263,6 +273,24 @@ func mayLiveIn(n gomod.Nested, query string) bool {
 		return nil
 	})
 	return found
+}
+
+// isLocalName reports whether a bare name is spelled like a local variable or parameter (a lower-case
+// identifier that is not a predeclared one).
+func isLocalName(name string) bool {
+	r := []rune(name)
+	return len(r) > 0 && (unicode.IsLower(r[0]) || r[0] == '_') && token.IsIdentifier(name) && !builtins[name]
+}
+
+// importAlias is the import path the workspace's files bind the qualifier q to under a name other than the
+// package's own ("" when none does).
+func importAlias(root, q string) string {
+	for _, p := range workspaceImports(root, "")[q] {
+		if gosrc.ImportName(p) != q {
+			return p
+		}
+	}
+	return ""
 }
 
 func isStdlib(qualifier string) bool {

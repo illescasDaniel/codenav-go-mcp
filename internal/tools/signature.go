@@ -257,7 +257,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 		}
 	}
 	members := []member{root}
-	skipped := 0
+	var skipped []string
 	if sym.Kind == methodKind && flag(in.IncludeOverrides, true) {
 		if members, skipped, err = linkedMembers(ctx, w, root, sym.Name, "changing its signature", "include_overrides=false"); err != nil {
 			return "", err
@@ -525,6 +525,9 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	notes = append(notes, excluded...)
 	if len(reorderSites) > 0 {
 		holds = append(holds, fmt.Sprintf("The reorder changes the order in which %d call(s) evaluate their arguments: %s. Go evaluates the arguments of a call from left to right, so each call that has side effects now feeds another parameter.", len(reorderSites), listing(reorderSites)))
+	}
+	if h := foreignHold(skipped, sym.Name); h != "" {
+		holds = append(holds, h)
 	}
 	plan := edits.NewPlan("change_signature "+in.Name, changes, notes...)
 	plan.Holds = holds

@@ -252,7 +252,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	// The members that must change together. gopls checks each rename on its own and refuses
 	// to break an interface relationship, so for several members the edits come from references.
 	members := []member{root}
-	skipped := 0
+	var skipped []string
 	if flag(in.Linked, true) && kind == methodKind {
 		var err error
 		if members, skipped, err = linkedMembers(ctx, w, root, oldName, "renaming it", "linked=false"); err != nil {
@@ -291,6 +291,13 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		}
 	}
 
+	// Edits that gopls' rename adds but that are not this symbol: the receivers of the type's other methods (REN-001),
+	// and identifiers another package qualifies (REN-004's sub.B, BED-003's doc link [cmp.Ordered]).
+	var unchanged []string
+	if in.Parameter == "" {
+		limitToReceiver(decl, all)
+		unchanged = dropForeignQualified(w, decl, all)
+	}
 	changes, err := edits.ChangesFromEdits(all)
 	if err != nil {
 		return nil, err
@@ -304,6 +311,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	desc := fmt.Sprintf("rename %s -> %s", oldName, in.NewName)
 	var notes []string
+	if len(unchanged) > 0 {
+		notes = append(notes, unchangedNote(unchanged, oldName))
+	}
 	if in.Parameter == "" && gosrc.IsEmbeddedFieldAt(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character)) {
 		notes = append(notes, fmt.Sprintf("%s is an embedded field; renaming it also renames the type %s (and every other embedding of it).", oldName, oldName))
 	}
@@ -329,7 +339,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			lines = lines[:10]
 		}
 		notes = append(notes, fmt.Sprintf("Also renamed %d linked method(s) (interface methods and implementations rename together):\n%s%s", len(linked), strings.Join(lines, "\n"), more))
-	} else if kind == methodKind && flag(in.Linked, true) {
+	} else if kind == methodKind && flag(in.Linked, true) && len(skipped) == 0 {
 		notes = append(notes, "No interface relationships found for this method.")
 	}
 	if byRefs && len(linked) == 0 && kind == methodKind {
@@ -369,6 +379,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		var guard []string
 		holds, guard = buildGuard(w, decl, oldName, "renamed")
 		notes = append(notes, guard...)
+	}
+	if h := foreignHold(skipped, oldName); h != "" {
+		holds = append(holds, h)
 	}
 	plan := edits.NewPlan(desc, changes, notes...)
 	plan.Holds = holds
@@ -521,7 +534,7 @@ func couldRefer(declFile, name string) func(path, text string) bool {
 // error) would break, so the operation is refused. When it is an interface method, what comes back are
 // implementers: those outside the workspace (any stdlib type with a Name() string) are not touched and
 // not expanded; their number is returned as skipped.
-func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, optOut string) (members []member, skipped int, err error) {
+func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, optOut string) (members []member, skipped []string, err error) {
 	members = []member{root}
 	seen := map[string]bool{root.key(): true}
 	texts := map[string]string{}
@@ -539,7 +552,7 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, 
 		m := members[i]
 		locs, err := w.Client.Implementation(ctx, m.path, m.line+1, m.col+1)
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, err
 		}
 		isConcrete := concrete(m)
 		for _, l := range locs {
@@ -557,12 +570,12 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, 
 						hidden = append(hidden, label)
 					}
 				} else {
-					skipped++
+					skipped = append(skipped, foreignImplementer(n))
 				}
 				continue
 			}
 			if len(members) > maxLinked {
-				return nil, 0, toolerr.Inputf("more than %d linked methods; pass %s to change only this one.", maxLinked, optOut)
+				return nil, nil, toolerr.Inputf("more than %d linked methods; pass %s to change only this one.", maxLinked, optOut)
 			}
 			members = append(members, n)
 		}
@@ -579,17 +592,42 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, 
 		if len(list) > 3 {
 			shown += fmt.Sprintf(" and %d more", len(list)-3)
 		}
-		return nil, 0, toolerr.Inputf("%s is also %s%s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
+		return nil, nil, toolerr.Inputf("%s is also %s%s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
 			"Pass %s to change only this declaration and its uses.", name, what, shown, doing, optOut)
 	}
 	return members, skipped, nil
 }
 
-func skippedNote(n int, name string) string {
-	if n == 0 {
+// skippedNote says which types outside the workspace have a method of an interface's name and satisfy the
+// interface: they are not renamed, so they stop satisfying it (REN-003: the note used to say they were unaffected
+// and the caller had no list of them).
+func skippedNote(foreign []string, name string) string {
+	if len(foreign) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d type(s) outside the workspace also have a %s method; they are unaffected.", n, name)
+	list := uniqueSorted(foreign)
+	return fmt.Sprintf("%d type(s) outside the workspace also have a %s method that satisfies this interface (%s). They are not changed, so they no longer satisfy it; a compile-time check or a use of them as the interface fails to build.", len(list), name, foreignShown(list))
+}
+
+// foreignHold holds a write that leaves types outside the workspace no longer satisfying an interface (REN-003):
+// the rename does not change them, and a use of them as the interface (a type assertion, a value passed as it)
+// can fail at run time with no compile error, so the write waits for apply_edit.
+func foreignHold(foreign []string, name string) string {
+	if len(foreign) == 0 {
+		return ""
+	}
+	list := uniqueSorted(foreign)
+	return fmt.Sprintf("%d type(s) outside the workspace satisfy this interface through %s (%s), and the change does not touch them: they stop satisfying it, and a use of them as the interface may fail with no compile error.",
+		len(list), name, foreignShown(list))
+}
+
+// foreignShown lists up to three of the sorted labels, and how many more there are.
+func foreignShown(list []string) string {
+	shown := strings.Join(list[:min(len(list), 3)], ", ")
+	if len(list) > 3 {
+		shown += fmt.Sprintf(" and %d more", len(list)-3)
+	}
+	return shown
 }
 
 // parameterOf moves root from a function's name to the name of its parameter.

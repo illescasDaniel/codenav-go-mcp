@@ -704,15 +704,21 @@ func TestRenameKeepsCRLF(t *testing.T) {
 func TestRenameInterfaceMethodWithStdlibLookalikes(t *testing.T) {
 	cs, root := session(t, nil)
 	writeFile(t, root, "shapes/namer.go", "package shapes\n\nimport \"os\"\n\nvar _ = os.Getpid\n\ntype Namer interface{ Name() string }\n\ntype Pt struct{}\n\nfunc (Pt) Name() string { return \"\" }\n")
+	// REN-003: stdlib types satisfy Namer through Name and the rename does not change them, so the write is held
+	// (a deliberate behaviour change: this test used to expect it applied).
 	out := call(t, cs, "rename_symbol", map[string]any{"name": "Namer.Name", "new_name": "Label"})
-	if !strings.Contains(out, "Applied") || strings.Contains(out, "would break that relationship") {
-		t.Fatalf("rename:\n%s", out)
+	if !strings.Contains(out, "Not written") || strings.Contains(out, "would break that relationship") {
+		t.Fatalf("rename must be held:\n%s", out)
 	}
-	if !strings.Contains(out, "outside the workspace also have") {
-		t.Errorf("want skipped note:\n%s", out)
+	if !strings.Contains(out, "outside the workspace also have") || strings.Contains(out, "/src/") {
+		t.Errorf("want skipped note naming types, not paths:\n%s", out)
 	}
+	if s := readFile(t, root, "shapes/namer.go"); strings.Count(s, "Label") != 0 {
+		t.Errorf("a held write must not change the file:\n%s", s)
+	}
+	call(t, cs, "apply_edit", map[string]any{"id": previewID(t, out)})
 	if s := readFile(t, root, "shapes/namer.go"); strings.Count(s, "Label") != 2 {
-		t.Errorf("want both renamed:\n%s", s)
+		t.Errorf("apply_edit must write the held rename, both sides:\n%s", s)
 	}
 }
 

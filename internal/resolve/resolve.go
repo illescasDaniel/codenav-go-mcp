@@ -322,7 +322,7 @@ func ResolveExact(ctx context.Context, c *lsp.Client, ix *index.Index, root, que
 }
 
 func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, file string, exactCase bool) (Symbol, error) {
-	query = strings.TrimSpace(query)
+	query = normalizeQuery(strings.TrimSpace(query))
 	last := query
 	if i := strings.LastIndex(query, "."); i >= 0 {
 		last = query[i+1:]
@@ -341,6 +341,10 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		}
 	}
 	exact, loose, onlyIndex := merge(ix, query, exact, loose)
+	if len(exact) == 0 && len(loose) == 0 {
+		// Nothing by name: the member may be named through a type alias ("Square.Area" for a method of Sq).
+		exact = aliasedMembers(all, query)
+	}
 	exact, loose = dedupeSymbols(format.Rank(exact, root, last)), dedupeSymbols(format.Rank(loose, root, last))
 	// A case-exact match beats a merely case-insensitive one.
 	cands := exact
@@ -397,6 +401,11 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		}
 		cands = narrowed
 	}
+	if file == "" && !exactCase { // read tools only: a write never refuses a name for its reading (NAVN-010)
+		if std := qualifierAmbiguous(query, cands); std != "" {
+			return Symbol{}, qualifierRefusal(query, std, cands)
+		}
+	}
 	if len(cands) > 1 { // deterministic order for the ambiguity listing
 		sort.SliceStable(cands, func(i, j int) bool {
 			a, b := canonPath(cands[i].Location.URI), canonPath(cands[j].Location.URI)
@@ -408,6 +417,11 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 	}
 	switch len(cands) {
 	case 0:
+		if !strings.Contains(query, ".") {
+			if mem := memberNamed(all, query); len(mem) > 0 {
+				return Symbol{}, memberRefusal(query, mem, root)
+			}
+		}
 		hint := ""
 		if !strings.Contains(query, ".") {
 			hint = " (struct fields and methods are named Type.Name)"
