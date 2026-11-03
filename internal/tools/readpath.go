@@ -61,6 +61,26 @@ func replaceDir(root, p string) string {
 	return p
 }
 
+var goRootDir struct {
+	once sync.Once
+	dir  string
+}
+
+// stdlibTop reports whether first is a top-level directory of the Go root's src tree, that is, a standard
+// library package path. When the Go root is unknown it answers true (keeps the link).
+func stdlibTop(first string) bool {
+	goRootDir.once.Do(func() {
+		if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+			goRootDir.dir = strings.TrimSpace(string(out))
+		}
+	})
+	if goRootDir.dir == "" {
+		return true
+	}
+	_, err := os.Stat(filepath.Join(goRootDir.dir, "src", first))
+	return err == nil
+}
+
 func realPath(p string) string {
 	p = filepath.Clean(p)
 	if r, err := filepath.EvalSymlinks(p); err == nil {

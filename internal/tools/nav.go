@@ -10,6 +10,7 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -109,6 +110,10 @@ func capOutput(out string) string {
 	cut := strings.LastIndex(out[:maxOutputBytes], "\n")
 	if cut < maxOutputBytes/2 {
 		cut = maxOutputBytes
+		// Never cut inside a multi-byte character: back up to its first byte.
+		for cut > 0 && !utf8.RuneStart(out[cut]) {
+			cut--
+		}
 	}
 	return fmt.Sprintf("%s\n... %d more byte(s) omitted (the answer is over %d bytes; narrow the request).", out[:cut], len(out)-cut, maxOutputBytes)
 }
@@ -391,8 +396,17 @@ func caseNote(w *Workspace, name string, sym resolve.Symbol) string {
 	return msg
 }
 
-func checkGoFile(p string) error {
+// checkGoFile refuses a path that is not a .go file. A path that does not exist is reported as missing first,
+// whatever its extension (so "p/p.go " says File not found, not "not a .go file").
+func checkGoFile(w *Workspace, p string) error {
 	if !strings.HasSuffix(p, ".go") {
+		abs := p
+		if !filepath.IsAbs(abs) {
+			abs = filepath.Join(w.Root, abs)
+		}
+		if _, err := os.Stat(abs); errors.Is(err, os.ErrNotExist) {
+			return &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
+		}
 		return toolerr.Inputf("%q is not a .go file.", p)
 	}
 	return nil
@@ -475,9 +489,25 @@ var fileLink = regexp.MustCompile(`file://[^\s)\]>"]+`)
 // The stdlib (no dot in the first element) and versioned module-cache dependencies keep theirs.
 var adHocLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/(?:command-line-arguments[^)\n]*|_/[^)\n]*|[./][^)\n]*|[^)\s]*@[#/][^)\n]*|[^)\s]*@|[^/)\s@]*\.[^/)\s@]*(?:/[^)\s@]*)?)\)[ \t]*`)
 
+// dotlessLink matches a pkg.go.dev link whose import path starts with an element that has no dot (the first
+// capture). pkg.go.dev serves the standard library under such names and does not serve a dotless module path.
+var dotlessLink = regexp.MustCompile(`(?m)\n*(?:---\n+)?\[[^\]\n]*\]\(https://pkg\.go\.dev/([^/)\s@#]+)(?:/[^)\s@#]*)?(?:#[^)\s@]*)?\)[ \t]*`)
+
+// dropDotlessModuleLinks removes the links to a dotless module path (`myapp/x#X`) and keeps the standard
+// library's (`fmt#Println`): an element with no dot that is a directory of the Go root is the standard library.
+func dropDotlessModuleLinks(t string) string {
+	return dotlessLink.ReplaceAllStringFunc(t, func(m string) string {
+		sub := dotlessLink.FindStringSubmatch(m)
+		if sub == nil || strings.Contains(sub[1], ".") || stdlibTop(sub[1]) {
+			return m
+		}
+		return ""
+	})
+}
+
 // tidyHover drops useless links and caps the length, keeping the head (signature and summary).
 func tidyHover(t string) string {
-	t = strings.TrimRight(adHocLink.ReplaceAllString(t, ""), "\n ")
+	t = strings.TrimRight(dropDotlessModuleLinks(adHocLink.ReplaceAllString(t, "")), "\n ")
 	t = fileLink.ReplaceAllStringFunc(t, func(m string) string {
 		if u, err := url.PathUnescape(strings.TrimPrefix(m, "file://")); err == nil {
 			return u
@@ -500,6 +530,19 @@ func tidyHover(t string) string {
 // notCompiledErr is the refusal for a file the go tool never compiles (`_x.go`, `//go:build ignore`).
 func notCompiledErr(file string) error {
 	return toolerr.Inputf("%s is not part of any package the Go toolchain builds (build constraints / name prefix); nothing to analyse.", file)
+}
+
+// navErr is friendlyNavErr for the read tools. When the Go configuration is broken (go.mod, go.work, GOWORK),
+// gopls has no package for the file and its "no package" / "no views" answers are not about build constraints
+// or name prefixes: the answer names the configuration problem instead.
+func (w *Workspace) navErr(ctx context.Context, err error, file string, line, col int) error {
+	var re *lsp.RequestError
+	if errors.As(err, &re) && (strings.Contains(re.Message, "no package metadata") || strings.Contains(re.Message, "no views")) {
+		if p := gomod.Health(ctx, w.Root); p != "" {
+			return toolerr.Inputf("%s cannot be analysed: the Go configuration is broken: %s", file, p)
+		}
+	}
+	return friendlyNavErr(err, file, line, col)
 }
 
 // friendlyNavErr turns the language server's errors about a position or file that has no analysis into
@@ -563,6 +606,34 @@ func siblingSyntaxNote(root, abs, src string) string {
 	return ""
 }
 
+// ownSyntaxNote gives the first syntax error of abs itself, for an answer about that file (outline, hover,
+// definition): such an answer can be partial or "nothing here" for a valid identifier. "" when abs parses or
+// cannot be read.
+func ownSyntaxNote(w *Workspace, abs string) string {
+	text, _, err := edits.ReadSource(abs)
+	if err != nil {
+		return ""
+	}
+	_, perr := parser.ParseFile(token.NewFileSet(), abs, text, parser.SkipObjectResolution)
+	if perr == nil {
+		return ""
+	}
+	at := exclude.RelativeTo(abs, w.Root)
+	var list scanner.ErrorList
+	if errors.As(perr, &list) && len(list) > 0 {
+		return fmt.Sprintf("%s:%d:%d: syntax error: %s (the file does not parse, so the answer may be incomplete)", at, list[0].Pos.Line, list[0].Pos.Column, list[0].Msg)
+	}
+	return fmt.Sprintf("%s: %v (the file does not parse, so the answer may be incomplete)", at, perr)
+}
+
+// withNote puts a note line before an answer ("" note: the answer as it is).
+func withNote(note, out string) string {
+	if note == "" {
+		return out
+	}
+	return note + "\n" + out
+}
+
 // excludedNote says that the build leaves out the file subject (a sentence start, such as "This file"), and why
 // (reason: buildscope's). gopls checks such a file on its own, so the errors it shows may not match the build.
 func excludedNote(subject, reason string) string {
@@ -612,7 +683,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 
 	add(s, h, "hover", "Type/documentation info for the symbol at a position. line/column are 1-indexed; column is a UTF-16 offset.",
 		func(ctx context.Context, w *Workspace, in posIn) (string, error) {
-			if err := checkGoFile(in.FilePath); err != nil {
+			if err := checkGoFile(w, in.FilePath); err != nil {
 				return "", err
 			}
 			raw, err := w.Client.Hover(ctx, in.FilePath, in.Line, in.Column)
@@ -621,21 +692,22 @@ func RegisterNav(s *mcp.Server, h Host) {
 				if msg := cgoDefinition(w, cgoSelectorName(w, in)); msg != "" {
 					return msg, nil
 				}
-				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
+				return "", w.navErr(ctx, err, in.FilePath, in.Line, in.Column)
 			}
+			abs := in.FilePath
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(w.Root, abs)
+			}
+			note := ownSyntaxNote(w, abs)
 			if t := tidyHover(hoverText(raw)); t != "" {
-				abs := in.FilePath
-				if !filepath.IsAbs(abs) {
-					abs = filepath.Join(w.Root, abs)
-				}
-				return cgoHover(abs, t), nil
+				return withNote(note, cgoHover(abs, t)), nil
 			}
-			return "No hover information at that position.", nil
+			return withNote(note, "No hover information at that position."), nil
 		})
 
 	add(s, h, "definition", "Go to the definition of the symbol at a position (type-resolved).",
 		func(ctx context.Context, w *Workspace, in posIn) (string, error) {
-			if err := checkGoFile(in.FilePath); err != nil {
+			if err := checkGoFile(w, in.FilePath); err != nil {
 				return "", err
 			}
 			if msg := cgoDefinition(w, in); msg != "" {
@@ -643,10 +715,15 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			locs, err := w.Client.Definition(ctx, in.FilePath, in.Line, in.Column)
 			if err != nil {
-				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
+				return "", w.navErr(ctx, err, in.FilePath, in.Line, in.Column)
 			}
+			abs := in.FilePath
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(w.Root, abs)
+			}
+			note := ownSyntaxNote(w, abs)
 			if len(locs) == 0 {
-				return "No definition found at that position.", nil
+				return withNote(note, "No definition found at that position."), nil
 			}
 			more := 0
 			if len(locs) > maxDefinitions {
@@ -658,18 +735,18 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if more > 0 {
 				out += fmt.Sprintf("\n(+%d more files)", more)
 			}
-			return out, nil
+			return withNote(note, out), nil
 		})
 
 	add(s, h, "references", "All usages of the symbol at a position across the workspace. Hits in _test.go files are listed separately.",
 		func(ctx context.Context, w *Workspace, in refsIn) (string, error) {
-			if err := checkGoFile(in.FilePath); err != nil {
+			if err := checkGoFile(w, in.FilePath); err != nil {
 				return "", err
 			}
 			decl := in.IncludeDeclaration == nil || *in.IncludeDeclaration
 			locs, err := w.Client.References(ctx, in.FilePath, in.Line, in.Column, decl)
 			if err != nil {
-				return "", friendlyNavErr(err, in.FilePath, in.Line, in.Column)
+				return "", w.navErr(ctx, err, in.FilePath, in.Line, in.Column)
 			}
 			return splitTests(dropGeneratedLocs(locs), w.Root), nil
 		})
@@ -697,7 +774,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 
 	add(s, h, "diagnostics", "gopls diagnostics (errors/warnings) for a single file.",
 		func(ctx context.Context, w *Workspace, in fileIn) (string, error) {
-			if err := checkGoFile(in.FilePath); err != nil {
+			if err := checkGoFile(w, in.FilePath); err != nil {
 				return "", err
 			}
 			abs := in.FilePath
@@ -710,7 +787,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {
-				return "", friendlyNavErr(err, in.FilePath, 0, 0)
+				return "", w.navErr(ctx, err, in.FilePath, 0, 0)
 			}
 			out := format.FormatDiagnosticsIn(items, format.DefaultDiagnosticsLimit, w.Root, filepath.ToSlash(rel))
 			if src, _, rerr := edits.ReadSource(abs); rerr == nil {
@@ -737,11 +814,11 @@ func RegisterNav(s *mcp.Server, h Host) {
 			rel, line, col := sym.Rel(w.Root), sym.Line+1, sym.Column+1
 			raw, err := w.Client.Hover(ctx, rel, line, col)
 			if err != nil {
-				return "", friendlyNavErr(err, rel, line, col)
+				return "", w.navErr(ctx, err, rel, line, col)
 			}
 			defs, err := w.Client.Definition(ctx, rel, line, col)
 			if err != nil {
-				return "", friendlyNavErr(err, rel, line, col)
+				return "", w.navErr(ctx, err, rel, line, col)
 			}
 			defs = dropGeneratedLocs(defs)
 			ht := cgoHover(lsp.URIToPath(sym.URI), tidyHover(hoverText(raw)))
@@ -756,7 +833,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if in.IncludeReferences == nil || *in.IncludeReferences {
 				refs, err := w.Client.References(ctx, rel, line, col, true)
 				if err != nil {
-					return "", friendlyNavErr(err, rel, line, col)
+					return "", w.navErr(ctx, err, rel, line, col)
 				}
 				refs = dropGeneratedLocs(refs)
 				prod, tests := format.SplitTests(refs)
@@ -776,7 +853,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 
 	add(s, h, "outline", "Indented outline (types, funcs, methods with line spans) of a Go file.",
 		func(ctx context.Context, w *Workspace, in fileIn) (string, error) {
-			if err := checkGoFile(in.FilePath); err != nil {
+			if err := checkGoFile(w, in.FilePath); err != nil {
 				return "", err
 			}
 			syms, err := w.Client.DocumentSymbol(ctx, in.FilePath)
@@ -797,7 +874,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 					groups = pf.Groups()
 				}
 			}
-			return format.FormatOutlineGroups(ptrs, groups), nil
+			return withNote(ownSyntaxNote(w, abs), format.FormatOutlineGroups(ptrs, groups)), nil
 		})
 
 	add(s, h, "callers", "Who calls this function or method? Only real call sites, unlike references.",
