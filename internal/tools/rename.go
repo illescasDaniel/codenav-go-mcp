@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
@@ -204,6 +206,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 		}
 		return nil, toolerr.Inputf("nothing renameable at %s:%d:%d.", edits.RelativeName(root.path, w.Root), root.line+1, root.col+1)
 	}
+	decl := root // where the name is declared: a use is followed to its declaration
 	if in.Parameter == "" {
 		// A use of a standard-library or dependency symbol: name the file that declares it (the plan's
 		// first file would be an arbitrary one, such as doc.go).
@@ -212,6 +215,8 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 				return nil, toolerr.Inputf("%s is declared in cgo-generated code (it is C.%s); rename the C symbol in the cgo preamble or C sources instead.", identAt(root.path, root.line, root.col), identAt(root.path, root.line, root.col))
 			} else if dp != "" && !w.inWorkspace(dp) {
 				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), edits.RelativeName(dp, w.Root), defs[0].Range.Start.Line+1)
+			} else if dp != "" {
+				decl = member{dp, defs[0].Range.Start.Line, defs[0].Range.Start.Character}
 			}
 		}
 	}
@@ -250,14 +255,18 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	skipped := 0
 	if flag(in.Linked, true) && kind == methodKind {
 		var err error
-		if members, skipped, err = linkedMembers(ctx, w, root, oldName, "renaming it"); err != nil {
+		if members, skipped, err = linkedMembers(ctx, w, root, oldName, "renaming it", "linked=false"); err != nil {
 			return nil, err
 		}
 	}
 
+	// linked=false on an interface method: gopls' Rename would rename the implementations too, so the edit is
+	// built from the references instead (an interface method's references are its own uses, not the methods of
+	// the types that implement it). A concrete method keeps gopls' Rename, which refuses a break of an interface.
+	byRefs := len(members) > 1 || (kind == methodKind && !flag(in.Linked, true) && !isConcreteMethod(root.path, text, root.line, root.col))
 	all := map[string][]lsp.TextEdit{}
 	linked := members[1:]
-	if len(members) == 1 {
+	if !byRefs {
 		we, err := w.Client.Rename(ctx, root.path, root.line+1, root.col+1, in.NewName)
 		if err != nil {
 			return nil, renameFailure(w, root.path, err)
@@ -323,6 +332,9 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	} else if kind == methodKind && flag(in.Linked, true) {
 		notes = append(notes, "No interface relationships found for this method.")
 	}
+	if byRefs && len(linked) == 0 && kind == methodKind {
+		notes = append(notes, fmt.Sprintf("linked=false: only this interface method and its uses are renamed; the types that implement it keep %s (linked=true renames them together).", oldName))
+	}
 	if n := skippedNote(skipped, oldName); n != "" {
 		notes = append(notes, n)
 	}
@@ -351,7 +363,16 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			notes = append(notes, mentions.Notes(inScope, oldName)...)
 		}
 	}
-	return edits.NewPlan(desc, changes, notes...), nil
+	// What gopls cannot see in this build (buildscope, assembly, linkname) holds the write; see buildGuard.
+	var holds []string
+	if in.Parameter == "" {
+		var guard []string
+		holds, guard = buildGuard(w, decl, oldName, "renamed")
+		notes = append(notes, guard...)
+	}
+	plan := edits.NewPlan(desc, changes, notes...)
+	plan.Holds = holds
+	return plan, nil
 }
 
 // otherObjects drops the code mentions that are some other, unrelated object. For a field or method,
@@ -500,7 +521,7 @@ func couldRefer(declFile, name string) func(path, text string) bool {
 // error) would break, so the operation is refused. When it is an interface method, what comes back are
 // implementers: those outside the workspace (any stdlib type with a Name() string) are not touched and
 // not expanded; their number is returned as skipped.
-func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing string) (members []member, skipped int, err error) {
+func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing, optOut string) (members []member, skipped int, err error) {
 	members = []member{root}
 	seen := map[string]bool{root.key(): true}
 	texts := map[string]string{}
@@ -541,7 +562,7 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 				continue
 			}
 			if len(members) > maxLinked {
-				return nil, 0, toolerr.Inputf("more than %d linked methods; pass linked=false (include_overrides=false) to change only this one.", maxLinked)
+				return nil, 0, toolerr.Inputf("more than %d linked methods; pass %s to change only this one.", maxLinked, optOut)
 			}
 			members = append(members, n)
 		}
@@ -559,7 +580,7 @@ func linkedMembers(ctx context.Context, w *Workspace, root member, name, doing s
 			shown += fmt.Sprintf(" and %d more", len(list)-3)
 		}
 		return nil, 0, toolerr.Inputf("%s is also %s%s, outside the workspace (a type here satisfies a foreign interface); %s would break that relationship. "+
-			"Pass linked=false (include_overrides=false) to change only this declaration and its uses.", name, what, shown, doing)
+			"Pass %s to change only this declaration and its uses.", name, what, shown, doing, optOut)
 	}
 	return members, skipped, nil
 }
@@ -832,4 +853,233 @@ func importPathAt(file, src string, off int) string {
 		}
 	}
 	return ""
+}
+
+// isConcreteMethod reports whether the name at line/col (0-based) of path, or the declaration it is in, is a
+// method with a receiver (an interface method is a member of a type declaration, and is not one).
+func isConcreteMethod(path, text string, line, col int) bool {
+	d, err := gosrc.FindDeclAt(path, text, edits.Offset(text, line, col))
+	return err == nil && d.Keyword == "func" && d.Method
+}
+
+// declShape is what a package-level declaration is, as far as buildGuard needs it.
+type declShape struct {
+	method   bool // a method, whose name is a member of its receiver type
+	bodyless bool // a func with no body: its implementation is assembly, or elsewhere through //go:linkname
+}
+
+// declShapeAt reports whether the identifier at byte offset off of src is the name of a package-level func,
+// method, interface method, type, var or const, and describes it. A method of an interface is a method (its
+// selectors are noted like a concrete method's). A local, a parameter, a receiver or a struct field is not one:
+// ok is false.
+func declShapeAt(path, src string, off int) (shape declShape, ok bool) {
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	if f == nil {
+		return declShape{}, false
+	}
+	at := func(id *ast.Ident) bool { return id != nil && fset.Position(id.Pos()).Offset == off }
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if at(d.Name) {
+				return declShape{method: d.Recv != nil, bodyless: d.Body == nil}, true
+			}
+		case *ast.GenDecl:
+			for _, s := range d.Specs {
+				switch s := s.(type) {
+				case *ast.TypeSpec:
+					if at(s.Name) {
+						return declShape{}, true
+					}
+					if it, isIface := s.Type.(*ast.InterfaceType); isIface && it.Methods != nil {
+						for _, m := range it.Methods.List {
+							for _, id := range m.Names {
+								if at(id) {
+									return declShape{method: true}, true
+								}
+							}
+						}
+					}
+				case *ast.ValueSpec:
+					for _, id := range s.Names {
+						if at(id) {
+							return declShape{}, true
+						}
+					}
+				}
+			}
+		}
+	}
+	return declShape{}, false
+}
+
+// linknameRe is a //go:linkname directive: its local name, and its target when it has one.
+var linknameRe = regexp.MustCompile(`(?m)^//go:linkname[ \t]+(\S+)(?:[ \t]+(\S+))?[ \t]*$`)
+
+// linknameSites lists the //go:linkname directives that name the package-level name declared in declFile, as
+// "file:line (directive)": those in its directory whose local name is name, and those below root whose target is
+// importPath.name (a pull from another package, which needs no export).
+func linknameSites(root, declFile, name, importPath string) []string {
+	declDir := filepath.Dir(declFile)
+	target := ""
+	if importPath != "" {
+		target = importPath + "." + name
+	}
+	var out []string
+	scan := func(path, src string) {
+		for _, m := range linknameRe.FindAllStringSubmatchIndex(src, -1) {
+			local, remote := src[m[2]:m[3]], ""
+			if m[4] >= 0 {
+				remote = src[m[4]:m[5]]
+			}
+			if (filepath.Dir(path) == declDir && local == name) || (target != "" && remote == target) {
+				line := 1 + strings.Count(src[:m[0]], "\n")
+				out = append(out, fmt.Sprintf("%s:%d (%s)", edits.RelativeName(path, root), line, src[m[0]:m[1]]))
+			}
+		}
+	}
+	ents, _ := os.ReadDir(declDir)
+	for _, e := range ents {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".go" {
+			continue
+		}
+		p := filepath.Join(declDir, e.Name())
+		if raw, err := os.ReadFile(p); err == nil && strings.Contains(string(raw), "go:linkname") {
+			scan(p, string(raw))
+		}
+	}
+	if target != "" {
+		_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if p != root && (exclude.IsDirName(d.Name()) || d.Name() == "testdata" || strings.HasPrefix(d.Name(), ".") || strings.HasPrefix(d.Name(), "_")) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if filepath.Dir(p) == declDir || filepath.Ext(p) != ".go" {
+				return nil
+			}
+			if raw, err := os.ReadFile(p); err == nil && strings.Contains(string(raw), "go:linkname") && strings.Contains(string(raw), target) {
+				scan(p, string(raw))
+			}
+			return nil
+		})
+	}
+	return out
+}
+
+// goDeclOf is the position of the func declaration named name (no receiver) among the .go files of dir. Where
+// several build variants declare it, the body-less one (the declaration of an assembly-backed func) is preferred.
+func goDeclOf(dir, name string) (member, bool) {
+	var best member
+	ok, bestBodyless := false, false
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".go" {
+			continue
+		}
+		p := filepath.Join(dir, e.Name())
+		text, _, err := edits.ReadSource(p)
+		if err != nil {
+			continue
+		}
+		fset := token.NewFileSet()
+		f, _ := parser.ParseFile(fset, p, text, parser.SkipObjectResolution)
+		if f == nil {
+			continue
+		}
+		for _, d := range f.Decls {
+			fd, isFunc := d.(*ast.FuncDecl)
+			if !isFunc || fd.Recv != nil || fd.Name.Name != name {
+				continue
+			}
+			bodyless := fd.Body == nil
+			if ok && (bestBodyless || !bodyless) {
+				continue
+			}
+			line, col := edits.PositionOf(text, fset.Position(fd.Name.Pos()).Offset)
+			best, bestBodyless, ok = member{p, line, col}, bodyless, true
+		}
+	}
+	return best, ok
+}
+
+// buildGuard covers what gopls cannot see of the package-level name declared at decl, for a rename or a
+// signature change (verb: "renamed" or "rewritten"). Its uses and declarations in files the build leaves out
+// (buildscope) are not changed, nor is the assembly that implements a body-less func (TEXT ·name(SB)) or a
+// //go:linkname directive that names it, so they hold the write: the held edit is a preview that apply_edit
+// writes on request. A method's selectors cannot be told apart by name, so they are only noted. Nothing is
+// checked for a name that is not a package-level declaration (a local, a parameter or a field).
+func buildGuard(w *Workspace, decl member, name, verb string) (holds, notes []string) {
+	if !strings.HasSuffix(decl.path, ".go") {
+		// gopls answers a use of a body-less func with its assembly: the Go declaration is in the same directory.
+		d, found := goDeclOf(filepath.Dir(decl.path), name)
+		if !found {
+			return []string{fmt.Sprintf("%s is implemented in assembly (%s), and its Go declaration was not found; a change here does not reach the assembly.", name, edits.RelativeName(decl.path, w.Root))}, nil
+		}
+		decl = d
+	}
+	text, _, err := edits.ReadSource(decl.path)
+	if err != nil {
+		return nil, nil
+	}
+	shape, ok := declShapeAt(decl.path, text, edits.Offset(text, decl.line, decl.col))
+	if !ok {
+		return nil, nil
+	}
+	dir := filepath.Dir(decl.path)
+	ip := ""
+	if m, err := moduleOf(dir); err == nil {
+		ip, _ = importPathOf(m, dir)
+	}
+	var uses, decls, sels, asm []string
+	for _, h := range buildscope.Mentions(buildscope.Context(), buildscope.Query{
+		Root: w.Root, DeclFile: decl.path, Name: name, Member: shape.method, ImportPath: ip,
+	}) {
+		if h.Path == decl.path && h.Line-1 == decl.line {
+			continue
+		}
+		rel := edits.RelativeName(h.Path, w.Root)
+		where := fmt.Sprintf("%s:%d (%s)", rel, h.Line, h.Reason)
+		switch h.Kind {
+		case buildscope.Use:
+			uses = append(uses, where)
+		case buildscope.Decl:
+			decls = append(decls, where)
+		case buildscope.Member:
+			sels = append(sels, where)
+		case buildscope.Asm:
+			asm = append(asm, fmt.Sprintf("%s:%d", rel, h.Line))
+		}
+	}
+	var link []string
+	if !shape.method {
+		link = linknameSites(w.Root, decl.path, name, ip)
+	}
+	if len(uses) > 0 {
+		holds = append(holds, fmt.Sprintf("%d use(s) of %s in files the build leaves out are not %s: %s.", len(uses), name, verb, listing(uses)))
+	}
+	if len(decls) > 0 {
+		holds = append(holds, fmt.Sprintf("%s is declared again in files the build leaves out: %s.", name, listing(decls)))
+	}
+	if len(uses)+len(decls) > 0 {
+		holds = append(holds, "Change those files too, or check them with the build that includes them (GOOS=... go build, or -tags in CODENAV_GO_MCP_BUILD_FLAGS).")
+	}
+	if len(asm) > 0 {
+		holds = append(holds, fmt.Sprintf("TEXT ·%s(SB) in assembly is not %s: %s.", name, verb, listing(asm)))
+	}
+	if len(link) > 0 {
+		holds = append(holds, fmt.Sprintf("%s is named by //go:linkname, and the directive is not %s: %s.", name, verb, listing(link)))
+	}
+	if shape.bodyless && len(asm) == 0 && len(link) == 0 {
+		holds = append(holds, fmt.Sprintf("%s has no body, so its implementation is elsewhere, and no assembly or //go:linkname here names it; a change here does not reach that implementation.", name))
+	}
+	if len(sels) > 0 {
+		notes = append(notes, fmt.Sprintf("%d selector(s) of %s in files the build leaves out were not checked: %s.", len(sels), name, listing(sels)))
+	}
+	return holds, notes
 }

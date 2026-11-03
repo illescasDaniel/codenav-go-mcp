@@ -6,13 +6,11 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
@@ -261,7 +259,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	members := []member{root}
 	skipped := 0
 	if sym.Kind == methodKind && flag(in.IncludeOverrides, true) {
-		if members, skipped, err = linkedMembers(ctx, w, root, sym.Name, "changing its signature"); err != nil {
+		if members, skipped, err = linkedMembers(ctx, w, root, sym.Name, "changing its signature", "include_overrides=false"); err != nil {
 			return "", err
 		}
 	}
@@ -523,7 +521,7 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	if len(droppedComments) > 0 {
 		notes = append(notes, fmt.Sprintf("%d comment(s) inside a call were dropped with a removed argument: %s.", len(droppedComments), listing(droppedComments)))
 	}
-	holds, excluded := excludedCheck(w, root, identAt(root.path, root.line, root.col), sym.Kind == methodKind)
+	holds, excluded := buildGuard(w, root, identAt(root.path, root.line, root.col), "rewritten")
 	notes = append(notes, excluded...)
 	if len(reorderSites) > 0 {
 		holds = append(holds, fmt.Sprintf("The reorder changes the order in which %d call(s) evaluate their arguments: %s. Go evaluates the arguments of a call from left to right, so each call that has side effects now feeds another parameter.", len(reorderSites), listing(reorderSites)))
@@ -531,47 +529,6 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	plan := edits.NewPlan("change_signature "+in.Name, changes, notes...)
 	plan.Holds = holds
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
-}
-
-// excludedCheck covers what gopls cannot see: the uses and declarations of the function in files the go tool
-// leaves out of this build (buildscope). Those are not rewritten, so they hold the write (a preview that
-// apply_edit writes). A method's selectors cannot be told apart by name, so they are only noted.
-func excludedCheck(w *Workspace, decl member, name string, method bool) (holds, notes []string) {
-	dir := filepath.Dir(decl.path)
-	ip := ""
-	if m, err := moduleOf(dir); err == nil {
-		ip, _ = importPathOf(m, dir)
-	}
-	var uses, decls, sels []string
-	for _, h := range buildscope.Mentions(buildscope.Context(), buildscope.Query{
-		Root: w.Root, DeclFile: decl.path, Name: name, Member: method, ImportPath: ip,
-	}) {
-		if h.Kind == buildscope.Asm || (h.Path == decl.path && h.Line-1 == decl.line) {
-			continue
-		}
-		where := fmt.Sprintf("%s:%d (%s)", edits.RelativeName(h.Path, w.Root), h.Line, h.Reason)
-		switch h.Kind {
-		case buildscope.Use:
-			uses = append(uses, where)
-		case buildscope.Decl:
-			decls = append(decls, where)
-		case buildscope.Member:
-			sels = append(sels, where)
-		}
-	}
-	if len(uses) > 0 {
-		holds = append(holds, fmt.Sprintf("%d use(s) of %s in files the build leaves out are not rewritten: %s.", len(uses), name, listing(uses)))
-	}
-	if len(decls) > 0 {
-		holds = append(holds, fmt.Sprintf("%s is declared again in files the build leaves out: %s.", name, listing(decls)))
-	}
-	if len(holds) > 0 {
-		holds = append(holds, "Change those files too, or check them with the build that includes them (GOOS=... go build, or -tags in CODENAV_GO_MCP_BUILD_FLAGS).")
-	}
-	if len(sels) > 0 {
-		notes = append(notes, fmt.Sprintf("%d selector(s) of %s in files the build leaves out were not checked: %s.", len(sels), name, listing(sels)))
-	}
-	return holds, notes
 }
 
 // listing joins up to five entries and says how many were left out.
