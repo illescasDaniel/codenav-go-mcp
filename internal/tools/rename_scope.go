@@ -5,14 +5,158 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 )
+
+// outsideRelative renders a path outside the workspace the way the "outside the workspace" refusals show it: `../`
+// steps up from root to the first ancestor that holds it, at any depth. edits.RelativeName keeps toolchain paths
+// (the module cache, GOROOT) absolute, which prints the user's home directory (WRX-004).
+func outsideRelative(path, root string) string {
+	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	up := ""
+	for dir := root; ; {
+		parent := filepath.Dir(dir)
+		up += "../"
+		if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return up + filepath.ToSlash(rel)
+		}
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return filepath.ToSlash(path)
+}
+
+// namedResultAt is the position of the named result name of the function whose name starts at fn (0-based line and
+// column). ok is false when the function has no such result.
+func namedResultAt(fn member, text, name string) (line, col int, ok bool) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, fn.path, text, parser.SkipObjectResolution)
+	if err != nil {
+		return 0, 0, false
+	}
+	off := edits.Offset(text, fn.line, fn.col)
+	for _, d := range f.Decls {
+		fd, isFunc := d.(*ast.FuncDecl)
+		if !isFunc || fd.Type.Results == nil || fset.Position(fd.Name.Pos()).Offset != off {
+			continue
+		}
+		for _, field := range fd.Type.Results.List {
+			for _, id := range field.Names {
+				if id.Name == name {
+					line, col = edits.PositionOf(text, fset.Position(id.Pos()).Offset)
+					return line, col, true
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// exampleNote lists the Example functions named after the renamed func, type or method (ExampleX and
+// ExampleX_suffix; for a method ExampleT_M) in the _test.go files of its package. After the rename they name an
+// identifier that no longer exists, which go vet (run by go test) reports, so the note says to rename them too.
+// They are not rewritten (LANG-006).
+func exampleNote(path, text string, off int, oldName, newName string) string {
+	d, err := gosrc.FindDeclAt(path, text, off)
+	if err != nil || (d.Keyword != "func" && d.Keyword != "type") {
+		return ""
+	}
+	base, newBase := "Example"+oldName, "Example"+newName
+	if d.Method {
+		base, newBase = "Example"+d.Recv+"_"+oldName, "Example"+d.Recv+"_"+newName
+	}
+	dir := filepath.Dir(path)
+	entries, _ := os.ReadDir(dir)
+	re := regexp.MustCompile(`(?m)^func (` + regexp.QuoteMeta(base) + `(?:_\w*)?)\(`)
+	var hits []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), "_test.go") {
+			continue
+		}
+		src, _, rerr := edits.ReadSource(filepath.Join(dir, e.Name()))
+		if rerr != nil {
+			continue
+		}
+		for _, m := range re.FindAllStringSubmatchIndex(src, -1) {
+			name := src[m[2]:m[3]]
+			line := 1 + strings.Count(src[:m[0]], "\n")
+			hits = append(hits, fmt.Sprintf("%s to %s (%s:%d)", name, strings.Replace(name, base, newBase, 1), e.Name(), line))
+		}
+	}
+	if len(hits) == 0 {
+		return ""
+	}
+	shown := hits
+	if len(shown) > 5 {
+		shown = append(shown[:5:5], fmt.Sprintf("and %d more", len(hits)-5))
+	}
+	return fmt.Sprintf("rename %s too: go vet (run by go test) reports an example whose name matches no identifier.", strings.Join(shown, ", "))
+}
+
+// siblingLimit bounds the modules goworkOffNote looks at.
+const siblingLimit = 20
+
+// goworkOffNote says, for a rename run with GOWORK=off, that the sibling modules of the tree are not visible to the go
+// command, so the implementers and callers in them were not rewritten (SHAPE-006). It speaks only when crossModule
+// (an exported name or an interface method) and a sibling module mentions name.
+func goworkOffNote(w *Workspace, name string, crossModule bool) string {
+	if !crossModule || os.Getenv("GOWORK") != "off" {
+		return ""
+	}
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	var users []string
+	for _, sib := range gomod.UncoveredModules(w.Root, exclude.IsDirName, siblingLimit) {
+		if moduleMentions(sib.Dir, re) {
+			users = append(users, edits.RelativeName(sib.Dir, w.Root))
+		}
+	}
+	if len(users) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("GOWORK=off: sibling modules are not visible, so their implementers and callers were not rewritten (%s use %s; unset GOWORK to include them).", strings.Join(users, ", "), name)
+}
+
+// moduleMentions reports whether a Go file below dir has text matching re.
+func moduleMentions(dir string, re *regexp.Regexp) bool {
+	found := false
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if found {
+			return filepath.SkipAll
+		}
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != dir && exclude.IsDirName(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		if src, rerr := os.ReadFile(p); rerr == nil && re.Match(src) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
 
 // receiverSpan is the byte span of the method whose receiver name is at off in src (ok is false when off is not
 // the name of a receiver).

@@ -131,6 +131,10 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	if len(in.NewName) > maxIdentLen {
 		return nil, toolerr.Argf("new_name is %d characters long; identifiers over %d characters are refused (a mistake, and the answer would be enormous).", len(in.NewName), maxIdentLen)
 	}
+	if in.NewName == "_" {
+		// token.IsIdentifier accepts it, so gopls would answer with its own "invalid identifier" text (REN-007).
+		return nil, toolerr.Argf(`"_" is the blank identifier and cannot be a new name; pick a name.`)
+	}
 	if !token.IsIdentifier(in.NewName) {
 		return nil, toolerr.Argf("%q is not a valid Go identifier (it must not be a keyword either).", in.NewName)
 	}
@@ -214,7 +218,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 			if dp := lsp.URIToPath(defs[0].URI); dp != "" && isCgoGenerated(dp) {
 				return nil, toolerr.Inputf("%s is declared in cgo-generated code (it is C.%s); rename the C symbol in the cgo preamble or C sources instead.", identAt(root.path, root.line, root.col), identAt(root.path, root.line, root.col))
 			} else if dp != "" && !w.inWorkspace(dp) {
-				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), edits.RelativeName(dp, w.Root), defs[0].Range.Start.Line+1)
+				return nil, toolerr.Inputf("%s is declared in %s:%d, outside the workspace; only workspace symbols can be renamed.", identAt(root.path, root.line, root.col), outsideRelative(dp, w.Root), defs[0].Range.Start.Line+1)
 			} else if dp != "" {
 				decl = member{dp, defs[0].Range.Start.Line, defs[0].Range.Start.Character}
 			}
@@ -356,8 +360,11 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	// A parameter or local variable is fully resolved by gopls; same-named text elsewhere is unrelated.
 	if in.Parameter == "" && kind != 0 {
-		ms := mentions.FindScoped(w.Root, oldName, after, "", couldRefer(root.path, oldName))
+		ms, truncated := mentions.FindScopedLimited(w.Root, oldName, after, "", couldRefer(root.path, oldName))
 		notes = append(notes, mentions.Notes(otherObjects(ctx, w, ms, after, oldName, root.path, kind >= 6 && kind <= 8), oldName)...)
+		if truncated { // SCALE-003: a silent stop would look like a complete scan
+			notes = append(notes, fmt.Sprintf("leftover scan stopped after %d files; non-Go files past that point were not checked", mentions.ScanCap()))
+		}
 	} else if ptext, ok := after[root.path]; ok {
 		// A local, parameter or type parameter lives inside one declaration: only that span can
 		// still mention the old name.
@@ -370,7 +377,19 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 					inScope = append(inScope, m)
 				}
 			}
+			// LANG-003: a code mention the type checker resolves to another declaration (a shadowing local) is
+			// another object, not an unlinked leftover of this one.
+			inScope = otherObjects(ctx, w, inScope, map[string]string{root.path: ptext}, oldName, root.path, false)
 			notes = append(notes, mentions.Notes(inScope, oldName)...)
+		}
+	}
+	if in.Parameter == "" {
+		if n := exampleNote(root.path, text, edits.Offset(text, rng.Start.Line, rng.Start.Character), oldName, in.NewName); n != "" {
+			notes = append(notes, n) // LANG-006
+		}
+		crossModule := token.IsExported(oldName) || (kind == methodKind && !isConcreteMethod(root.path, text, root.line, root.col))
+		if n := goworkOffNote(w, oldName, crossModule); n != "" {
+			notes = append(notes, n) // SHAPE-006
 		}
 	}
 	// What gopls cannot see in this build (buildscope, assembly, linkname) holds the write; see buildGuard.
@@ -653,6 +672,10 @@ func parameterOf(fn member, param string, w *Workspace) (member, error) {
 		if p.Name != "" {
 			names = append(names, p.Name)
 		}
+	}
+	if line, col, ok := namedResultAt(fn, text, param); ok {
+		// LANG-002: a named result is not a parameter, and only the position form renames it.
+		return member{}, toolerr.Inputf("`%s` is a named result, not a parameter; rename it by position (file_path=%s, line=%d, column=%d).", param, edits.RelativeName(fn.path, w.Root), line+1, col+1)
 	}
 	if len(names) == 0 {
 		return member{}, toolerr.Inputf("the parameters of this function are unnamed or blank.")

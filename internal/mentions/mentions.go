@@ -18,10 +18,13 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 )
 
-const (
-	maxFiles = 2000
-	maxBytes = 512_000
-)
+// maxFiles bounds the files a leftover scan reads; a variable so that tests can shrink it.
+var maxFiles = 2000
+
+const maxBytes = 512_000
+
+// ScanCap is the number of files a leftover scan reads at most (FindScopedLimited reports when it stopped there).
+func ScanCap() int { return maxFiles }
 
 var textSuffixes = map[string]bool{".md": true, ".rst": true, ".txt": true, ".toml": true, ".yml": true, ".yaml": true, ".json": true, ".cfg": true, ".ini": true}
 
