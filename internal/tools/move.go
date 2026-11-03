@@ -10,12 +10,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
@@ -174,15 +176,30 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 			notes = append(notes, "Moving a var can change the order of package initialisation side effects.")
 		}
 	}
+	// BUG-MOVE-001: embed patterns are relative to the package directory, so a //go:embed declaration can only
+	// move within its directory; inside it, the destination gets the embed import the directive needs.
+	embed := embedDirectiveRE.MatchString(l.text[d.Start:d.End])
+	sameDir := filepath.Dir(dest) == filepath.Dir(l.path)
+	if embed && !sameDir {
+		return "", toolerr.Inputf("%s has a //go:embed directive; its patterns are relative to the package directory, so it can only move within %s (the embedded files would stay behind). Move the embedded files and the declaration by hand.", in.Name, edits.RelativeName(filepath.Dir(l.path), w.Root))
+	}
+	// BUG-MOVE-004: the moved code keeps the build constraint of its file. A new destination takes it; an existing
+	// one must already have the same (checked on the plan below).
+	srcCons := buildscope.FileConstraint(l.path, l.text)
+	header := ""
+	if _, serr := os.Stat(dest); os.IsNotExist(serr) && !buildscope.Equivalent(buildscope.FileConstraint(dest, ""), srcCons) {
+		header = srcCons // a new file whose own name does not already give the constraint
+	}
 	var plan *edits.EditPlan
-	if filepath.Dir(dest) == filepath.Dir(l.path) {
-		plan, err = moveWithinPackage(l, dest)
+	if sameDir {
+		plan, err = moveWithinPackage(l, dest, header, embed)
 	} else {
-		plan, err = moveAcrossPackages(ctx, w, l, dest, in.Name)
+		plan, err = moveAcrossPackages(ctx, w, l, dest, in.Name, header)
 	}
 	if err != nil {
 		return "", err
 	}
+	plan.Holds = append(plan.Holds, constraintHolds(plan, l.path, srcCons, dest)...)
 	plan.Notes = append(plan.Notes, notes...)
 	return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), in.AllowLarge)
 }
@@ -195,7 +212,9 @@ func appendTo(destText, snippet string) string {
 	return strings.TrimRight(destText, "\r\n") + "\n\n" + snippet + "\n"
 }
 
-func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
+// moveWithinPackage moves the declaration into dest, a file of its own directory. header is the build line a
+// new dest takes ("" for none); embed says the declaration has a //go:embed directive, which needs the embed import.
+func moveWithinPackage(l *located, dest, header string, embed bool) (*edits.EditPlan, error) {
 	d := l.decl
 	destText, destBOM, rerr := edits.ReadSource(dest)
 	exists := rerr == nil
@@ -221,7 +240,10 @@ func moveWithinPackage(l *located, dest string) (*edits.EditPlan, error) {
 		}
 		destText = appendTo(destText, snippet)
 	} else {
-		destText = "package " + gosrc.PackageName(l.text) + "\n\n" + snippet + "\n"
+		destText = newFileHead(header) + "package " + gosrc.PackageName(l.text) + "\n\n" + snippet + "\n"
+	}
+	if embed {
+		used = append(used, `_ "embed"`)
 	}
 	destText, err := gosrc.EditImports(dest, destText, "", used, false)
 	if err != nil {
@@ -282,7 +304,9 @@ func recvBase(e ast.Expr) string {
 	return ""
 }
 
-func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, display string) (*edits.EditPlan, error) {
+// moveAcrossPackages moves the declaration into dest, a file of another directory; header is the build line a
+// new dest takes ("" for none).
+func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, display, header string) (*edits.EditPlan, error) {
 	d := l.decl
 	fset := token.NewFileSet()
 	cfg := &packages.Config{
@@ -756,7 +780,7 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 		}
 		next = appendTo(destText, code)
 	} else {
-		next = "package " + bName + "\n\n" + code + "\n"
+		next = newFileHead(header) + "package " + bName + "\n\n" + code + "\n"
 	}
 	if next, err = gosrc.EditImports(dest, next, "", specs, false); err != nil {
 		return nil, err
@@ -782,7 +806,100 @@ func moveAcrossPackages(ctx context.Context, w *Workspace, l *located, dest, dis
 	if crossModule {
 		notes = append(notes, fmt.Sprintf("%s moved to another module (%s -> %s): packages of %s resolve %s only through a go.work that joins both modules, or a require/replace in their go.mod.", display, A.Module.Path, destMod.Path, A.Module.Path, bPath))
 	}
-	return edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...), nil
+	plan := edits.NewPlan("move "+display+" to "+edits.RelativeName(dest, w.Root), out, notes...)
+	if !d.Method {
+		plan.Holds = append(clashWithExcluded(w, dest, d.Name, bName), excludedMentionHolds(w, l, d.Name, A.PkgPath)...)
+	}
+	return plan, nil
+}
+
+// excludedMentionHolds holds a cross-package move when a file the build leaves out still uses the name or
+// declares it again (a twin in a sibling _windows file, or a caller in a constrained file): gopls does not
+// see those files, so they are neither rewritten nor checked, and the other build would break (BUG-MOVE-004
+// family; the same policy as change_signature). Within the package, the unqualified name still resolves.
+func excludedMentionHolds(w *Workspace, l *located, name, pkgPath string) []string {
+	decl := l.decl
+	first, _ := edits.PositionOf(l.text, decl.Start)
+	last, _ := edits.PositionOf(l.text, max(decl.Start, decl.End-1))
+	var uses, decls []string
+	for _, h := range buildscope.Mentions(buildscope.Context(), buildscope.Query{
+		Root: w.Root, DeclFile: l.path, Name: name, ImportPath: pkgPath,
+	}) {
+		if h.Kind == buildscope.Asm || (h.Path == l.path && h.Line-1 >= first && h.Line-1 <= last) {
+			continue // the moved declaration itself
+		}
+		where := fmt.Sprintf("%s:%d (%s)", edits.RelativeName(h.Path, w.Root), h.Line, h.Reason)
+		switch h.Kind {
+		case buildscope.Use:
+			uses = append(uses, where)
+		case buildscope.Decl:
+			decls = append(decls, where)
+		}
+	}
+	var holds []string
+	if len(uses) > 0 {
+		holds = append(holds, fmt.Sprintf("%d use(s) of %s in files the build leaves out are not rewritten: %s.", len(uses), name, listing(uses)))
+	}
+	if len(decls) > 0 {
+		holds = append(holds, fmt.Sprintf("%s is declared again in files the build leaves out: %s.", name, listing(decls)))
+	}
+	if len(holds) > 0 {
+		holds = append(holds, "Change those files too, or check them with the build that includes them (GOOS=... go build, or -tags in CODENAV_GO_MCP_BUILD_FLAGS).")
+	}
+	return holds
+}
+
+// newFileHead is what a new file starts with before its package clause: the build line it takes ("" for none).
+func newFileHead(header string) string {
+	if header == "" {
+		return ""
+	}
+	return header + "\n\n"
+}
+
+// embedDirectiveRE finds a //go:embed directive line.
+var embedDirectiveRE = regexp.MustCompile(`(?m)^\s*//go:embed\b`)
+
+// constraintHolds holds a move whose destination would not be built under the constraint of the file the
+// declaration came from (BUG-MOVE-004): the moved code would then be in the build on other platforms, or
+// missing from this one. The check reads the destination's text as the plan writes it.
+func constraintHolds(plan *edits.EditPlan, src, srcCons, dest string) []string {
+	for _, c := range plan.Changes {
+		if c.Path != dest || c.New == nil {
+			continue
+		}
+		if got := buildscope.FileConstraint(dest, *c.New); !buildscope.Equivalent(got, srcCons) {
+			return []string{fmt.Sprintf("The declaration is built under %s in %s and would be built under %s in %s, so the builds would differ. Move it into a file with the same build constraint, or check the builds that include it.", describeCons(srcCons), filepath.Base(src), describeCons(got), filepath.Base(dest))}
+		}
+	}
+	return nil
+}
+
+func describeCons(cons string) string {
+	if cons == "" {
+		return "all builds"
+	}
+	return "`" + strings.TrimPrefix(cons, "//go:build ") + "`"
+}
+
+// clashWithExcluded holds a move whose name is already declared, in package pkg, in a file of dest's directory
+// that the build leaves out: the two would clash on that build, which this check does not see (BUG-MOVE-002).
+func clashWithExcluded(w *Workspace, dest, name, pkg string) []string {
+	var where []string
+	for _, h := range buildscope.Mentions(buildscope.Context(), buildscope.Query{DeclFile: dest, Name: name}) {
+		if h.Kind != buildscope.Decl {
+			continue
+		}
+		src, err := os.ReadFile(h.Path)
+		if err != nil || gosrc.PackageName(string(src)) != pkg {
+			continue
+		}
+		where = append(where, fmt.Sprintf("%s:%d (%s)", edits.RelativeName(h.Path, w.Root), h.Line, h.Reason))
+	}
+	if len(where) == 0 {
+		return nil
+	}
+	return []string{fmt.Sprintf("%s is already declared in %s, a file the build leaves out: the moved %s would clash with it on that build, which this check does not see. Rename one of them, or check with that build (GOOS=... go build, or -tags in CODENAV_GO_MCP_BUILD_FLAGS).", name, listing(where), name)}
 }
 
 // importsC: the Go file at path has `import "C"`.

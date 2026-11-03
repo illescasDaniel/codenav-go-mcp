@@ -107,6 +107,60 @@ func TestNameConstraintAndNeverBuilt(t *testing.T) {
 	}
 }
 
+// BUG-MOVE-004: the constraint a file puts on its declarations, normalized, so that two files with the same
+// constraint compare equal whatever the spelling of their lines.
+func TestFileConstraint(t *testing.T) {
+	for _, c := range []struct{ path, src, want string }{
+		{"tags.go", "//go:build linux\n\npackage src\n", "//go:build linux"},
+		{"tags.go", "// +build linux,amd64\n\npackage src\n", "//go:build linux && amd64"},
+		// Every +build line must hold: the go tool ANDs them, so both constraints carry over.
+		{"tags.go", "// +build linux\n// +build amd64\n\npackage src\n", "//go:build linux && amd64"},
+		{"tags.go", "// +build linux amd64\n// +build !cgo\n\npackage src\n", "//go:build (linux || amd64) && !cgo"},
+		{"tags.go", "//go:build (linux) && (amd64)\n\npackage src\n", "//go:build linux && amd64"},
+		{"tags.go", "//go:build amd64 && linux\n\npackage src\n", "//go:build amd64 && linux"},
+		{"tags.go", "package src\n", ""},
+		{"x_windows.go", "package src\n", "//go:build windows"},
+		{"x_linux_amd64.go", "package src\n", "//go:build linux && amd64"},
+		{"x_windows.go", "//go:build linux\n\npackage src\n", "//go:build linux && windows"},
+		{"x_test.go", "package src\n", ""},
+	} {
+		if got := FileConstraint(c.path, c.src); got != c.want {
+			t.Errorf("FileConstraint(%q, %q) = %q, want %q", c.path, c.src, got, c.want)
+		}
+	}
+}
+
+// Equivalent compares the builds two constraints admit, not their spelling.
+func TestEquivalent(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"//go:build linux && linux", "//go:build linux", true},
+		{"//go:build amd64 && linux", "//go:build linux && amd64", true},
+		{"", "//go:build linux || !linux", true},
+		{"", "", true},
+		{"", "//go:build linux", false},
+		{"//go:build linux", "//go:build windows", false},
+		{"//go:build linux && windows", "//go:build linux", false},
+	} {
+		if got := Equivalent(c.a, c.b); got != c.want {
+			t.Errorf("Equivalent(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+	if got := FileConstraint("y_linux.go", "package y\n"); !Equivalent(got, "//go:build linux") {
+		t.Errorf("a _linux file has the constraint linux, got %q", got)
+	}
+	// Two // +build lines are linux AND amd64, not linux alone.
+	two := FileConstraint("y.go", "// +build linux\n// +build amd64\n\npackage y\n")
+	if !Equivalent(two, "//go:build linux && amd64") {
+		t.Errorf("two +build lines should equal linux && amd64, got %q", two)
+	}
+	if Equivalent(two, "//go:build linux") {
+		t.Errorf("two +build lines must not be equivalent to linux alone, got %q", two)
+	}
+}
+
 func TestContextReadsBuildFlagTags(t *testing.T) {
 	t.Setenv(gomod.EnvBuildFlags, "-race -tags=integration,e2e --tags=mock")
 	if got := Context().BuildTags; strings.Join(got, ",") != "integration,e2e,mock" {

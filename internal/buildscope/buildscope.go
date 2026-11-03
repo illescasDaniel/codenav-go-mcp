@@ -14,6 +14,8 @@
 //	Mentions(c, Query) []Hit          the uses, declarations and member selectors of a name in the files that
 //	                                  c's build leaves out and could refer to the object declared in DeclFile
 //	NameConstraint(file) string       the GOOS/GOARCH suffix of a file name as a reason, "" if none
+//	FileConstraint(path, src) string  the //go:build line that the name and header of a file put on it, normalized
+//	                                  ("" if none): two files with the same one are built under the same conditions
 //	NeverBuilt(cons) bool             a //go:build line no build satisfies (the "ignore" tag): scratch programs
 //
 // Mentions returns one Hit per mention: its Path, 1-based Line and Col (bytes), its Kind, and the Reason
@@ -47,6 +49,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -129,6 +132,99 @@ func NameConstraint(file string) string {
 	return ""
 }
 
+// FileConstraint is the build constraint the name and the header of the file at path (with text src) put
+// on it, as one normalized "//go:build" line: the GOOS and GOARCH of the name's suffix, and the //go:build
+// (or legacy // +build) line before the package clause, both must hold. "" when neither constrains the file.
+func FileConstraint(path, src string) string {
+	var parts []string
+	if h := headerLine(src); h != "" {
+		e, err := constraint.Parse(h)
+		if err != nil {
+			return h // unreadable: it matches no other file's constraint
+		}
+		parts = append(parts, "("+e.String()+")")
+	}
+	goos, goarch := suffixParts(filepath.Base(path))
+	if goos != "" {
+		parts = append(parts, goos)
+	}
+	if goarch != "" {
+		parts = append(parts, goarch)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	e, err := constraint.Parse("//go:build " + strings.Join(parts, " && "))
+	if err != nil {
+		return ""
+	}
+	return "//go:build " + e.String()
+}
+
+// Equivalent reports whether the two constraints (as FileConstraint returns them; "" is no constraint) admit
+// the same builds: every assignment of their tags gives both the same answer. A constraint too wide to
+// enumerate is compared as text.
+func Equivalent(a, b string) bool {
+	ea, errA := parseOrNil(a)
+	eb, errB := parseOrNil(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	tags := map[string]bool{}
+	for _, e := range []constraint.Expr{ea, eb} {
+		collectTags(e, tags)
+	}
+	names := make([]string, 0, len(tags))
+	for t := range tags {
+		names = append(names, t)
+	}
+	sort.Strings(names)
+	if len(names) > 16 {
+		return a == b
+	}
+	for bits := 0; bits < 1<<len(names); bits++ {
+		on := map[string]bool{}
+		for i, t := range names {
+			on[t] = bits&(1<<i) != 0
+		}
+		if evalOrTrue(ea, on) != evalOrTrue(eb, on) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseOrNil(s string) (constraint.Expr, error) {
+	if s == "" {
+		return nil, nil
+	}
+	return constraint.Parse(s)
+}
+
+// evalOrTrue evaluates e under the tags set in on; a nil expression (no constraint) is true.
+func evalOrTrue(e constraint.Expr, on map[string]bool) bool {
+	if e == nil {
+		return true
+	}
+	return e.Eval(func(tag string) bool { return on[tag] })
+}
+
+func collectTags(e constraint.Expr, into map[string]bool) {
+	switch x := e.(type) {
+	case nil:
+	case *constraint.TagExpr:
+		into[x.Tag] = true
+	case *constraint.NotExpr:
+		collectTags(x.X, into)
+	case *constraint.AndExpr:
+		collectTags(x.X, into)
+		collectTags(x.Y, into)
+	case *constraint.OrExpr:
+		collectTags(x.X, into)
+		collectTags(x.Y, into)
+	}
+}
+
 // NeverBuilt reports whether the constraint line cons is one no build satisfies: it is false whatever the
 // other tags are, because it needs the conventional "ignore" tag, which no build sets (scratch programs and
 // generators, which go run builds on their own).
@@ -190,9 +286,11 @@ func suffixMatches(c *build.Context, goos, goarch string) bool {
 	return osOK && (goarch == "" || goarch == c.GOARCH)
 }
 
-// headerLine is the //go:build (or legacy // +build) line before the package clause, "" if none.
+// headerLine is the //go:build (or legacy // +build) line before the package clause, "" if none. A //go:build
+// line wins. Without one, every // +build line must hold (the go tool ANDs them), so several are combined into
+// one //go:build line; if one of them does not parse, the first is returned as it is.
 func headerLine(src string) string {
-	plus := ""
+	var plus []string
 	for rest := src; rest != ""; {
 		var line string
 		line, rest, _ = strings.Cut(rest, "\n")
@@ -203,11 +301,25 @@ func headerLine(src string) string {
 		switch {
 		case constraint.IsGoBuild(t):
 			return t
-		case constraint.IsPlusBuild(t) && plus == "":
-			plus = t
+		case constraint.IsPlusBuild(t):
+			plus = append(plus, t)
 		}
 	}
-	return plus
+	switch len(plus) {
+	case 0:
+		return ""
+	case 1:
+		return plus[0]
+	}
+	parts := make([]string, 0, len(plus))
+	for _, p := range plus {
+		e, err := constraint.Parse(p)
+		if err != nil {
+			return plus[0]
+		}
+		parts = append(parts, "("+e.String()+")")
+	}
+	return "//go:build " + strings.Join(parts, " && ")
 }
 
 // Query selects the mentions Mentions looks for.
