@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/format"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"path/filepath"
 	"sort"
@@ -764,6 +765,103 @@ func ConstShift(filename, src string, start, end int) bool {
 		}
 	}
 	return false
+}
+
+// ConstRepeats describes the const spec inside src[start:end) of a parenthesised block. names are the
+// constants that take their type and value from it: the specs after it with no value of their own, up
+// to the next spec that has one. value is the canonical text of the type and value that spec passes on
+// (its own, or the nearest earlier spec's), in the form ConstSourceValue returns.
+func ConstRepeats(filename, src string, start, end int) (names []string, value string) {
+	fset, f, err := parse(filename, src)
+	if err != nil {
+		return nil, ""
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST || !gd.Lparen.IsValid() {
+			continue
+		}
+		for i, spec := range gd.Specs {
+			if o := fset.Position(spec.Pos()).Offset; o < start || o >= end {
+				continue
+			}
+			k := i
+			for k > 0 && len(gd.Specs[k].(*ast.ValueSpec).Values) == 0 {
+				k--
+			}
+			value = constValueText(fset, gd.Specs[k].(*ast.ValueSpec))
+			for _, later := range gd.Specs[i+1:] {
+				vs := later.(*ast.ValueSpec)
+				if len(vs.Values) > 0 {
+					break
+				}
+				for _, n := range vs.Names {
+					names = append(names, n.Name)
+				}
+			}
+			return names, value
+		}
+	}
+	return nil, ""
+}
+
+// ConstSourceValue is the canonical type and value text (see ConstRepeats) of a const spec written as
+// src, such as "B Color = 2"; "" when src is not exactly one spec.
+func ConstSourceValue(src string) string {
+	fset, f, err := parse("source.go", "package p\nconst (\n"+src+"\n)")
+	if err != nil || len(f.Decls) != 1 {
+		return ""
+	}
+	gd, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok || len(gd.Specs) != 1 {
+		return ""
+	}
+	return constValueText(fset, gd.Specs[0].(*ast.ValueSpec))
+}
+
+// GroupSpecNames lists the names that the specs written as src declare inside a parenthesised block of
+// keyword (const, var or type), and how many specs src holds (none for a comment alone).
+func GroupSpecNames(keyword, src string) (names []string, specs int) {
+	_, f, err := parse("source.go", "package p\n"+keyword+" (\n"+src+"\n)")
+	if err != nil || len(f.Decls) != 1 {
+		return nil, 0
+	}
+	gd, ok := f.Decls[0].(*ast.GenDecl)
+	if !ok {
+		return nil, 0
+	}
+	for _, spec := range gd.Specs {
+		switch s := spec.(type) {
+		case *ast.ValueSpec:
+			for _, n := range s.Names {
+				names = append(names, n.Name)
+			}
+		case *ast.TypeSpec:
+			names = append(names, s.Name.Name)
+		}
+	}
+	return names, len(gd.Specs)
+}
+
+// constValueText is "Type = values", or "= values" when the spec has no type.
+func constValueText(fset *token.FileSet, vs *ast.ValueSpec) string {
+	typ := ""
+	if vs.Type != nil {
+		typ = nodeText(fset, vs.Type)
+	}
+	var vals []string
+	for _, v := range vs.Values {
+		vals = append(vals, nodeText(fset, v))
+	}
+	return strings.TrimSpace(typ + " = " + strings.Join(vals, ", "))
+}
+
+func nodeText(fset *token.FileSet, n ast.Node) string {
+	var b bytes.Buffer
+	if err := printer.Fprint(&b, fset, n); err != nil {
+		return ""
+	}
+	return b.String()
 }
 
 // EnclosingDecl returns the byte span of the top-level declaration (doc comment included) that

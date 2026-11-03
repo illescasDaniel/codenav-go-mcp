@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -263,9 +265,31 @@ func replaceSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source st
 	if err := checkSnippet(source, l.decl); err != nil {
 		return nil, err
 	}
+	if err := constRepeatsRefusal(l, source); err != nil {
+		return nil, err
+	}
 	if sp := specialFunc(l.decl, gosrc.PackageName(l.text)); sp != "" {
 		if names, nerr := gosrc.DeclNames(source); nerr == nil && len(names) == 1 && names[0] != l.decl.Name {
 			return nil, toolerr.Inputf("%s is the %s function; the replacement is called %s, which would remove it. Keep the name %s.", in.Name, sp, names[0], l.decl.Name)
+		}
+	}
+	key := declKey(l.decl)
+	names, specs := sourceNames(l.decl, source)
+	if len(names) == 0 {
+		return nil, toolerr.Inputf("source declares nothing; replace expects the new definition of %s (use delete to remove it)", in.Name)
+	}
+	if l.decl.Grouped && specs != 1 && l.decl.Keyword == "const" && gosrc.ConstShift(l.path, l.text, l.decl.Start, l.decl.End) {
+		return nil, toolerr.Inputf("%s is followed by constants that take their value from their position (iota) or from a repeated expression, so a replacement with %d specs would move them. Give the later constants explicit values first, then replace %s with one spec.", in.Name, specs, in.Name)
+	}
+	var extra []string // the other names the source declares, listed in the header
+	if len(names) > 1 {
+		if !slices.Contains(names, key) {
+			return nil, toolerr.Inputf("source declares %s but not %s; replace expects the new definition of %s (use insert for extra declarations)", strings.Join(names, ", "), in.Name, in.Name)
+		}
+		for _, n := range names {
+			if n != key && !slices.Contains(extra, n) {
+				extra = append(extra, n)
+			}
 		}
 	}
 	next := l.text[:l.decl.Start] + edits.MatchEOL(source, l.text) + l.text[l.decl.End:]
@@ -277,6 +301,13 @@ func replaceSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source st
 	if l.decl.HasDoc && !strings.HasPrefix(source, "//") && !strings.HasPrefix(source, "/*") {
 		notes = append(notes, "The old doc comment was dropped because source has none; include it in source to keep it.")
 	}
+	if lost := lostDirectives(l, source); len(lost) > 0 {
+		noun, verb, pronoun := "directive", "is", "it"
+		if len(lost) > 1 {
+			noun, verb, pronoun = "directives", "are", "them"
+		}
+		notes = append(notes, fmt.Sprintf("The old definition's %s %s %s not in source and %s dropped; include %s in source to keep %s.", noun, strings.Join(lost, ", "), verb, verb, pronoun, pronoun))
+	}
 	if names, nerr := gosrc.DeclNames(source); nerr == nil && !l.decl.Grouped && len(names) == 1 && !strings.HasSuffix("."+names[0], "."+l.decl.Name) {
 		notes = append(notes, fmt.Sprintf("The new definition is called %s, not %s; its callers are not renamed (use rename_symbol).", names[0], l.decl.Name))
 	}
@@ -285,7 +316,92 @@ func replaceSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source st
 			notes = append(notes, tagChangeNote(c))
 		}
 	}
-	return planFile(l.path, "replace "+in.Name, next, l.text, true, l.bom, notes...)
+	if !slices.Contains(gosrc.FileDeclNames(l.path, next), key) {
+		if note := exportNote(l, false); note != "" {
+			notes = append(notes, note)
+		}
+	}
+	desc := "replace " + in.Name
+	if len(extra) > 0 {
+		desc += " (also declares " + strings.Join(extra, ", ") + ")"
+	}
+	return planFile(l.path, desc, next, l.text, true, l.bom, notes...)
+}
+
+// constRepeatsRefusal refuses a replacement that changes the value the constants after l.decl take
+// from it (iota or a repeated expression): they would change value without a word in the answer.
+func constRepeatsRefusal(l *located, source string) error {
+	if l.decl.Keyword != "const" || !l.decl.Grouped {
+		return nil
+	}
+	deps, value := gosrc.ConstRepeats(l.path, l.text, l.decl.Start, l.decl.End)
+	if len(deps) == 0 || gosrc.ConstSourceValue(source) == value {
+		return nil
+	}
+	return toolerr.Inputf("%s is followed by %s, which take their value from it (%q), so replacing %s would change their values. Give %s an explicit value first (replace %s with %q), then replace %s.",
+		l.decl.Name, strings.Join(deps, ", "), value, l.decl.Name, deps[0], deps[0], deps[0]+" "+value, l.decl.Name)
+}
+
+// declKey is the name the declaration has in gosrc.DeclNames: "Recv.Name" for a method.
+func declKey(d *gosrc.Decl) string {
+	if d.Method {
+		return d.Recv + "." + d.Name
+	}
+	return d.Name
+}
+
+// sourceNames lists the names that source declares in place of d, and how many specs it holds (a
+// grouped source may hold several, or none).
+func sourceNames(d *gosrc.Decl, source string) ([]string, int) {
+	if d.Grouped {
+		return gosrc.GroupSpecNames(d.Keyword, source)
+	}
+	names, _ := gosrc.DeclNames(source)
+	return names, len(names)
+}
+
+// lostDirectives lists the //go: and //export directives of the old doc comment that source does not
+// repeat: a replacement drops them with the old doc block.
+func lostDirectives(l *located, source string) []string {
+	have := map[string]bool{}
+	for _, line := range strings.Split(source, "\n") {
+		have[strings.TrimSpace(line)] = true
+	}
+	var lost []string
+	for _, line := range strings.Split(l.text[l.decl.Start:], "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "//") {
+			break // the doc block ends where the declaration starts
+		}
+		if (strings.HasPrefix(t, "//go:") || strings.HasPrefix(t, "//export ")) && !have[t] {
+			lost = append(lost, t)
+		}
+	}
+	return lost
+}
+
+// exportNote says that a removed exported name may still be used by code outside the workspace.
+// It says nothing where no such code can exist: package main, an internal/ package, a _test.go file,
+// or a method on an unexported type. unused is true when the workspace has no uses of the name.
+func exportNote(l *located, unused bool) string {
+	d := l.decl
+	if !token.IsExported(d.Name) || strings.HasSuffix(l.path, "_test.go") || gosrc.PackageName(l.text) == "main" || (d.Method && !token.IsExported(d.Recv)) {
+		return ""
+	}
+	dir := filepath.Dir(l.path)
+	m, err := moduleOf(dir)
+	if err != nil {
+		return ""
+	}
+	imp, err := importPathOf(m, dir)
+	if err != nil || slices.Contains(strings.Split(imp, "/"), "internal") {
+		return ""
+	}
+	pkg := gosrc.PackageName(l.text)
+	if unused {
+		return fmt.Sprintf("%s was exported from %s; nothing in this workspace uses it, but code outside the workspace that imports %s no longer builds.", declKey(d), imp, pkg)
+	}
+	return fmt.Sprintf("%s was exported from %s; code outside the workspace that imports %s no longer builds.", declKey(d), imp, pkg)
 }
 
 // tagChangeNote describes a field whose struct tag differs between the old and the new definition.
@@ -503,6 +619,9 @@ func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool
 	}
 	if len(users) > 0 {
 		notes = append(notes, fmt.Sprintf("Forced: %d use(s) of %s remain.", len(users), in.Name))
+	}
+	if note := exportNote(l, len(users) == 0 && !l.unbuilt); note != "" {
+		notes = append(notes, note)
 	}
 	plan, err := planFile(l.path, "delete "+in.Name, next, l.text, true, l.bom, notes...)
 	return plan, "", err

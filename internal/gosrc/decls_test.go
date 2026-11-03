@@ -1,6 +1,7 @@
 package gosrc
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -57,6 +58,79 @@ func TestFindDeclAt(t *testing.T) {
 	}
 	if _, err := FindDeclAt("p.go", sample, strings.Index(sample, "X int")); err == nil {
 		t.Error("a struct field is not a top-level declaration")
+	}
+}
+
+// ESYM-001: the constants a const spec hands its value on to, and the canonical value text.
+func TestConstRepeats(t *testing.T) {
+	const src = `package p
+
+const (
+	Red Color = iota
+	Green
+	Blue
+	Max = 9
+	Min
+)
+
+const (
+	X = "a"
+	Y
+)
+`
+	for _, c := range []struct {
+		name, wantNames, wantValue string
+	}{
+		{"Red", "Green Blue", "Color = iota"},
+		{"Green", "Blue", "Color = iota"}, // inherits Red's type and value
+		{"Blue", "", "Color = iota"},
+		{"Max", "Min", "= 9"},
+		{"Min", "", "= 9"},
+		{"X", "Y", `= "a"`},
+		{"Y", "", `= "a"`},
+	} {
+		d, _, err := FindDeclByName("p.go", src, c.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		names, value := ConstRepeats("p.go", src, d.Start, d.End)
+		if got := strings.Join(names, " "); got != c.wantNames || value != c.wantValue {
+			t.Errorf("%s: names %q value %q, want names %q value %q", c.name, got, value, c.wantNames, c.wantValue)
+		}
+	}
+}
+
+func TestConstSourceValueIsCanonical(t *testing.T) {
+	for _, c := range []struct{ src, want string }{
+		{"Red = 10", "= 10"},
+		{"Red Color = iota", "Color = iota"},
+		{"X = 1<<iota", "= 1 << iota"}, // printer form, so spacing does not matter
+		{"X = 1 << iota", "= 1 << iota"},
+		{"A = 1\nB = 2", ""}, // not one spec
+		{"func F() {}", ""},
+	} {
+		if got := ConstSourceValue(c.src); got != c.want {
+			t.Errorf("ConstSourceValue(%q) = %q, want %q", c.src, got, c.want)
+		}
+	}
+}
+
+func TestGroupSpecNames(t *testing.T) {
+	for _, c := range []struct {
+		keyword, src string
+		names        []string
+		specs        int
+	}{
+		{"const", "A = 1\nB = 2", []string{"A", "B"}, 2},
+		{"const", "// gone", nil, 0},
+		{"var", "va = 1", []string{"va"}, 1},
+		{"var", "X, Y = 1, 2", []string{"X", "Y"}, 1},
+		{"var", "T int", []string{"T"}, 1},
+	} {
+		names, specs := GroupSpecNames(c.keyword, c.src)
+		if !slices.Equal(names, c.names) || specs != c.specs {
+			t.Errorf("GroupSpecNames(%q, %q) = %v, %d; want %v, %d", c.keyword, c.src, names, specs, c.names, c.specs)
+		}
 	}
 }
 
