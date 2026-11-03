@@ -500,11 +500,10 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	notes = append(notes, importNotes...)
 	if len(members) > 1 {
 		notes = append(notes, fmt.Sprintf("Changed %d interface/implementing method declarations together.", len(members)))
-		links, err := satisfactionNotes(ctx, w, root, members)
-		if err != nil {
-			return "", err
+		// The links are explanation only; failing to compute them must not fail the edit.
+		if links, err := satisfactionNotes(ctx, w, root, members); err == nil {
+			notes = append(notes, links...)
 		}
-		notes = append(notes, links...)
 	}
 	if n := skippedNote(skipped, sym.Name); n != "" {
 		notes = append(notes, n)
