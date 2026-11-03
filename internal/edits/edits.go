@@ -258,6 +258,7 @@ type EditPlan struct {
 	Changes     []FileChange
 	Notes       []string
 	BaseHashes  map[string]string // path -> hash of bytes at plan time ("" = absent)
+	ConfigFP    string            // gomod.Fingerprint of the Go configuration the plan was simulated under ("" = not recorded)
 	AllowLarge  bool              // allow_large was given when the plan was made; apply_edit honours it
 	Previewed   bool              // kept in the plan store: a preview exists for it
 	// Holds are reasons the gate cannot check the plan (code the build leaves out still uses what it changes):

@@ -116,7 +116,7 @@ func (w *Workspace) withConfigProblem(ctx context.Context, out string) string {
 	if w == nil {
 		return out
 	}
-	if p := gomod.ConfigProblem(ctx, w.Root); p != "" {
+	if p := gomod.Health(ctx, w.Root); p != "" {
 		return out + "\n\nWarning: the Go configuration of this workspace is broken, so no package is loaded and type-resolved results (symbols, diagnostics, rename) are empty or wrong: " + p
 	}
 	return out

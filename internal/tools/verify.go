@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
@@ -25,9 +26,14 @@ func verifyChanges(ctx context.Context, w *Workspace, includeDeps bool) (string,
 	untracked, _ := git(ctx, w.Root, "ls-files", "--others", "--exclude-standard", "-z", "--full-name")
 	before := map[string]string{}
 	skipBefore, skipAfter := map[string]bool{}, map[string]bool{}
-	var edited []string
+	var edited, moduleFiles []string
 	seen := map[string]bool{}
 	add := func(rel string, isNew bool) {
+		if rel != "" && filepath.Ext(rel) != ".go" && isModuleFile(rel) && !seen[rel] {
+			// A module file is not type-checked, but the Go configuration it sets is: say it changed.
+			seen[rel] = true
+			moduleFiles = append(moduleFiles, rel)
+		}
 		if rel == "" || filepath.Ext(rel) != ".go" || seen[rel] {
 			return
 		}
@@ -51,17 +57,34 @@ func verifyChanges(ctx context.Context, w *Workspace, includeDeps bool) (string,
 		add(f, true)
 	}
 	if len(edited) == 0 {
+		if len(moduleFiles) > 0 {
+			return "Uncommitted changes vs HEAD in module file(s) only: " + strings.Join(moduleFiles, ", ") +
+				". No Go file changed, so no Go file was type-checked: the Go configuration was reloaded, and run go build to confirm the build.", nil
+		}
 		return "No uncommitted Go changes.", nil
 	}
 	// Deleted files: absent on disk now.
-	files, left := FilesToCheck(ctx, w, edited, includeDeps)
+	files, left, incomplete := FilesToCheck(ctx, w, edited, includeDeps)
 	d, err := Delta(ctx, w, before, nil, files, skipBefore, skipAfter)
 	if err != nil {
 		return "", err
 	}
+	d.NotChecked = gateReasons(gomod.Health(ctx, w.Root), incomplete, d.FilesChecked)
 	out := "Uncommitted changes vs HEAD in " + strconv.Itoa(len(edited)) + " Go file(s).\n" + diagdelta.Format(d, 15)
+	if len(moduleFiles) > 0 {
+		out += "\nModule file(s) changed too: " + strings.Join(moduleFiles, ", ") + " (a broken Go configuration is reported in the warning, if any)."
+	}
 	if len(left) > 0 {
 		out += "\n(" + leftOutNote(w, left) + ")"
 	}
 	return out, nil
+}
+
+// isModuleFile reports whether rel is a module file that sets the Go configuration of the workspace.
+func isModuleFile(rel string) bool {
+	switch filepath.Base(rel) {
+	case "go.mod", "go.sum", "go.work", "go.work.sum":
+		return true
+	}
+	return false
 }

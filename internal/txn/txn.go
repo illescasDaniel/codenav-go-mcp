@@ -13,6 +13,7 @@ import (
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
@@ -278,6 +279,27 @@ func (j *Journal) History() []*Applied {
 }
 
 func (j *Journal) CheckFresh(p *edits.EditPlan) error {
+	if err := j.checkFreshFiles(p); err != nil {
+		return err
+	}
+	return j.checkFreshConfig(p)
+}
+
+// checkFreshConfig refuses a plan simulated under a Go configuration that has since changed: a go.mod, go.sum or
+// go.work edit (or a GOWORK/GOFLAGS/GOTOOLCHAIN change) makes its type check stale even when every file it writes
+// is unchanged. A plan without a recorded fingerprint is not checked.
+func (j *Journal) checkFreshConfig(p *edits.EditPlan) error {
+	if p.ConfigFP == "" || gomod.Fingerprint(j.Guard.Root) == p.ConfigFP {
+		return nil
+	}
+	if !p.Previewed {
+		return toolerr.Inputf("Go config changed while the edit was being applied (go.mod, go.sum, go.work or the Go environment). Run the refactoring again.")
+	}
+	return toolerr.Inputf("Go config changed since the preview (go.mod, go.sum, go.work or the Go environment). Run the refactoring again.")
+}
+
+// checkFreshFiles refuses a plan whose files changed since it was made.
+func (j *Journal) checkFreshFiles(p *edits.EditPlan) error {
 	var stale []string
 	for path, want := range p.BaseHashes {
 		if edits.FileHash(path) != want {

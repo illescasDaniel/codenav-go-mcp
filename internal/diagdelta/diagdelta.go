@@ -120,6 +120,11 @@ type Delta struct {
 	Unchecked    []string
 	// Ignored describes diagnostics left out as analysis artefacts (see DropCgoArtefacts).
 	Ignored []string
+	// NotChecked gives the reasons the check is not complete (the Go configuration does not load, an edited package
+	// does not load, no file was checked, ...). A delta with reasons says nothing clean, whatever it counted.
+	NotChecked []string
+	// Capped counts the dependent files past the check limit, which were not type-checked.
+	Capped int
 }
 
 const cgoListFailure = "go list failed to return CompiledGoFiles"
@@ -248,11 +253,22 @@ func dedupe(es []Entry) []Entry {
 
 func Format(d Delta, limit int) string {
 	ne, fe := len(d.NewErrors()), len(d.FixedErrors())
-	head := fmt.Sprintf("Diagnostics: %d new error(s), %d fixed", ne, fe)
+	newText := fmt.Sprintf("%d new error(s)", ne)
+	if d.Capped > 0 {
+		newText = fmt.Sprintf("at least %d new error(s)", ne) // the files left out may hold more
+	}
+	head := fmt.Sprintf("Diagnostics: %s, %d fixed", newText, fe)
 	if other := len(d.New) - ne; other > 0 {
 		head += fmt.Sprintf(", %d new warning(s)", other)
 	}
 	head += fmt.Sprintf(" (%d file(s) checked, %d unchanged)", d.FilesChecked, d.Unchanged)
+	if len(d.NotChecked) > 0 {
+		// Not a clean count: the check did not run where it had to, so the head says so instead of "0 new error(s)".
+		head = "NOT CHECKED: " + strings.Join(d.NotChecked, "; ")
+		if ne > 0 {
+			head += fmt.Sprintf("\n  %d new error(s) in the files that were checked", ne)
+		}
+	}
 	lines := []string{head}
 	if len(d.Ignored) > 0 {
 		lines = append(lines, "  ignored: "+strings.Join(d.Ignored, "; "))

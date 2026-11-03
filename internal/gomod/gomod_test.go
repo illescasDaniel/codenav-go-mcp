@@ -137,7 +137,7 @@ func TestRelatedWithCgoFiles(t *testing.T) {
 	}
 }
 
-func TestConfigProblem(t *testing.T) {
+func TestHealth(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not installed")
 	}
@@ -145,7 +145,7 @@ func TestConfigProblem(t *testing.T) {
 
 	healthy := t.TempDir()
 	writeTree(t, healthy, map[string]string{"go.mod": "module example.com/h\n\ngo 1.21\n", "h.go": "package h\n"})
-	if p := ConfigProblem(ctx, healthy); p != "" {
+	if p := Health(ctx, healthy); p != "" {
 		t.Errorf("healthy module: %q", p)
 	}
 
@@ -154,24 +154,24 @@ func TestConfigProblem(t *testing.T) {
 		"go.mod": "module example.com/w\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./sub\n)\n",
 		"sub/go.mod": "module example.com/w/sub\n\ngo 1.21\n",
 	})
-	if p := ConfigProblem(ctx, healthyWork); p != "" {
+	if p := Health(ctx, healthyWork); p != "" {
 		t.Errorf("healthy go.work workspace: %q", p)
 	}
 
 	noMod := t.TempDir()
-	if p := ConfigProblem(ctx, noMod); p != "" {
+	if p := Health(ctx, noMod); p != "" {
 		t.Errorf("a directory without any go.mod is not a problem: %q", p)
 	}
 
 	broken := t.TempDir()
 	writeTree(t, broken, map[string]string{"go.mod": "this is not a go.mod\n"})
-	p := ConfigProblem(ctx, broken)
+	p := Health(ctx, broken)
 	if p == "" || strings.Contains(p, broken) || strings.Contains(p, "\n") {
 		t.Errorf("garbled go.mod: want a one-line problem relative to the workspace, got %q", p)
 	}
 	// Cached answer follows the file: fixing it clears the problem.
 	writeTree(t, broken, map[string]string{"go.mod": "module example.com/fixed\n\ngo 1.21\n\n// fixed and longer so the stamp changes\n"})
-	if p := ConfigProblem(ctx, broken); p != "" {
+	if p := Health(ctx, broken); p != "" {
 		t.Errorf("after fixing go.mod the problem must be gone: %q", p)
 	}
 
@@ -179,7 +179,7 @@ func TestConfigProblem(t *testing.T) {
 	writeTree(t, missingUse, map[string]string{
 		"go.mod": "module example.com/m\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./missing\n)\n",
 	})
-	p = ConfigProblem(ctx, missingUse)
+	p = Health(ctx, missingUse)
 	if p == "" || !strings.Contains(p, "missing") || strings.Contains(p, missingUse) {
 		t.Errorf("go.work with a missing use directory: %q", p)
 	}
@@ -213,7 +213,7 @@ func TestWorkModules(t *testing.T) {
 }
 
 // Round 12: several problems of one config are separated, not run together.
-func TestConfigProblemSeparatesErrors(t *testing.T) {
+func TestHealthSeparatesErrors(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not installed")
 	}
@@ -221,20 +221,20 @@ func TestConfigProblemSeparatesErrors(t *testing.T) {
 	writeTree(t, two, map[string]string{
 		"go.mod": "module example.com/m\n\ngo 1.21\n", "go.work": "go 1.21\n\nuse (\n\t.\n\t./gone1\n\t./gone2\n)\n",
 	})
-	p := ConfigProblem(context.Background(), two)
+	p := Health(context.Background(), two)
 	if !strings.Contains(p, "gone1/go.mod: no such file or directory; go: cannot load module gone2") {
 		t.Errorf("two errors must be separated by \"; \": %q", p)
 	}
 }
 
 // Round 13 (11f): a line that ends in ":" introduces the next one, so no ":;" shows up.
-func TestConfigProblemNoColonSemicolon(t *testing.T) {
+func TestHealthNoColonSemicolon(t *testing.T) {
 	if _, err := exec.LookPath("go"); err != nil {
 		t.Skip("go not installed")
 	}
 	d := t.TempDir()
 	writeTree(t, d, map[string]string{"go.mod": "this is not a go.mod\n"})
-	p := ConfigProblem(context.Background(), d)
+	p := Health(context.Background(), d)
 	if strings.Contains(p, ":;") || !strings.Contains(p, "errors parsing go.mod: go.mod:1:") {
 		t.Errorf("want \"errors parsing go.mod: go.mod:1: ...\", got %q", p)
 	}

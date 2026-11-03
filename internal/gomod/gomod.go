@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,38 @@ type pkg struct {
 	Imports      []string
 	TestImports  []string
 	XTestImports []string
+	Error        *pkgError   // why the package itself does not load
+	DepsErrors   []*pkgError // why one of its dependencies does not
+}
+
+// pkgError is a load error `go list -e` reports (the go command's PackageError).
+type pkgError struct {
+	Pos string
+	Err string
+}
+
+// loadProblems describes why p does not load, one line per error: "import path: position: cause".
+func (p pkg) loadProblems() []string {
+	var out []string
+	add := func(e *pkgError) {
+		if e == nil || e.Err == "" {
+			return
+		}
+		cause := strings.SplitN(e.Err, "\n", 2)[0]
+		if i := strings.Index(cause, "; to add"); i >= 0 {
+			cause = cause[:i]
+		}
+		line := p.ImportPath + ": "
+		if e.Pos != "" {
+			line += e.Pos + ": "
+		}
+		out = append(out, line+cause)
+	}
+	add(p.Error)
+	for _, e := range p.DepsErrors {
+		add(e)
+	}
+	return out
 }
 
 func (p pkg) files() []string {
@@ -193,12 +226,15 @@ func runListDir(ctx context.Context, root string, flags []string) ([]pkg, error)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	args := append([]string{"list", "-e"}, flags...)
-	args = append(args, "-json=ImportPath,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports", "./...")
+	args = append(args, "-json=ImportPath,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports,Error,DepsErrors", "./...")
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = root
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil && out.Len() == 0 {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, errors.New("go list did not finish within 60s")
+		}
 		return nil, err
 	}
 	var pkgs []pkg
@@ -219,14 +255,24 @@ func runListDir(ctx context.Context, root string, flags []string) ([]pkg, error)
 // A file of a nested module (a go.mod below root that no go.work lists) is looked up in that module:
 // `go list ./...` at the root leaves nested modules out.
 func Related(ctx context.Context, root string, edited []string) (files []string, err error) {
+	files, _, err = RelatedLoad(ctx, root, edited)
+	return files, err
+}
+
+// RelatedLoad is Related with the load state of what it looked at. err is the failure of a `go list` whose
+// output the importers were searched in (the root's own module, a nested one, or a sibling module), so the
+// importers of the edited packages may be missing from files. problems lists the errors of the packages the
+// edited files belong to ("import path: position: cause"): an edit to such a package is checked against a graph
+// that does not load.
+func RelatedLoad(ctx context.Context, root string, edited []string) (files, problems []string, err error) {
 	pkgs, err := list(ctx, root)
 	nestedDirs := map[string]bool{}
 	for _, f := range edited {
 		if n, ok := Uncovered(root, f); ok && !nestedDirs[n.Dir] {
 			nestedDirs[n.Dir] = true
-			if more, merr := list(ctx, n.Dir); merr == nil || len(more) > 0 {
-				pkgs = append(pkgs, more...)
-			}
+			more, merr := list(ctx, n.Dir)
+			pkgs = append(pkgs, more...)
+			err = firstErr(err, merr)
 		}
 	}
 	if len(nestedDirs) > 0 {
@@ -237,9 +283,9 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 				continue
 			}
 			nestedDirs[o.Dir] = true
-			if more, merr := list(ctx, o.Dir); merr == nil || len(more) > 0 {
-				pkgs = append(pkgs, more...)
-			}
+			more, merr := list(ctx, o.Dir)
+			pkgs = append(pkgs, more...)
+			err = firstErr(err, merr)
 		}
 	}
 	seen := map[string]bool{}
@@ -252,9 +298,6 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 	for _, f := range edited {
 		add(f)
 	}
-	if err != nil && len(pkgs) == 0 {
-		return files, err
-	}
 	dirs := map[string]bool{}
 	for _, f := range edited {
 		dirs[filepath.Dir(f)] = true
@@ -265,8 +308,11 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 		if dirs[p.Dir] {
 			targets = append(targets, p.ImportPath)
 			same = append(same, p.files()...)
+			problems = append(problems, p.loadProblems()...)
 		}
 	}
+	sort.Strings(problems)
+	problems = uniqueStrings(problems)
 	sort.Strings(same)
 	for _, f := range same {
 		add(f)
@@ -287,7 +333,26 @@ func Related(ctx context.Context, root string, edited []string) (files []string,
 	for _, f := range deps {
 		add(f)
 	}
-	return files, nil
+	return files, problems, err
+}
+
+// firstErr is the first non-nil error of a and b.
+func firstErr(a, b error) error {
+	if a != nil {
+		return a
+	}
+	return b
+}
+
+// uniqueStrings drops repeated entries of a sorted slice.
+func uniqueStrings(s []string) []string {
+	var out []string
+	for i, v := range s {
+		if i == 0 || s[i-1] != v {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // maxSiblingModules bounds how many uncovered modules are listed to find importers of an edited one.

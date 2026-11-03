@@ -208,15 +208,17 @@ func TestRenameLeftoverMentionsStayInTheSymbolsPackage(t *testing.T) {
 
 func TestOrganizeImportsDropsStackedAndTrailingHeadings(t *testing.T) {
 	cs, root := session(t, nil)
-	writeFile(t, root, "shapes/orph.go", "package shapes\n\nimport (\n\t// Standard library\n\t\"fmt\"\n\t\"os\"\n\n\t\"sort\"\n\t// Another heading\n\n\t// Local packages\n\t\"example.com/fx/app\"\n\t// Trailing heading\n)\n\nfunc O1() { fmt.Println(os.Args) }\nfunc O2() { _ = app.Total }\n")
-	writeFile(t, root, "shapes/orph2.go", "package shapes\n\nimport (\n\t\"os\" // used\n\t\"strings\"\n\t/* block heading */\n)\n\nfunc P1() { _ = os.Args }\n")
-	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/orph.go", "organize_imports": true, "max_new_errors": -1})
-	call(t, cs, "quick_fix", map[string]any{"file_path": "shapes/orph2.go", "organize_imports": true, "max_new_errors": -1})
-	got := readFile(t, root, "shapes/orph.go")
+	// Not in shapes: app imports shapes, so a shapes file importing app is an import cycle, and a package that
+	// does not load is held as a preview (NOT CHECKED) instead of written.
+	writeFile(t, root, "orph/orph.go", "package orph\n\nimport (\n\t// Standard library\n\t\"fmt\"\n\t\"os\"\n\n\t\"sort\"\n\t// Another heading\n\n\t// Local packages\n\t\"example.com/fx/app\"\n\t// Trailing heading\n)\n\nfunc O1() { fmt.Println(os.Args) }\nfunc O2() { _ = app.Total }\n")
+	writeFile(t, root, "orph/orph2.go", "package orph\n\nimport (\n\t\"os\" // used\n\t\"strings\"\n\t/* block heading */\n)\n\nfunc P1() { _ = os.Args }\n")
+	call(t, cs, "quick_fix", map[string]any{"file_path": "orph/orph.go", "organize_imports": true, "max_new_errors": -1})
+	call(t, cs, "quick_fix", map[string]any{"file_path": "orph/orph2.go", "organize_imports": true, "max_new_errors": -1})
+	got := readFile(t, root, "orph/orph.go")
 	if strings.Contains(got, "Another heading") || strings.Contains(got, "Trailing heading") || strings.Contains(got, "\n\n\n") || !strings.Contains(got, "// Local packages") {
 		t.Errorf("orph.go:\n%s", got)
 	}
-	got = readFile(t, root, "shapes/orph2.go")
+	got = readFile(t, root, "orph/orph2.go")
 	if strings.Contains(got, "block heading") || strings.Contains(got, "*/)") {
 		t.Errorf("orph2.go:\n%s", got)
 	}

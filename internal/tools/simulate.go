@@ -133,8 +133,9 @@ func Delta(ctx context.Context, w *Workspace, before, after map[string]string, c
 }
 
 // FilesToCheck: edited Go files first, then their package siblings and importers (capped). The
-// second result lists the files left out by the cap.
-func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDependents bool) ([]string, []string) {
+// second result lists the files left out by the cap. The third lists why the check is incomplete
+// (reasons for NOT CHECKED): the importers could not be listed, or an edited package does not load.
+func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDependents bool) ([]string, []string, []string) {
 	var goEdited []string
 	for _, p := range edited {
 		if strings.HasSuffix(p, ".go") {
@@ -142,9 +143,29 @@ func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDep
 		}
 	}
 	files := goEdited
-	if includeDependents {
-		if rel, _ := gomod.Related(ctx, w.Root, goEdited); len(rel) > 0 {
+	var incomplete []string
+	if includeDependents && len(goEdited) > 0 {
+		rel, problems, err := gomod.RelatedLoad(ctx, w.Root, goEdited)
+		if len(rel) > 0 {
 			files = rel
+		}
+		if err != nil {
+			incomplete = append(incomplete, "the packages that import the edited files could not be listed ("+goErrText(err.Error(), w.Root)+")")
+		}
+		if len(problems) > 0 {
+			shown := problems
+			if len(shown) > 2 {
+				shown = shown[:2]
+			}
+			var texts []string
+			for _, p := range shown {
+				texts = append(texts, goErrText(p, w.Root))
+			}
+			more := ""
+			if len(problems) > len(shown) {
+				more = fmt.Sprintf("; +%d more", len(problems)-len(shown))
+			}
+			incomplete = append(incomplete, "the package of an edited file does not load ("+strings.Join(texts, "; ")+more+")")
 		}
 	}
 	var kept []string
@@ -154,9 +175,31 @@ func FilesToCheck(ctx context.Context, w *Workspace, edited []string, includeDep
 		}
 	}
 	if len(kept) > CheckLimit {
-		return kept[:CheckLimit], kept[CheckLimit:]
+		return kept[:CheckLimit], kept[CheckLimit:], incomplete
 	}
-	return kept, nil
+	return kept, nil, incomplete
+}
+
+// goErrText shows a go command's error with paths relative to the workspace, on one line.
+func goErrText(msg, root string) string {
+	msg = strings.ReplaceAll(msg, root+string(filepath.Separator), "")
+	return strings.TrimSpace(strings.SplitN(msg, "\n", 2)[0])
+}
+
+// gateReasons lists why the type check of an edit is not complete (the NOT CHECKED reasons): the Go
+// configuration does not load (health, "" when it does), the check could not cover what the edit touches
+// (incomplete, from FilesToCheck), or no Go file was type-checked at all (checked == 0). An empty result means
+// the check covered what the edit touches.
+func gateReasons(health string, incomplete []string, checked int) []string {
+	var out []string
+	if health != "" {
+		out = append(out, "the Go configuration does not load, so no package is loaded: "+health)
+	}
+	out = append(out, incomplete...)
+	if checked == 0 {
+		out = append(out, "no Go file was type-checked")
+	}
+	return out
 }
 
 // leftOutNote says exactly which files the CheckLimit cap skipped.
@@ -238,7 +281,7 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 			after[p] = ignoreStub(stub)
 		}
 	}
-	check, leftOut := FilesToCheck(ctx, w, changed, includeDependents)
+	check, leftOut, incomplete := FilesToCheck(ctx, w, changed, includeDependents)
 	d, err := Delta(ctx, w, nil, after, check, created, deleted)
 	if err != nil {
 		return d, err
@@ -249,6 +292,8 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 	if len(leftOut) > 0 {
 		d.Unchecked = append(d.Unchecked, leftOutNote(w, leftOut))
 	}
+	d.Capped = len(leftOut)
+	d.NotChecked = gateReasons(gomod.Health(ctx, w.Root), incomplete, d.FilesChecked)
 	seenConstraint := map[string]bool{}
 	for _, c := range plan.Changes {
 		if filepath.Ext(c.Path) != ".go" {
