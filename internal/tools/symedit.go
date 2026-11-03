@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
@@ -21,6 +22,9 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/resolve"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
+
+// editSymbolActions lists the values of edit_symbol's action parameter, as the refusals and the usage text name them.
+const editSymbolActions = "replace, insert or delete"
 
 type editSymbolIn struct {
 	Action            string   `json:"action" jsonschema:"replace, insert or delete"`
@@ -243,7 +247,7 @@ func editSymbol(ctx context.Context, w *Workspace, in editSymbolIn) (string, err
 			return "", toolerr.Inputf("%s", refused)
 		}
 	default:
-		return "", toolerr.Inputf("unknown action %q: use replace, insert or delete.", in.Action)
+		return "", toolerr.Inputf("unknown action %q: use %s.", in.Action, editSymbolActions)
 	}
 	if err != nil {
 		return "", err
@@ -446,11 +450,14 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 	case where != "end" && in.Name == "":
 		return nil, toolerr.Inputf("position=%q needs name (the symbol to place it relative to).", where)
 	}
+	var pkgNote []string // ESYM-005: where the package clause of a new file came from
 	if !exists {
 		if where != "end" {
 			return nil, toolerr.Inputf("%s does not exist; insert with position=end creates it.", in.FilePath)
 		}
-		text = "package " + packageFor(abs) + "\n"
+		pkg, from := packageSource(abs)
+		text = "package " + pkg + "\n"
+		pkgNote = []string{from}
 	}
 	wholeFile := false
 	if pk := gosrc.PackageName(source); pk != "" {
@@ -467,6 +474,9 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 			}
 			if strings.TrimSpace(body) == "" {
 				return nil, toolerr.Inputf("source has a package clause but no declaration.")
+			}
+			if declCount(body) == 0 {
+				return nil, toolerr.Inputf("source holds only comments; give a declaration.")
 			}
 			in.Imports = append(append([]string(nil), in.Imports...), imps...)
 			source = body
@@ -500,6 +510,9 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		if err := checkSnippet(source, nil); err != nil {
 			return nil, err
 		}
+		if declCount(source) == 0 {
+			return nil, toolerr.Inputf("source holds only comments; give a declaration.")
+		}
 		if d != nil && d.Grouped {
 			return nil, toolerr.Inputf("%s is inside a const/var/type block; place the new code relative to a standalone declaration.", in.Name)
 		}
@@ -529,23 +542,50 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 	if err != nil {
 		return nil, err
 	}
-	return planFile(abs, "insert into "+in.FilePath, next, text, exists, bom)
+	return planFile(abs, "insert into "+in.FilePath, next, text, exists, bom, pkgNote...)
 }
 
 // packageFor guesses the package clause of a new file from its siblings, else the directory name.
 func packageFor(abs string) string {
-	entries, _ := os.ReadDir(filepath.Dir(abs))
+	name, _ := packageSource(abs)
+	return name
+}
+
+// packageSource is packageFor with the reason for its choice, for the answer (ESYM-005): the package of a sibling
+// .go file (not a test), else the directory name, which the note says was taken because no sibling was usable.
+func packageSource(abs string) (name, from string) {
+	dir := filepath.Dir(abs)
+	entries, _ := os.ReadDir(dir)
+	tests := false
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".go" || strings.HasSuffix(e.Name(), "_test.go") {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".go" {
 			continue
 		}
-		if raw, err := os.ReadFile(filepath.Join(filepath.Dir(abs), e.Name())); err == nil {
+		if strings.HasSuffix(e.Name(), "_test.go") {
+			tests = true
+			continue
+		}
+		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
 			if n := gosrc.PackageName(string(raw)); n != "" {
-				return n
+				return n, fmt.Sprintf("package %s chosen from sibling file %s", n, e.Name())
 			}
 		}
 	}
-	return strings.NewReplacer("-", "_", ".", "_").Replace(filepath.Base(filepath.Dir(abs)))
+	name = strings.NewReplacer("-", "_", ".", "_").Replace(filepath.Base(dir))
+	if tests {
+		return name, fmt.Sprintf("package %s chosen from the directory name (the only sibling .go files are tests)", name)
+	}
+	return name, fmt.Sprintf("package %s chosen from the directory name (no sibling .go files)", name)
+}
+
+// declCount is the number of top-level declarations in src, a snippet without a package clause (an import
+// counts). Comments are not declarations: a comment-only snippet has none (ESYM-006).
+func declCount(src string) int {
+	f, _ := parser.ParseFile(token.NewFileSet(), "source.go", "package p\n"+src, parser.SkipObjectResolution)
+	if f == nil {
+		return 1 // not parsable: the syntax check refuses it, not this one
+	}
+	return len(f.Decls)
 }
 
 func deleteSymbol(ctx context.Context, w *Workspace, in editSymbolIn, prune bool) (*edits.EditPlan, string, error) {

@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -499,6 +500,11 @@ func changeSignature(ctx context.Context, w *Workspace, in changeSigIn) (string,
 	notes = append(notes, importNotes...)
 	if len(members) > 1 {
 		notes = append(notes, fmt.Sprintf("Changed %d interface/implementing method declarations together.", len(members)))
+		links, err := satisfactionNotes(ctx, w, root, members)
+		if err != nil {
+			return "", err
+		}
+		notes = append(notes, links...)
 	}
 	if n := skippedNote(skipped, sym.Name); n != "" {
 		notes = append(notes, n)
@@ -540,6 +546,146 @@ func listing(items []string) string {
 		return strings.Join(items, "; ")
 	}
 	return fmt.Sprintf("%s; and %d more", strings.Join(items[:5], "; "), len(items)-5)
+}
+
+// satisfactionNotes says why each member outside the root's directory changes with the root (SIG-001). Such a
+// member is reached through a type that satisfies both interfaces, and nothing in the file list shows that link:
+// "b.Store.Get changed too because a.Mem implements both a.Store and b.Store". Members of the root's own
+// directory need no note. Where the link is not that simple the note says only that the two are linked.
+func satisfactionNotes(ctx context.Context, w *Workspace, root member, members []member) ([]string, error) {
+	rootText, _, err := edits.ReadSource(root.path)
+	if err != nil {
+		return nil, err
+	}
+	rootOwner, _ := ifaceMethod(root.path, rootText, edits.Offset(rootText, root.line, root.col))
+	// The types that satisfy the root's interface directly (only meaningful when the root is an interface method).
+	direct := map[string]bool{}
+	if rootOwner != "" {
+		locs, err := w.Client.Implementation(ctx, root.path, root.line+1, root.col+1)
+		if err != nil {
+			return nil, err
+		}
+		for _, l := range locs {
+			direct[member{lsp.URIToPath(l.URI), l.Range.Start.Line, l.Range.Start.Character}.key()] = true
+		}
+	}
+	var notes []string
+	sat := map[string]map[string]bool{} // concrete member -> the members its implementations list (one query each)
+	for _, n := range members[1:] {
+		if filepath.Dir(n.path) == filepath.Dir(root.path) {
+			continue
+		}
+		nText, _, err := edits.ReadSource(n.path)
+		if err != nil {
+			return nil, err
+		}
+		nOwner, _ := ifaceMethod(n.path, nText, edits.Offset(nText, n.line, n.col))
+		nLabel := memberLabel(n.path, nText, n.line, n.col)
+		// gopls finds the interfaces a concrete method satisfies across packages, not the methods that satisfy an
+		// interface of another package: so the search starts from the concrete members outside n's directory.
+		var impl *member // a concrete member, outside n's directory, that satisfies n
+		for _, c := range members {
+			if filepath.Dir(c.path) == filepath.Dir(n.path) {
+				continue
+			}
+			cText, _, err := edits.ReadSource(c.path)
+			if err != nil {
+				return nil, err
+			}
+			if !isConcreteMethod(c.path, cText, c.line, c.col) {
+				continue
+			}
+			if sat[c.key()] == nil {
+				locs, err := w.Client.Implementation(ctx, c.path, c.line+1, c.col+1)
+				if err != nil {
+					return nil, err
+				}
+				sat[c.key()] = map[string]bool{}
+				for _, l := range locs {
+					sat[c.key()][member{lsp.URIToPath(l.URI), l.Range.Start.Line, l.Range.Start.Character}.key()] = true
+				}
+			}
+			if sat[c.key()][n.key()] {
+				impl = &c
+				break
+			}
+		}
+		switch {
+		case impl == nil || nOwner == "":
+			notes = append(notes, fmt.Sprintf("%s changed too: it is linked to %s through interface satisfaction.", nLabel, memberLabel(root.path, rootText, root.line, root.col)))
+		case rootOwner != "" && direct[impl.key()]:
+			implText, _, err := edits.ReadSource(impl.path)
+			if err != nil {
+				return nil, err
+			}
+			implType := typeLabel(impl.path, implText, impl.line, impl.col)
+			notes = append(notes, fmt.Sprintf("%s changed too because %s implements both %s.%s and %s.%s.",
+				nLabel, implType, gosrc.PackageName(rootText), rootOwner, gosrc.PackageName(nText), nOwner))
+		case rootOwner == "" && impl.key() == root.key():
+			notes = append(notes, fmt.Sprintf("%s changed too because %s satisfies %s.%s.",
+				nLabel, memberLabel(root.path, rootText, root.line, root.col), gosrc.PackageName(nText), nOwner))
+		default:
+			notes = append(notes, fmt.Sprintf("%s changed too: it is linked to %s through interface satisfaction.", nLabel, memberLabel(root.path, rootText, root.line, root.col)))
+		}
+	}
+	return notes, nil
+}
+
+// ifaceMethod names the interface type and the method that the identifier at byte offset off of src is in
+// ("Store", "Get"); both are "" when it is not an interface method.
+func ifaceMethod(path, src string, off int) (owner, method string) {
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	if f == nil {
+		return "", ""
+	}
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok {
+				continue
+			}
+			it, ok := ts.Type.(*ast.InterfaceType)
+			if !ok || it.Methods == nil {
+				continue
+			}
+			for _, field := range it.Methods.List {
+				for _, id := range field.Names {
+					if fset.Position(id.Pos()).Offset == off {
+						return ts.Name.Name, id.Name
+					}
+				}
+			}
+		}
+	}
+	return "", ""
+}
+
+// memberLabel names the member at line, col of path the way the note reads it: "b.Store.Get" for an interface
+// method, "a.Mem.Get" for a method, "a.Name" for a function.
+func memberLabel(path, src string, line, col int) string {
+	pkg := gosrc.PackageName(src)
+	if owner, name := ifaceMethod(path, src, edits.Offset(src, line, col)); owner != "" {
+		return pkg + "." + owner + "." + name
+	}
+	name := identAt(path, line, col)
+	if d, err := gosrc.FindDeclAt(path, src, edits.Offset(src, line, col)); err == nil && d.Method {
+		return pkg + "." + d.Recv + "." + name
+	}
+	return pkg + "." + name
+}
+
+// typeLabel names the receiver type of the method at line, col of path: "a.Mem".
+func typeLabel(path, src string, line, col int) string {
+	pkg := gosrc.PackageName(src)
+	if d, err := gosrc.FindDeclAt(path, src, edits.Offset(src, line, col)); err == nil && d.Method {
+		return pkg + "." + d.Recv
+	}
+	return pkg + "." + identAt(path, line, col)
 }
 
 // neededImports lists the imports the added types and values written into fs need and fs lacks.

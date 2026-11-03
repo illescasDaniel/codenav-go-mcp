@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,6 +16,13 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// toolActions lists, for a tool whose action parameter takes a fixed set of values, those values (ESYM-007: a
+// missing action names them).
+var toolActions = map[string]string{"edit_symbol": editSymbolActions}
+
+// argsNotObjectRE: the SDK's refusal of an arguments value that is not a JSON object (PROTO-006), e.g. [] or "x".
+var argsNotObjectRE = regexp.MustCompile(`unmarshaling arguments: json: cannot unmarshal .* into Go value of type map\[string\]`)
 
 // usages maps a tool name to a one-line parameter summary ("move(to_file, [name], [file_path], ...)").
 var usages = struct {
@@ -214,6 +222,9 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 			if msg == "" {
 				msg = friendlyDecodeError(tc.Text)
 			}
+			if msg == "" && argsNotObjectRE.MatchString(tc.Text) {
+				msg = "arguments must be a JSON object."
+			}
 			if msg != "" {
 				if usage != "" {
 					msg += " Usage: " + usage + " (parameters in brackets are optional)."
@@ -239,6 +250,9 @@ func FriendlyValidation(next mcp.MethodHandler) mcp.MethodHandler {
 			msg = fmt.Sprintf("%s is missing %s.", where, strings.Join(names, ", "))
 		}
 		if params, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok {
+			if acts := toolActions[params.Name]; acts != "" && slices.Contains(names, "action") {
+				msg += " action is one of: " + acts + "."
+			}
 			usages.Lock()
 			u := usages.m[params.Name]
 			usages.Unlock()
