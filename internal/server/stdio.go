@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -23,12 +24,62 @@ const maxFrame = mcp.DefaultMaxLineLength
 // the same way, since the SDK would end the session on it.
 func NewStdioTransport(in io.Reader, out io.Writer) *mcp.IOTransport {
 	w := &lockedWriter{w: out}
+	fr := &frameReader{r: bufio.NewReader(in), reply: w, inflight: &inflightSet{}}
 	return &mcp.IOTransport{
-		Reader:        io.NopCloser(&frameReader{r: bufio.NewReader(in), reply: w}),
-		Writer:        w,
+		Reader:        io.NopCloser(fr),
+		Writer:        &answerWriter{w: w, inflight: fr.inflight},
 		MaxLineLength: -1, // frameReader already caps a line
 	}
 }
+
+// inflightSet holds the ids of the requests read and not yet answered. The SDK keeps requests by id, so a
+// second request with an id still in use would replace the first and lose its answer.
+type inflightSet struct {
+	mu  sync.Mutex
+	ids map[jsonrpc.ID]bool
+}
+
+// add records id and reports false when it is already in flight.
+func (s *inflightSet) add(id jsonrpc.ID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ids[id] {
+		return false
+	}
+	if s.ids == nil {
+		s.ids = map[jsonrpc.ID]bool{}
+	}
+	s.ids[id] = true
+	return true
+}
+
+func (s *inflightSet) done(id jsonrpc.ID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.ids, id)
+}
+
+// answerWriter is the SDK's writer: a response it writes ends the request with that id.
+type answerWriter struct {
+	w        io.Writer
+	inflight *inflightSet
+}
+
+func (a *answerWriter) Write(p []byte) (int, error) {
+	for _, line := range bytes.Split(p, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if msg, err := jsonrpc.DecodeMessage(line); err == nil {
+			if resp, ok := msg.(*jsonrpc.Response); ok && resp.ID.IsValid() {
+				a.inflight.done(resp.ID)
+			}
+		}
+	}
+	return a.w.Write(p)
+}
+
+func (a *answerWriter) Close() error { return nil }
 
 // lockedWriter serialises the SDK's writes with the parse-error replies; each is one Write call.
 type lockedWriter struct {
@@ -52,6 +103,8 @@ type frameReader struct {
 	// noBatch is set once an initialize request names a protocol version without JSON-RPC batches. Until then
 	// the SDK's own default (batches allowed) applies.
 	noBatch bool
+	// inflight is shared with answerWriter; a request whose id is still in it is refused.
+	inflight *inflightSet
 	// notifBatched is set once a forwarded batch held a notification. The SDK never answers a notification, so
 	// it keeps the zero id of notifications in its batch table and refuses the next batch that holds one.
 	notifBatched bool
@@ -69,6 +122,10 @@ func (f *frameReader) Read(p []byte) (int, error) {
 		}
 		if code, msg, id := f.frameProblem(line); code != 0 {
 			f.replyError(code, msg, id)
+			continue
+		}
+		if id, ok := requestID(line); ok && !f.inflight.add(id) {
+			f.replyError(codeInvalidRequest, "duplicate request id", rawID(line))
 			continue
 		}
 		f.noteInitialize(line)
@@ -107,6 +164,31 @@ func nonBufferErr(err error) error {
 	return err
 }
 
+// requestID returns the id of a request object (a method and a non-null id); other lines are not tracked.
+func requestID(line []byte) (jsonrpc.ID, bool) {
+	if len(bytes.TrimSpace(line)) == 0 || bytes.TrimSpace(line)[0] != '{' {
+		return jsonrpc.ID{}, false
+	}
+	msg, err := jsonrpc.DecodeMessage(line)
+	if err != nil {
+		return jsonrpc.ID{}, false
+	}
+	req, ok := msg.(*jsonrpc.Request)
+	if !ok || !req.ID.IsValid() {
+		return jsonrpc.ID{}, false
+	}
+	return req.ID, true
+}
+
+// rawID returns the id member of a JSON object as written, for a reply to echo.
+func rawID(line []byte) json.RawMessage {
+	var req struct {
+		ID json.RawMessage `json:"id"`
+	}
+	_ = json.Unmarshal(line, &req)
+	return req.ID
+}
+
 // JSON-RPC error codes of the replies.
 const (
 	codeParseError     = -32700
@@ -118,6 +200,10 @@ const (
 func (f *frameReader) frameProblem(line []byte) (code int, msg string, id json.RawMessage) {
 	if bytes.Equal(line, []byte("\x00too long")) {
 		return codeParseError, "Parse error: message is too large", nil
+	}
+	if !utf8.Valid(line) {
+		// Refused, not repaired: a string with the bytes replaced by U+FFFD would be processed silently.
+		return codeParseError, "parse error: invalid UTF-8", nil
 	}
 	if !json.Valid(line) {
 		return codeParseError, "Parse error: the message is not valid JSON", nil

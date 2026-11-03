@@ -26,9 +26,9 @@ type Selector struct {
 }
 
 func resolve(p string) string {
-	if strings.HasPrefix(p, "~/") {
+	if p == "~" || strings.HasPrefix(p, "~/") {
 		if h, err := os.UserHomeDir(); err == nil {
-			p = filepath.Join(h, p[2:])
+			p = filepath.Join(h, p[1:])
 		}
 	}
 	if abs, err := filepath.Abs(p); err == nil {
@@ -51,6 +51,17 @@ func NewSelector(explicitEnv string) *Selector {
 	wd, _ := os.Getwd()
 	s.Base, s.BaseSource = resolve(wd), "cwd"
 	return s
+}
+
+// IsGoProject reports whether root itself holds a go.mod or a go.work, the files that make it a Go
+// workspace root. A directory without either gives gopls no module to load, so symbol answers are empty.
+func IsGoProject(root string) bool {
+	for _, name := range []string{"go.mod", "go.work"} {
+		if st, err := os.Stat(filepath.Join(root, name)); err == nil && !st.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Selector) Explain(source string) string {
