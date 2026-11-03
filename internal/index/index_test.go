@@ -137,6 +137,27 @@ func TestUncompiledFilesAreSkipped(t *testing.T) {
 	}
 }
 
+// BUG-SCALE-001: a Refresh that stops at MaxFiles reports Capped; one that finishes under the cap does not.
+func TestCappedAtMaxFiles(t *testing.T) {
+	old := MaxFiles
+	defer func() { MaxFiles = old }()
+	root := t.TempDir()
+	for _, f := range []string{"a/a.go", "b/b.go", "c/c.go"} {
+		write(t, root, f, "package p\n\nfunc F() {}\n")
+	}
+	MaxFiles = 2
+	ix := New(root)
+	_ = ix.Refresh()
+	if !ix.Capped() {
+		t.Error("3 files with MaxFiles 2: the index must report it stopped at the cap")
+	}
+	MaxFiles = 3
+	_ = ix.Refresh()
+	if ix.Capped() {
+		t.Error("3 files with MaxFiles 3: the index is complete and must not report a cap")
+	}
+}
+
 // A //line directive changes the line and file names the parser reports, not the text. The index keeps the
 // real position: a directive past the end of the file must not panic, a directive that renames the file or
 // a huge line number must not move the declaration, and the declaration is listed once.

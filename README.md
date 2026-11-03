@@ -45,7 +45,7 @@ from your home directory. Prebuilt binaries are attached to each GitHub release.
 | `outline` | What's in this file? |
 | `callers` | Who calls this function? (call hierarchy) |
 | `implementations` | Which types implement this interface, or which interfaces does this type satisfy? |
-| `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters). Exact and prefix matches come from an own declaration index, so they are never capped or missed; gopls adds the fuzzy ones |
+| `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters). Exact and prefix matches come from an own declaration index, so they are never capped or missed and give the count; gopls adds the fuzzy ones after them, as a labelled sample when it is capped at 100 |
 | `workspace` | Which directory is being navigated, and why |
 | `hover`, `definition`, `references` | Position tools: `file_path`, `line`, `column` (1-indexed). `diagnostics` takes `file_path` only |
 
@@ -130,9 +130,15 @@ constraints is invisible to the type check (the response says when an edit touch
   files, packages that are not built, a directory created a moment ago). A name declared in several files
   is therefore reported as ambiguous, each file with its build constraint (`build: //go:build !linux`),
   and `file_path` picks one; a declaration only in a constrained file is used as is, and write tools say
-  the type check cannot see it. `search_symbol` adds the index's exact and prefix matches to gopls's
-  (capped, fuzzy) answer, so those are never missing; the fuzzy tail is still gopls's, and the output is
-  still limited to 50 lines. Local variables and parameters are not indexed. A declaration from an
+  the type check cannot see it. `search_symbol` takes its count and its listed matches from the index's
+  exact and prefix hits, ordered by rank, path, line and column, so they are never missing. gopls's fuzzy
+  matches come after them: gopls returns at most 100 matches per query, so when it hits that cap those
+  fuzzy matches are a labelled sample and are not counted. The output is still limited to 50 lines. The
+  index stops at 30000 `.go` files; when it does, the answer says so and its counts are lower bounds.
+  A `path` is a workspace-relative directory or file prefix (`internal/` matches `internal/...`, not
+  `plugins/`), or a glob: a glob with no `/` matches base names (`*_test.go`), `**/` crosses directories.
+  An absolute path inside the workspace is accepted; one outside is refused as an input error.
+  `query` and `name` are aliases and must not differ. Local variables and parameters are not indexed. A declaration from an
   unsaved or non-`.go` source is not seen.
 - **New directories:** files written outside the tools are picked up on the next call. A brand-new
   package directory is loaded by opening one of its files, so the first call after creating it can

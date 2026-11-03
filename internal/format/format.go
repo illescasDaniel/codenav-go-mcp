@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -247,23 +248,97 @@ func symFile(s *lsp.Symbol) string {
 // Property/Field symbols (struct fields) rank after declarations within the same tier.
 var lowPriority = map[int]bool{7: true, 8: true}
 
-func Rank(symbols []*lsp.Symbol, query string) []*lsp.Symbol {
-	out := append([]*lsp.Symbol(nil), symbols...)
-	if query == "" {
-		return out
+// rankKey orders the symbols of an answer: the match tier first; then production code, test helpers
+// (testutils, testutil, testing, fake*, mock* directories) and _test.go files, in that order; declarations
+// before fields; packages outside internal/ before internal/; shallower packages first; exported names
+// first. The file, line, column, name and kind settle what is left, so the order never depends on the
+// order gopls answered in.
+type rankKey struct {
+	tier, level, field, internal, depth, unexported int
+	rel, name                                       string
+	line, col, kind                                 int
+}
+
+func rankKeyOf(s *lsp.Symbol, root, query string) rankKey {
+	rel := Relative(symFile(s), root)
+	_, line, col := SymbolPosition(s)
+	k := rankKey{tier: matchTier(s.Name, query), level: testLevel(rel), rel: rel, name: s.Name, line: line, col: col, kind: s.Kind}
+	if lowPriority[s.Kind] {
+		k.field = 1
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i], out[j]
-		ta, tb := matchTier(a.Name, query), matchTier(b.Name, query)
-		if ta != tb {
-			return ta < tb
+	if dir := path.Dir(rel); dir != "." {
+		parts := strings.Split(dir, "/")
+		k.depth = len(parts)
+		for _, p := range parts {
+			if p == "internal" {
+				k.internal = 1
+			}
 		}
-		xa, xb := IsTestPath(symFile(a)), IsTestPath(symFile(b))
-		if xa != xb {
-			return !xa
+	}
+	if r, _ := utf8.DecodeRuneInString(BaseName(s.Name)); !unicode.IsUpper(r) {
+		k.unexported = 1
+	}
+	return k
+}
+
+func (a rankKey) less(b rankKey) bool {
+	for _, p := range [...][2]int{{a.tier, b.tier}, {a.level, b.level}, {a.field, b.field}, {a.internal, b.internal}, {a.depth, b.depth}, {a.unexported, b.unexported}} {
+		if p[0] != p[1] {
+			return p[0] < p[1]
 		}
-		return !lowPriority[a.Kind] && lowPriority[b.Kind]
-	})
+	}
+	if a.rel != b.rel {
+		return a.rel < b.rel
+	}
+	if a.line != b.line {
+		return a.line < b.line
+	}
+	if a.col != b.col {
+		return a.col < b.col
+	}
+	if a.name != b.name {
+		return a.name < b.name
+	}
+	return a.kind < b.kind
+}
+
+// testLevel: 2 for a _test.go file, 1 for a file in a test-helper directory, 0 for the package's own code.
+func testLevel(rel string) int {
+	if IsTestPath(rel) {
+		return 2
+	}
+	for _, d := range strings.Split(path.Dir(rel), "/") {
+		if helperDir(d) {
+			return 1
+		}
+	}
+	return 0
+}
+
+// helperDir names the directories that hold test helpers rather than the package's own API.
+func helperDir(d string) bool {
+	return d == "testutils" || d == "testutil" || d == "testing" || strings.HasPrefix(d, "fake") || strings.HasPrefix(d, "mock")
+}
+
+// Rank orders symbols for an answer about query (see rankKey). root is the workspace the paths are shown
+// relative to. Without a query the order is the input's.
+func Rank(symbols []*lsp.Symbol, root, query string) []*lsp.Symbol {
+	if query == "" {
+		return append([]*lsp.Symbol(nil), symbols...)
+	}
+	type ranked struct {
+		k rankKey
+		s *lsp.Symbol
+	}
+	rs := make([]ranked, len(symbols))
+	for i, s := range symbols {
+		rs[i] = ranked{rankKeyOf(s, root, query), s}
+	}
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].k.less(rs[j].k) })
+	out := make([]*lsp.Symbol, len(rs))
+	for i, r := range rs {
+		out[i] = r.s
+	}
 	return out
 }
 
@@ -314,9 +389,20 @@ func ParseKindFilter(kind string) (map[int]bool, error) {
 	return want, nil
 }
 
+// pathMatches: a pattern with glob characters matches as path.Match does, except that a pattern without a
+// slash matches the base name in any directory and ** crosses directories. Any other pattern is a
+// workspace-relative directory or file: it matches itself and what lies below it, never a sibling that
+// only shares its spelling (p does not match plugins/).
 func pathMatches(rel, pattern string) bool {
 	pattern = strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(pattern), "\\", "/"), "./")
+	if pattern == "" {
+		return true
+	}
 	if strings.ContainsAny(pattern, "*?[") {
+		if !strings.Contains(pattern, "/") {
+			ok, _ := path.Match(pattern, path.Base(rel))
+			return ok
+		}
 		if ok, _ := path.Match(pattern, rel); ok {
 			return true
 		}
@@ -324,7 +410,44 @@ func pathMatches(rel, pattern string) bool {
 		ok, _ := path.Match(strings.ReplaceAll(pattern, "**/", ""), rel)
 		return ok || globStar(pattern, rel)
 	}
-	return strings.HasPrefix(rel, pattern)
+	pattern = strings.TrimSuffix(pattern, "/")
+	return rel == pattern || strings.HasPrefix(rel, pattern+"/")
+}
+
+// SearchPath turns search_symbol's path= into the workspace-relative form pathMatches compares. A path inside
+// the workspace is accepted as an absolute path or as a relative one that resolves through "." or "..";
+// one that resolves outside it is refused, since no symbol of the workspace can match it. "" and the
+// workspace itself mean no path filter.
+func SearchPath(root, p string) (string, error) {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	if p == "" || root == "" {
+		return p, nil
+	}
+	abs := filepath.Join(root, filepath.FromSlash(p))
+	if path.IsAbs(p) {
+		abs = filepath.Clean(filepath.FromSlash(p))
+	}
+	rel, err := filepath.Rel(root, abs)
+	rel = filepath.ToSlash(rel)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return "", toolerr.Inputf("path %q is outside the workspace %s; give a path inside it, relative to the workspace (a directory such as internal/, or a glob such as **/*_test.go)", p, root)
+	}
+	if rel == "." {
+		return "", nil
+	}
+	return rel, nil
+}
+
+// PathForm says how a path= filter was read, for an answer that the filter emptied.
+func PathForm(p string) string {
+	switch {
+	case !strings.ContainsAny(p, "*?["):
+		return "a workspace-relative directory or file prefix"
+	case !strings.Contains(p, "/"):
+		return "a glob matched against each file's base name"
+	default:
+		return "a glob matched against workspace-relative paths (** crosses directories)"
+	}
 }
 
 func globStar(pattern, rel string) bool {
@@ -366,43 +489,112 @@ func FilterByKindAndPath(symbols []*lsp.Symbol, root string, kinds map[int]bool,
 	return kept
 }
 
-// FormatWorkspaceSymbols: ranked, capped listing. Unless fuzzy, subsequence-only hits are hidden
-// whenever some name really contains the query.
+// FormatWorkspaceSymbols: ranked, capped listing of symbols that are all counted (see SearchSymbols).
 func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int, fuzzy bool) string {
-	if len(symbols) == 0 {
+	return SearchSymbols(symbols, nil, false, root, query, limit, fuzzy)
+}
+
+// isSubsequenceOnly: the query's letters appear in the name in order, but the name does not contain the query.
+func isSubsequenceOnly(s *lsp.Symbol, query string) bool {
+	return matchTier(s.Name, query) == fuzzyTier && !strings.Contains(strings.ToLower(s.Name), strings.ToLower(query))
+}
+
+func anyBelowFuzzy(list []*lsp.Symbol, query string) bool {
+	for _, s := range list {
+		if matchTier(s.Name, query) < fuzzyTier {
+			return true
+		}
+	}
+	return false
+}
+
+func withoutFuzzy(list []*lsp.Symbol, query string) []*lsp.Symbol {
+	var out []*lsp.Symbol
+	for _, s := range list {
+		if matchTier(s.Name, query) < fuzzyTier {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func countFuzzy(list []*lsp.Symbol, query string) int {
+	return len(list) - len(withoutFuzzy(list, query))
+}
+
+// SearchSymbols renders the answer to search_symbol. hits are the index's exact and prefix matches: they are
+// what the count is taken from. sample holds gopls's other matches, listed after the hits and filling the
+// slots they leave. When partial (gopls answered with its cap, so the sample is not everything it knows), the
+// sample is not counted and what it hides is not counted either. Which hits are shown or hidden depends on
+// the hits only.
+func SearchSymbols(hits, sample []*lsp.Symbol, partial bool, root, query string, limit int, fuzzy bool) string {
+	hits = dedupe(Rank(hits, root, query))
+	sample = dedupe(Rank(sample, root, query))
+	if len(hits)+len(sample) == 0 {
 		return ""
 	}
-	ranked := dedupe(Rank(symbols, query))
-	hidden := 0
-	if query != "" && !fuzzy {
-		var real []*lsp.Symbol
-		for _, s := range ranked {
-			if matchTier(s.Name, query) < fuzzyTier {
-				real = append(real, s)
-			}
-		}
-		if len(real) > 0 {
-			hidden = len(ranked) - len(real)
-			ranked = real
+	sampleCounted := !partial
+	type item struct {
+		s       *lsp.Symbol
+		counted bool
+	}
+	var items []item
+	add := func(list []*lsp.Symbol, counted bool) {
+		for _, s := range list {
+			items = append(items, item{s, counted})
 		}
 	}
-	weak := 0
-	if query != "" {
-		var w []*lsp.Symbol
-		ranked, w = dropWeak(ranked, query)
-		if fuzzy {
-			ranked = append(ranked, w...) // asked for: the weak matches are listed, last
-		} else {
-			weak = len(w)
+	hidden, hiddenSample := 0, 0 // subsequence-only matches hidden: counted, and in the sample
+	weak, weakSample := 0, 0     // matches neither prefix nor subsequence-compact: hidden in the default listing
+	if query == "" {
+		add(hits, true)
+		add(sample, sampleCounted)
+	} else {
+		hasReal := anyBelowFuzzy(hits, query)
+		kh, wh := dropWeak(hits, query)
+		ks, ws := dropWeak(sample, query)
+		switch {
+		case fuzzy:
+			add(kh, true)
+			add(wh, true)
+			add(ks, sampleCounted)
+			add(ws, sampleCounted)
+		case hasReal:
+			add(withoutFuzzy(kh, query), true)
+			add(withoutFuzzy(ks, query), sampleCounted)
+			hidden, hiddenSample = countFuzzy(kh, query)+len(wh), countFuzzy(ks, query)+len(ws)
+		default:
+			add(kh, true)
+			add(ks, sampleCounted)
+			weak, weakSample = len(wh), len(ws)
 		}
 	}
-	shown := ranked[:min(len(ranked), max(0, limit))]
-	lines := make([]string, len(shown))
-	for i, s := range shown {
-		lines[i] = FormatWorkspaceSymbol(s, root)
+	if sampleCounted {
+		hidden, weak = hidden+hiddenSample, weak+weakSample
+		hiddenSample, weakSample = 0, 0
 	}
-	if omitted := len(ranked) - len(shown); omitted > 0 {
-		lines = append(lines, fmt.Sprintf("… and %d more (showing first %d); narrow with kind=… or path=…", omitted, len(shown)))
+
+	counted := 0
+	for _, it := range items {
+		if it.counted {
+			counted++
+		}
+	}
+	shown := items[:min(len(items), max(0, limit))]
+	lines := make([]string, 0, len(shown)+4)
+	shownCounted := 0
+	for _, it := range shown {
+		line := FormatWorkspaceSymbol(it.s, root)
+		if query != "" && isSubsequenceOnly(it.s, query) {
+			line += "  (fuzzy)"
+		}
+		lines = append(lines, line)
+		if it.counted {
+			shownCounted++
+		}
+	}
+	if omitted := counted - shownCounted; omitted > 0 {
+		lines = append(lines, fmt.Sprintf("… and %d more (showing first %d); narrow with kind=… or path=…", omitted, shownCounted))
 	}
 	if hidden > 0 {
 		s := "es"
@@ -411,12 +603,21 @@ func FormatWorkspaceSymbols(symbols []*lsp.Symbol, root, query string, limit int
 		}
 		lines = append(lines, fmt.Sprintf("(%d looser fuzzy match%s whose names don't contain %q hidden; pass fuzzy=true to list them)", hidden, s, query))
 	}
+	if hiddenSample > 0 {
+		lines = append(lines, fmt.Sprintf("(some looser fuzzy matches whose names don't contain %q are hidden in the partial sample; pass fuzzy=true to list them)", query))
+	}
 	if weak > 0 {
 		what := "weak matches"
 		if weak == 1 {
 			what = "weak match"
 		}
 		lines = append(lines, fmt.Sprintf("(%d %s hidden; pass fuzzy=true to list them)", weak, what))
+	}
+	if weakSample > 0 {
+		lines = append(lines, "(some weak matches are hidden in the partial sample; pass fuzzy=true to list them)")
+	}
+	if partial && len(sample) > 0 {
+		lines = append(lines, fmt.Sprintf("(partial sample: gopls returns at most %d matches per query, so the fuzzy matches shown here are only a sample and are not counted; they may differ between runs)", lsp.WorkspaceSymbolCap))
 	}
 	return strings.Join(lines, "\n")
 }

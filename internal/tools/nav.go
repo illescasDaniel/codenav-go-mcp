@@ -125,31 +125,99 @@ func (w *Workspace) withConfigProblem(ctx context.Context, out string) string {
 	return out
 }
 
-// addIndexed adds the exact and prefix matches of the symbol index to gopls's (capped, build-config
-// bound) workspace symbols, so those cannot be missing; gopls's fuzzy results stay for the rest. A
-// declaration gopls already reported (same file and line) is not added twice.
-func addIndexed(w *Workspace, q string, have []*lsp.Symbol) []*lsp.Symbol {
-	if w.Index == nil {
-		return have
+// localHint is added to the not-found answer: the index holds no local variables or parameters.
+const localHint = " Local variables and parameters are not in the symbol index; use hover, definition or references at a use of the name."
+
+// searchQuery is the name search_symbol looks for: query, or its alias name. Two different values are refused,
+// since one of them would be ignored.
+func searchQuery(query, name string) (string, error) {
+	if query != "" && name != "" && query != name {
+		return "", toolerr.Inputf("query and name are aliases; pass one value (query=%q, name=%q)", query, name)
 	}
-	type key struct {
+	return params.ResolveName("CreateUser", params.Alias{Name: "query", Value: query}, params.Alias{Name: "name", Value: name})
+}
+
+// indexHits are the index's exact and prefix matches of q. The index reads every .go file below the root
+// whatever the build configuration (up to index.MaxFiles), so these are never capped or missed; they are
+// what a search_symbol answer is counted from.
+func indexHits(ix *index.Index, q string) []*lsp.Symbol {
+	if ix == nil {
+		return nil
+	}
+	var out []*lsp.Symbol
+	for _, e := range ix.Prefix(q) {
+		if s := resolve.FromEntry(e); !exclude.IsSyntheticName(s.Name) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// searchAnswer is the search_symbol answer for q. syms is gopls's workspace/symbol list, partial when gopls
+// answered with its cap (so it may not hold every fuzzy match). A gopls match whose file and line the index
+// already reports is the index's; the rest are the sample. kinds and pathF are the parsed kind filter and
+// the normalised path filter.
+func searchAnswer(root string, ix *index.Index, q string, syms []lsp.Symbol, partial bool, kinds map[int]bool, pathF string, fuzzy bool) string {
+	hits := indexHits(ix, q)
+	type declKey struct {
 		uri  string
 		line int
 	}
-	seen := map[key]bool{}
-	for _, s := range have {
-		if uri, l, _ := format.SymbolPosition(s); uri != "" {
-			seen[key{uri, l}] = true
+	seen := map[declKey]bool{}
+	for _, s := range hits {
+		uri, l, _ := format.SymbolPosition(s)
+		seen[declKey{uri, l}] = true
+	}
+	ptrs := make([]*lsp.Symbol, len(syms))
+	for i := range syms {
+		ptrs[i] = &syms[i]
+	}
+	var sample []*lsp.Symbol
+	for _, s := range dropNoise(ptrs) {
+		if uri, l, _ := format.SymbolPosition(s); !seen[declKey{uri, l}] {
+			sample = append(sample, s)
 		}
 	}
-	for _, e := range w.Index.Prefix(q) {
-		s := resolve.FromEntry(e)
-		if k := (key{s.Location.URI, e.Line}); !seen[k] {
-			seen[k] = true
-			have = append(have, s)
+	note := ""
+	if ix != nil && ix.Capped() {
+		note = fmt.Sprintf("\n(the symbol index holds only the first %d .go files below the workspace root; declarations in the rest are not listed, so the counts are lower bounds)", index.MaxFiles)
+	}
+	if len(hits)+len(sample) == 0 {
+		return fmt.Sprintf("No symbols matching %q.", shortQuery(q)) + localHint + note
+	}
+	kh := format.FilterByKindAndPath(hits, root, kinds, pathF)
+	ks := format.FilterByKindAndPath(sample, root, kinds, pathF)
+	if len(kh)+len(ks) == 0 {
+		total := len(hits)
+		if !partial {
+			total += len(sample)
+		}
+		msg := fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", shortQuery(q), total)
+		if pathF != "" {
+			msg += fmt.Sprintf(" The path %q was read as %s.", pathF, format.PathForm(pathF))
+		}
+		return msg + note
+	}
+	body := format.SearchSymbols(kh, ks, partial, root, q, format.DefaultSearchSymbolLimit, fuzzy)
+	if onlyNotes(body) {
+		// Only notes are left, the weak matches hidden: nothing matched, and a local variable is the usual reason.
+		return fmt.Sprintf("No symbols matching %q.", shortQuery(q)) + localHint + "\n" + body + note
+	}
+	return body + note
+}
+
+// onlyNotes reports whether a rendered answer has no symbol line: every line is a parenthesised note or an
+// ellipsis line, and a symbol line never starts with either.
+func onlyNotes(body string) bool {
+	if body == "" {
+		return false
+	}
+	for _, l := range strings.Split(body, "\n") {
+		if l != "" && !strings.HasPrefix(l, "(") && !strings.HasPrefix(l, "…") {
+			return false
 		}
 	}
-	return have
+	return true
 }
 
 // isCgoGenerated: a file cgo wrote into the go build cache.
@@ -356,7 +424,7 @@ type searchIn struct {
 	Query string `json:"query,omitempty"`
 	Name  string `json:"name,omitempty" jsonschema:"alias for query"`
 	Kind  string `json:"kind,omitempty" jsonschema:"comma-separated kinds: function,method,interface,struct,type,..."`
-	Path  string `json:"path,omitempty" jsonschema:"workspace-relative prefix or glob"`
+	Path  string `json:"path,omitempty" jsonschema:"workspace-relative directory or file prefix (internal/ matches internal/...; p does not match plugins/), or a glob (*_test.go matches the base name in any directory; **/*_test.go crosses directories); an absolute path inside the workspace is accepted"`
 	Fuzzy bool   `json:"fuzzy,omitempty"`
 }
 
@@ -572,27 +640,19 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", err
 			}
-			q, err := params.ResolveName("CreateUser", params.Alias{Name: "query", Value: in.Query}, params.Alias{Name: "name", Value: in.Name})
+			q, err := searchQuery(in.Query, in.Name)
 			if err != nil {
 				return "", err
 			}
-			syms, err := w.Client.WorkspaceSymbol(ctx, q)
+			pathF, err := format.SearchPath(w.Root, in.Path)
 			if err != nil {
 				return "", err
 			}
-			ptrs := make([]*lsp.Symbol, len(syms))
-			for i := range syms {
-				ptrs[i] = &syms[i]
+			syms, partial, err := w.Client.WorkspaceSymbolCapped(ctx, q)
+			if err != nil {
+				return "", err
 			}
-			ptrs = dropNoise(addIndexed(w, q, ptrs))
-			if len(ptrs) == 0 {
-				return fmt.Sprintf("No symbols matching %q.", shortQuery(q)), nil
-			}
-			kept := format.FilterByKindAndPath(ptrs, w.Root, kinds, in.Path)
-			if len(kept) == 0 {
-				return fmt.Sprintf("No symbols matching %q with the given kind/path filters (%d without them).", shortQuery(q), len(ptrs)), nil
-			}
-			return format.FormatWorkspaceSymbols(kept, w.Root, q, format.DefaultSearchSymbolLimit, in.Fuzzy), nil
+			return searchAnswer(w.Root, w.Index, q, syms, partial, kinds, pathF, in.Fuzzy), nil
 		})
 
 	add(s, h, "diagnostics", "gopls diagnostics (errors/warnings) for a single file.",

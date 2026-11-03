@@ -975,14 +975,25 @@ func (c *Client) References(ctx context.Context, path string, line, column int, 
 		map[string]any{"context": map[string]any{"includeDeclaration": includeDeclaration}})
 }
 
+// WorkspaceSymbolCap is gopls's limit on a workspace/symbol answer: a list this long may be cut short.
+const WorkspaceSymbolCap = 100
+
 func (c *Client) WorkspaceSymbol(ctx context.Context, query string) ([]Symbol, error) {
-	syms, err := decode[[]Symbol](c.Request(ctx, "workspace/symbol", map[string]any{"query": query}))
-	return dropGenerated(syms, func(s Symbol) string {
+	syms, _, err := c.WorkspaceSymbolCapped(ctx, query)
+	return syms, err
+}
+
+// WorkspaceSymbolCapped is WorkspaceSymbol and whether gopls answered with its full cap. The cap is judged
+// on gopls's raw list, before the generated cgo files are dropped from it.
+func (c *Client) WorkspaceSymbolCapped(ctx context.Context, query string) ([]Symbol, bool, error) {
+	raw, err := decode[[]Symbol](c.Request(ctx, "workspace/symbol", map[string]any{"query": query}))
+	capped := len(raw) >= WorkspaceSymbolCap
+	return dropGenerated(raw, func(s Symbol) string {
 		if s.Location == nil {
 			return ""
 		}
 		return s.Location.URI
-	}), err
+	}), capped, err
 }
 
 func (c *Client) DocumentSymbol(ctx context.Context, path string) ([]Symbol, error) {

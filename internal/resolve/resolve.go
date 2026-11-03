@@ -177,7 +177,7 @@ func (e *NotFoundError) Unwrap() error { return e.Err }
 
 // SymbolCap is gopls's limit on workspace/symbol results; a result list this long may have
 // dropped the exact match in favour of fuzzy ones.
-const SymbolCap = 100
+const SymbolCap = lsp.WorkspaceSymbolCap
 
 // lookup queries workspace/symbol for last (the final dotted part of query). When gopls's result
 // list is capped, the exact symbol can be missing ("U" among 800 "U0_n"), so it also asks for
@@ -341,7 +341,7 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		}
 	}
 	exact, loose, onlyIndex := merge(ix, query, exact, loose)
-	exact, loose = dedupeSymbols(format.Rank(exact, last)), dedupeSymbols(format.Rank(loose, last))
+	exact, loose = dedupeSymbols(format.Rank(exact, root, last)), dedupeSymbols(format.Rank(loose, root, last))
 	// A case-exact match beats a merely case-insensitive one.
 	cands := exact
 	folded := false

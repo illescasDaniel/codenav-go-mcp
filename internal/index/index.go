@@ -38,8 +38,9 @@ const (
 	KindStruct    = 23
 )
 
-// maxFiles bounds how many files one index holds (a pathological checkout should not stall every call).
-const maxFiles = 30000
+// MaxFiles bounds how many files one index holds (a pathological checkout should not stall every call). A
+// variable so a test can lower it.
+var MaxFiles = 30000
 
 // Entry is one declaration.
 type Entry struct {
@@ -78,6 +79,7 @@ type Index struct {
 	files  map[string]*fileRec
 	byQual map[string][]*Entry // lower-case Qual -> entries
 	all    []*Entry
+	capped bool // the last Refresh stopped at MaxFiles
 }
 
 // New returns an empty index for root; call Refresh to fill it.
@@ -100,6 +102,7 @@ func (ix *Index) Refresh() error {
 	seen := map[string]bool{}
 	changed := false
 	n := 0
+	ix.capped = false
 	_ = filepath.WalkDir(ix.root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -113,7 +116,8 @@ func (ix *Index) Refresh() error {
 		if !strings.HasSuffix(p, ".go") || strings.HasPrefix(d.Name(), "_") || strings.HasPrefix(d.Name(), ".") {
 			return nil // the go tool never compiles _x.go and .x.go
 		}
-		if n++; n > maxFiles {
+		if n++; n > MaxFiles {
+			ix.capped = true
 			return filepath.SkipAll
 		}
 		st, err := os.Stat(p)
@@ -156,6 +160,14 @@ func (ix *Index) rebuild() {
 			ix.all = append(ix.all, &es[i])
 		}
 	}
+}
+
+// Capped reports whether the last Refresh stopped at MaxFiles: the .go files after that point are not indexed,
+// so their declarations are missing from Prefix and Lookup.
+func (ix *Index) Capped() bool {
+	ix.mu.Lock()
+	defer ix.mu.Unlock()
+	return ix.capped
 }
 
 // Len is the number of indexed declarations.

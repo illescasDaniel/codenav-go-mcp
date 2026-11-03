@@ -39,6 +39,8 @@ func TestIsErrorContract(t *testing.T) {
 		want    string
 	}{
 		{"refused input: unknown kind", "search_symbol", map[string]any{"query": "Scale", "kind": "bogus"}, true, "unknown symbol kind"},
+		{"refused input: path outside the workspace", "search_symbol", map[string]any{"query": "Scale", "path": "/usr/lib/go/src/net"}, true, "outside the workspace"},
+		{"refused input: query and name differ", "search_symbol", map[string]any{"query": "Scale", "name": "Other"}, true, "aliases"},
 		{"refused input: missing argument", "symbol_info", map[string]any{}, true, "Pass `name`"},
 		{"refused input: file outside the workspace", "hover", map[string]any{"file_path": "../nope/x.go", "line": 1, "column": 1}, true, "outside the workspace"},
 		{"refused write: file outside the workspace", "edit", map[string]any{"file_path": "../nope/x.go", "new_text": "package nope\n", "apply": false}, true, "outside the workspace"},
