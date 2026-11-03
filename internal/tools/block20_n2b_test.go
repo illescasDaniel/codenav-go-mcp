@@ -139,7 +139,7 @@ func TestBlock20NReferencesAnswerAllDroppedAndMixed(t *testing.T) {
 		{URI: "file://" + filepath.ToSlash(dep)},
 	}
 	all := referencesAnswer(depLocs, root, dirs)
-	if !strings.Contains(all, "2 reference(s) inside dependencies not shown") || strings.Contains(all, "No references found") {
+	if !strings.Contains(all, "only 2 reference(s), all inside dependencies") || strings.Contains(all, "No references found") {
 		t.Errorf("all dependency references:\n%s", all)
 	}
 	mixed := referencesAnswer(append([]lsp.Location{{URI: "file://" + filepath.ToSlash(filepath.Join(root, "use.go"))}}, depLocs[0]), root, dirs)

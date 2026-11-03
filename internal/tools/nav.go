@@ -1547,7 +1547,7 @@ func referencesAnswer(locs []lsp.Location, root string, dirs toolchainDirs) stri
 	case deps == 0:
 		return splitTests(kept, root)
 	case len(kept) == 0:
-		return fmt.Sprintf("%d reference(s) inside dependencies not shown (references lists the workspace only).", deps)
+		return fmt.Sprintf("gopls returned only %d reference(s), all inside dependencies (not shown); it listed none in the workspace, which can be incomplete for a dependency symbol. Try references on a use site of the package qualifier, or search_symbol.", deps)
 	}
 	return splitTests(kept, root) + fmt.Sprintf("\n(%d reference(s) inside dependencies not shown)", deps)
 }
