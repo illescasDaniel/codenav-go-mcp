@@ -351,10 +351,13 @@ func readOnlyDesc(desc string, readOnly bool) string {
 	return undoTailRE.ReplaceAllString(desc, " (read-only server: previews only).")
 }
 
-// addWrite registers a tool that may change files.
+// addWrite registers a tool that may change files. It is destructive (it overwrites files) and closed-world; on a
+// read-only server it writes nothing, so it is read-only there.
 func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	registerUsage[In](name)
-	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: false}}
+	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{
+		ReadOnlyHint: readOnly, DestructiveHint: boolPtr(true), IdempotentHint: false, OpenWorldHint: boolPtr(false),
+	}}
 	if readOnly {
 		// `apply` stays in the schema (clients that always send it must keep working): apply=false previews,
 		// apply=true is refused with the diff.
@@ -706,7 +709,8 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 			})
 	}
 
-	addWrite(s, h, readOnly, "verify_changes", "Diagnostics delta of the uncommitted changes against git HEAD: new vs fixed errors in changed Go files and the packages importing them.",
+	// verify_changes writes nothing, so it is registered as a read tool.
+	add(s, h, "verify_changes", "Diagnostics delta of the uncommitted changes against git HEAD: new vs fixed errors in changed Go files and the packages importing them.",
 		func(ctx context.Context, w *Workspace, in verifyIn) (string, error) {
 			return verifyChanges(ctx, w, flag(in.IncludeDependents, true))
 		})
