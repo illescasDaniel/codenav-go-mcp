@@ -94,7 +94,11 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 		if warn != "" {
 			m.board.Post(warn)
 		}
-		c := lsp.New(lsp.Options{Root: sel.Root, Command: cmd, Language: "go", InitOptions: goplsSettings(), WatchSuffix: ".go", SkipDir: exclude.IsDirName, ExtraFolders: uncoveredDirs(sel.Root)})
+		root := sel.Root
+		c := lsp.New(lsp.Options{Root: root, Command: cmd, Language: "go", InitOptions: goplsSettings(), OnNotice: m.board.Post,
+			WatchSuffix: ".go", SkipDir: exclude.IsDirName, ExtraFolders: uncoveredDirs(root),
+			ConfigNames:      []string{"go.mod", "go.sum", "go.work", "go.work.sum"},
+			ExtraConfigFiles: func() []string { return gomod.ConfigFiles(root) }})
 		if err := c.Start(ctx); err != nil {
 			return nil, err
 		}

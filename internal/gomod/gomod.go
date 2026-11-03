@@ -449,3 +449,24 @@ func UncoveredModules(root string, skipDir func(name string) bool, limit int) []
 	})
 	return out
 }
+
+// ConfigFiles lists the module files gopls loads the workspace of root from that may lie outside root: the
+// go.mod and go.sum of each directory above it, and the go.work that governs it with its go.sum and the
+// go.mod and go.sum of each module it uses. Paths may repeat and may not exist.
+func ConfigFiles(root string) []string {
+	root = filepath.Clean(root)
+	var out []string
+	for d := root; ; d = filepath.Dir(d) {
+		out = append(out, filepath.Join(d, "go.mod"), filepath.Join(d, "go.sum"))
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	if work := findWork(root); work != "" {
+		out = append(out, work, work+".sum")
+		for d := range workUses(work) {
+			out = append(out, filepath.Join(d, "go.mod"), filepath.Join(d, "go.sum"))
+		}
+	}
+	return out
+}

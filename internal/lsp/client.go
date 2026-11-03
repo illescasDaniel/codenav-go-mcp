@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,20 @@ import (
 const PushDiagnosticsTimeout = 5 * time.Second
 
 const stderrTailLines = 10
+
+// stderrLineKeep is how much of a stderr line is kept; the rest of an over-long line is read and dropped.
+const stderrLineKeep = 1024
+
+// Stop waits this long for the shutdown reply, then for the exit, before the server is killed; a write
+// to its stdin that does not complete within stdinWriteTimeout means it stopped reading (wedged).
+const (
+	stopRequestTimeout = 2 * time.Second
+	stopExitWait       = 2 * time.Second
+	stdinWriteTimeout  = 3 * time.Second
+)
+
+// maxScanFiles caps the watched files a disk scan lists, so a huge tree cannot stall a call.
+const maxScanFiles = 50000
 
 var retryDelays = []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond}
 
@@ -55,13 +71,16 @@ type response struct {
 
 type openFile struct {
 	version int
-	mtimeNs int64
-	size    int64
+	sum     string // content hash of the text last sent to the server
 }
 
-// overlayMtime never equals a real mtime, so the next EnsureOpen after an
-// overlay ends re-reads the file from disk.
-const overlayMtime = -2
+// fileStamp is what a disk scan remembers about a file: its mtime and size, and for the module files a
+// content hash, since a rewrite can keep both the size and the mtime.
+type fileStamp struct {
+	mtimeNs int64
+	size    int64
+	sum     string
+}
 
 // Options configure a Client.
 type Options struct {
@@ -70,11 +89,17 @@ type Options struct {
 	Language string
 	// InitOptions is sent as initializationOptions (gopls settings).
 	InitOptions map[string]any
-	OnNotice    func(string)
+	// OnNotice receives a line for each server restart the client makes on its own.
+	OnNotice func(string)
 	// WatchSuffix (e.g. ".go") and SkipDir enable the disk scan in Refresh: files with the suffix
 	// that appeared, changed or vanished since the last call are reported to the server.
 	WatchSuffix string
 	SkipDir     func(name string) bool
+	// ConfigNames are the base names of the module files (go.mod, go.sum, go.work, go.work.sum) below
+	// Root whose content is hashed by the scan. ExtraConfigFiles lists more of them (absolute paths,
+	// e.g. the go.mod above Root), read on each scan.
+	ConfigNames      []string
+	ExtraConfigFiles func() []string
 	// ExtraFolders are directories below Root sent to the server as further workspace folders at
 	// start (modules the root's go.mod/go.work does not cover, which gopls would not index).
 	ExtraFolders []string
@@ -96,8 +121,9 @@ type Client struct {
 	started  bool
 	stderr   []string
 	exited   chan struct{}
-	snapshot map[string][2]int64 // watched files on disk at the last Refresh (path -> mtime, size)
-	extra    map[string]bool     // workspace folders besides the root that the server knows
+	snapshot map[string]fileStamp // watched files on disk at the last Refresh
+	configs  map[string]fileStamp // module files on disk at the last Refresh
+	extra    map[string]bool      // workspace folders besides the root that the server knows
 
 	writeMu sync.Mutex
 	// opMu serialises overlay() against refresh()/EnsureOpen from other tool calls.
@@ -190,15 +216,14 @@ func (c *Client) Start(ctx context.Context) error {
 	stderrDone := make(chan struct{})
 	go func() {
 		defer close(stderrDone)
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
+		readStderr(stderr, func(line string) {
 			c.mu.Lock()
-			c.stderr = append(c.stderr, sc.Text())
+			c.stderr = append(c.stderr, line)
 			if len(c.stderr) > stderrTailLines {
 				c.stderr = c.stderr[len(c.stderr)-stderrTailLines:]
 			}
 			c.mu.Unlock()
-		}
+		})
 	}()
 	go func() {
 		c.readLoop(bufio.NewReader(stdout))
@@ -258,7 +283,44 @@ func (c *Client) folders() []map[string]any {
 	return out
 }
 
-func sortedKeys(m map[string]bool) []string {
+// readStderr reads the server's stderr to EOF and passes each line to emit. A line over stderrLineKeep
+// bytes is cut to its prefix and marked " ...". The stream is always read to the end: a server whose
+// stderr nobody drains blocks on its next write and answers nothing.
+func readStderr(r io.Reader, emit func(string)) {
+	br := bufio.NewReader(r)
+	var line []byte
+	cut := false
+	for {
+		part, isPrefix, err := br.ReadLine()
+		if err != nil {
+			if len(line) > 0 || cut {
+				emit(string(line) + cutMark(cut))
+			}
+			return
+		}
+		if room := stderrLineKeep - len(line); room > 0 {
+			n := min(room, len(part))
+			line = append(line, part[:n]...)
+			cut = cut || n < len(part)
+		} else if len(part) > 0 {
+			cut = true
+		}
+		if isPrefix {
+			continue
+		}
+		emit(string(line) + cutMark(cut))
+		line, cut = line[:0], false
+	}
+}
+
+func cutMark(cut bool) string {
+	if cut {
+		return " ..."
+	}
+	return ""
+}
+
+func sortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -312,7 +374,7 @@ func (c *Client) Stop() error {
 	cmd, stdin, exited := c.cmd, c.stdin, c.exited
 	c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), stopRequestTimeout)
 	if _, err := c.requestOnce(ctx, "shutdown", nil); err == nil {
 		_ = c.Notify("exit", nil)
 	}
@@ -320,7 +382,7 @@ func (c *Client) Stop() error {
 	_ = stdin.Close()
 	select {
 	case <-exited:
-	case <-time.After(3 * time.Second):
+	case <-time.After(stopExitWait):
 		_ = cmd.Process.Kill()
 		<-exited
 	}
@@ -463,8 +525,24 @@ func (c *Client) send(obj any) error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if d, ok := stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = d.SetWriteDeadline(time.Now().Add(stdinWriteTimeout))
+	}
 	_, err = stdin.Write(append([]byte(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))), body...))
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		c.kill() // the server stopped reading its input: end it, so the next call starts a new one
+	}
 	return err
+}
+
+// kill ends the server process (its exit is then seen by Alive and the readLoop).
+func (c *Client) kill() {
+	c.mu.Lock()
+	cmd := c.cmd
+	c.mu.Unlock()
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 // Request sends a request, retrying on ContentModified / ServerCancelled.
@@ -556,22 +634,29 @@ func (c *Client) EnsureOpen(path string) (string, error) {
 		return uri, nil
 	}
 	known := c.open[uri]
+	var sum string
+	if known != nil {
+		sum = known.sum
+	}
 	c.mu.Unlock()
-	st, err := os.Stat(abs)
-	if err != nil {
-		return "", err
-	}
-	if known != nil && known.mtimeNs == st.ModTime().UnixNano() && known.size == st.Size() {
-		return uri, nil
-	}
+	// The content decides, not the mtime and size: a same-length rewrite that keeps the mtime is a change.
 	text, err := readDocumentText(abs)
 	if err != nil {
 		return "", err
 	}
-	return uri, c.syncText(uri, text, st.ModTime().UnixNano(), st.Size())
+	if known != nil && contentSum(text) == sum {
+		return uri, nil
+	}
+	return uri, c.syncText(uri, text)
 }
 
-func (c *Client) syncText(uri, text string, mtime, size int64) error {
+// contentSum is the content hash of a document or module file.
+func contentSum(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *Client) syncText(uri, text string) error {
 	c.mu.Lock()
 	known := c.open[uri]
 	if known == nil {
@@ -581,7 +666,7 @@ func (c *Client) syncText(uri, text string, mtime, size int64) error {
 	} else {
 		known.version++
 	}
-	known.mtimeNs, known.size = mtime, size
+	known.sum = contentSum(text)
 	version, isNew := known.version, known.version == 1
 	// A fresh sync invalidates the last pushed diagnostics: wait for the next ones.
 	delete(c.diags, uri)
@@ -624,10 +709,9 @@ func (c *Client) Overlay(ctx context.Context, texts map[string]string, fn func()
 			delete(c.overlays, uri)
 			c.mu.Unlock()
 			path := URIToPath(uri)
-			if st, err := os.Stat(path); err == nil {
-				if text, err := readDocumentText(path); err == nil {
-					_ = c.syncText(uri, text, st.ModTime().UnixNano(), st.Size())
-				}
+			text, rerr := readDocumentText(path)
+			if st, err := os.Stat(path); err == nil && st.Mode().IsRegular() && rerr == nil {
+				_ = c.syncText(uri, text)
 			} else {
 				_ = c.CloseDocument(uri)
 			}
@@ -639,7 +723,7 @@ func (c *Client) Overlay(ctx context.Context, texts map[string]string, fn func()
 		c.mu.Lock()
 		c.overlays[uri] = text
 		c.mu.Unlock()
-		if err := c.syncText(uri, text, overlayMtime, int64(len(text))); err != nil {
+		if err := c.syncText(uri, text); err != nil {
 			return err
 		}
 	}
@@ -657,12 +741,9 @@ func (c *Client) NoteWritten(paths []string) error {
 	defer c.opMu.Unlock()
 	var changes []map[string]any
 	c.mu.Lock()
-	var before map[string][2]int64
-	if c.snapshot != nil {
-		before = make(map[string][2]int64, len(c.snapshot))
-		for k, v := range c.snapshot {
-			before[k] = v
-		}
+	before := make(map[string]fileStamp, len(c.snapshot))
+	for k, v := range c.snapshot {
+		before[k] = v
 	}
 	c.mu.Unlock()
 	for _, p := range paths {
@@ -672,28 +753,17 @@ func (c *Client) NoteWritten(paths []string) error {
 		p = filepath.Clean(p)
 		uri := PathToURI(c.docPath(p))
 		st, err := os.Stat(p)
+		regular := err == nil && st.Mode().IsRegular()
+		isConfig := c.isConfigName(filepath.Base(p))
 		c.mu.Lock()
-		if c.snapshot == nil {
-			c.snapshot = map[string][2]int64{}
-		}
-		_, was := c.snapshot[p]
-		typ := 3
-		if err == nil {
-			c.snapshot[p] = [2]int64{st.ModTime().UnixNano(), st.Size()}
-			typ = 1
-			if was {
-				typ = 2
-			}
-		} else {
-			delete(c.snapshot, p)
-		}
+		typ := c.record(p, st, regular, isConfig)
 		_, isOpen := c.open[uri]
 		c.mu.Unlock()
 		if isOpen {
-			if err != nil {
+			if !regular {
 				_ = c.CloseDocument(uri)
 			} else if text, rerr := readDocumentText(p); rerr == nil {
-				_ = c.syncText(uri, text, st.ModTime().UnixNano(), st.Size())
+				_ = c.syncText(uri, text)
 			}
 		}
 		changes = append(changes, map[string]any{"uri": uri, "type": typ})
@@ -702,13 +772,57 @@ func (c *Client) NoteWritten(paths []string) error {
 		return err
 	}
 	c.mu.Lock()
-	now := make(map[string][2]int64, len(c.snapshot))
+	now := make(map[string]fileStamp, len(c.snapshot))
 	for k, v := range c.snapshot {
 		now[k] = v
 	}
 	c.mu.Unlock()
 	c.loadNewDirs(newDirFiles(before, now))
 	return nil
+}
+
+// record stamps p in the scan that holds it (module files in configs, the rest in snapshot) and returns the
+// didChangeWatchedFiles type for it. A path that is not a regular file (missing, or a directory now) counts as
+// deleted. The caller holds c.mu.
+func (c *Client) record(p string, st os.FileInfo, regular, isConfig bool) int {
+	table := &c.snapshot
+	if isConfig {
+		table = &c.configs
+	}
+	if *table == nil {
+		*table = map[string]fileStamp{}
+	}
+	_, was := (*table)[p]
+	if !regular {
+		delete(*table, p)
+		return 3
+	}
+	(*table)[p] = stampOf(p, st, isConfig)
+	if was {
+		return 2
+	}
+	return 1
+}
+
+// isConfigName reports whether a base name is one of the module files whose content is hashed.
+func (c *Client) isConfigName(name string) bool {
+	for _, n := range c.opts.ConfigNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// stampOf stamps the file at p from its info. Module files also get a content hash.
+func stampOf(p string, info os.FileInfo, hashed bool) fileStamp {
+	s := fileStamp{mtimeNs: info.ModTime().UnixNano(), size: info.Size()}
+	if hashed {
+		if b, err := os.ReadFile(p); err == nil {
+			s.sum = contentSum(string(b))
+		}
+	}
+	return s
 }
 
 // docPath is absPath for a path that may not exist yet: its directory is resolved instead.
@@ -998,44 +1112,76 @@ func (c *Client) CodeActions(ctx context.Context, path string, rng Range, only [
 		map[string]any{"textDocument": map[string]any{"uri": uri}, "range": rng, "context": ctxt}))
 }
 
-// scanDisk lists the watched files below the root, capped so a huge tree cannot stall a call.
-func (c *Client) scanDisk() map[string][2]int64 {
-	out := map[string][2]int64{}
-	if c.opts.WatchSuffix == "" {
-		return out
+// scanDisk lists the watched files below the root, capped so a huge tree cannot stall a call, and the
+// module files: the ConfigNames below the root and the ExtraConfigFiles. Module files carry content hashes.
+func (c *Client) scanDisk() (files, configs map[string]fileStamp) {
+	files, configs = map[string]fileStamp{}, map[string]fileStamp{}
+	if c.opts.WatchSuffix != "" || len(c.opts.ConfigNames) > 0 {
+		_ = filepath.WalkDir(c.opts.Root, func(p string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				if p != c.opts.Root && c.opts.SkipDir != nil && c.opts.SkipDir(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			info, ierr := d.Info()
+			if ierr != nil {
+				return nil
+			}
+			switch {
+			case c.isConfigName(d.Name()):
+				configs[p] = stampOf(p, info, true)
+			case c.opts.WatchSuffix != "" && strings.HasSuffix(p, c.opts.WatchSuffix):
+				files[p] = stampOf(p, info, false)
+				if len(files) >= maxScanFiles {
+					return filepath.SkipAll
+				}
+			}
+			return nil
+		})
 	}
-	_ = filepath.WalkDir(c.opts.Root, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if p != c.opts.Root && c.opts.SkipDir != nil && c.opts.SkipDir(d.Name()) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if strings.HasSuffix(p, c.opts.WatchSuffix) {
-			if info, ierr := d.Info(); ierr == nil {
-				out[p] = [2]int64{info.ModTime().UnixNano(), info.Size()}
+	if c.opts.ExtraConfigFiles != nil {
+		for _, p := range c.opts.ExtraConfigFiles() {
+			if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+				configs[p] = stampOf(p, info, true)
 			}
 		}
-		if len(out) >= 50000 {
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return out
+	}
+	return files, configs
 }
 
-// Refresh brings the server's view up to date with the disk: open files that changed are re-read,
-// and files created, changed or deleted behind its back are reported via didChangeWatchedFiles.
+// ConfigFingerprint is a stable digest of the module files gopls loads the workspace from (the ConfigNames
+// below the root and the ExtraConfigFiles), read from the disk now: sorted root-relative paths with content
+// hashes and no mtimes. It changes exactly when one of those files changes content, appears or disappears.
+// The environment (GOWORK, GOFLAGS, ...) is not part of it.
+func (c *Client) ConfigFingerprint() string {
+	_, configs := c.scanDisk()
+	h := sha256.New()
+	for _, p := range sortedKeys(configs) {
+		rel, err := filepath.Rel(c.opts.Root, p)
+		if err != nil {
+			rel = p
+		}
+		fmt.Fprintf(h, "%s\x00%s\n", filepath.ToSlash(rel), configs[p].sum)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Refresh brings the server's view up to date with the disk: open files that changed are re-synced, and
+// files created, changed or deleted behind its back are reported via didChangeWatchedFiles. An open file
+// that was replaced by a directory (or removed) is closed. A module file whose content changed while its
+// mtime did not, or that was removed, is not reported: gopls keys its view of such a file on the mtime and
+// would ignore the event, so the server is restarted instead.
 func (c *Client) Refresh() error {
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
-	now := c.scanDisk()
+	now, configs := c.scanDisk()
 	c.mu.Lock()
-	prev := c.snapshot
-	c.snapshot = now
+	prev, prevConfigs := c.snapshot, c.configs
+	c.snapshot, c.configs = now, configs
 	var stale []string
 	var changes []map[string]any
 	seen := map[string]bool{}
@@ -1043,18 +1189,20 @@ func (c *Client) Refresh() error {
 		if _, ok := c.overlays[uri]; ok {
 			continue
 		}
-		seen[URIToPath(uri)] = true
-		st, err := os.Stat(URIToPath(uri))
-		if err != nil {
+		p := URIToPath(uri)
+		seen[p] = true
+		st, err := os.Stat(p)
+		if err != nil || !st.Mode().IsRegular() {
 			stale = append(stale, uri)
 			changes = append(changes, map[string]any{"uri": uri, "type": 3})
 			continue
 		}
-		if f.mtimeNs != st.ModTime().UnixNano() || f.size != st.Size() {
+		if text, err := readDocumentText(p); err == nil && contentSum(text) != f.sum {
 			changes = append(changes, map[string]any{"uri": uri, "type": 2})
 		}
 	}
 	c.mu.Unlock()
+	restart := false
 	if prev != nil {
 		for p, v := range now {
 			switch old, ok := prev[p]; {
@@ -1069,6 +1217,24 @@ func (c *Client) Refresh() error {
 				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 3})
 			}
 		}
+		for p, v := range configs {
+			switch old, ok := prevConfigs[p]; {
+			case !ok:
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 1})
+			case old.sum != v.sum:
+				restart = restart || old.mtimeNs == v.mtimeNs
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 2})
+			}
+		}
+		for p := range prevConfigs {
+			if _, ok := configs[p]; !ok {
+				restart = true
+				changes = append(changes, map[string]any{"uri": PathToURI(p), "type": 3})
+			}
+		}
+	}
+	if restart {
+		return c.restartForModuleFiles()
 	}
 	for _, uri := range stale {
 		_ = c.CloseDocument(uri)
@@ -1082,10 +1248,8 @@ func (c *Client) Refresh() error {
 			uri := ch["uri"].(string)
 			if f := c.openFileFor(uri); f {
 				p := URIToPath(uri)
-				if st, err := os.Stat(p); err == nil {
-					if text, err := readDocumentText(p); err == nil {
-						_ = c.syncText(uri, text, st.ModTime().UnixNano(), st.Size())
-					}
+				if text, err := readDocumentText(p); err == nil {
+					_ = c.syncText(uri, text)
 				}
 			}
 		}
@@ -1095,6 +1259,23 @@ func (c *Client) Refresh() error {
 	}
 	c.loadNewDirs(newDirs)
 	return nil
+}
+
+// restartForModuleFiles restarts a started server so it loads the module files that changed in place. The
+// open documents are gone with the old process; the next call opens them again.
+func (c *Client) restartForModuleFiles() error {
+	c.mu.Lock()
+	started := c.started
+	c.mu.Unlock()
+	if !started {
+		return nil
+	}
+	if c.opts.OnNotice != nil {
+		c.opts.OnNotice("go.mod, go.sum or go.work changed on disk; restarting gopls")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return c.Restart(ctx)
 }
 
 // loadNewDirs makes gopls load the packages of files created in directories it did not know.
@@ -1117,7 +1298,7 @@ const maxNewDirOpens = 50
 
 // newDirFiles picks one file in each directory that has watched files now but had none at the last
 // scan. prev == nil (the first scan) yields nothing: gopls loads the initial tree itself.
-func newDirFiles(prev, now map[string][2]int64) []string {
+func newDirFiles(prev, now map[string]fileStamp) []string {
 	if prev == nil {
 		return nil
 	}
