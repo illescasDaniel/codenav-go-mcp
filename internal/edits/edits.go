@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
@@ -381,7 +382,28 @@ func CountChanged(c FileChange) (added, removed int) {
 	return
 }
 
+// maxShownLine is the longest line an answer shows in full (a diff, a quoted closest line); a longer one is cut.
+const maxShownLine = 200
+
+// ClipLine cuts a line longer than maxShownLine runes (a generated literal, a minified file) and says how many
+// characters it left out, so an answer that quotes it stays readable.
+func ClipLine(s string) string {
+	n := 0
+	for i := range s {
+		if n == maxShownLine {
+			return s[:i] + fmt.Sprintf("... (%d more characters)", utf8.RuneCountInString(s[i:]))
+		}
+		n++
+	}
+	return s
+}
+
 func UnifiedDiff(c FileChange, root string, context int) string {
+	return unifiedDiff(c, root, context, false)
+}
+
+// unifiedDiff is UnifiedDiff; with clip, lines longer than maxShownLine are cut (see RefusedDiff).
+func unifiedDiff(c FileChange, root string, context int, clip bool) string {
 	name := RelativeName(c.Path, root)
 	from, to := "a/"+name, "b/"+name
 	if c.Old == nil {
@@ -444,7 +466,11 @@ func UnifiedDiff(c FileChange, root string, context int) string {
 		fmt.Fprintf(&sb, "@@ -%d,%d +%d,%d @@\n", os, oc, ns, nc)
 		for _, x := range ops[start:end] {
 			sb.WriteByte(x.kind)
-			sb.WriteString(strings.TrimSuffix(x.text, "\n"))
+			line := strings.TrimSuffix(x.text, "\n")
+			if clip {
+				line = ClipLine(line)
+			}
+			sb.WriteString(line)
 			sb.WriteByte('\n')
 			if !strings.HasSuffix(x.text, "\n") {
 				sb.WriteString(noNewlineMarker + "\n")
@@ -466,9 +492,19 @@ func (p *EditPlan) Summary(root string) string {
 }
 
 func (p *EditPlan) Diff(root string, context, maxLines int) string {
+	return p.diff(root, context, maxLines, false)
+}
+
+// RefusedDiff is Diff for an answer that refuses the write (EDIT-010): a line longer than maxShownLine is cut,
+// so a 200 KB line in the file does not reach the answer whole. A preview keeps Diff; the answer cap bounds it.
+func (p *EditPlan) RefusedDiff(root string, context, maxLines int) string {
+	return p.diff(root, context, maxLines, true)
+}
+
+func (p *EditPlan) diff(root string, context, maxLines int, clip bool) string {
 	var sb strings.Builder
 	for _, c := range p.Changes {
-		sb.WriteString(UnifiedDiff(c, root, context))
+		sb.WriteString(unifiedDiff(c, root, context, clip))
 	}
 	lines := strings.Split(sb.String(), "\n")
 	if len(lines) <= maxLines {

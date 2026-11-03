@@ -29,12 +29,22 @@ const ReadOnlyEnv = "CODENAV_GO_MCP_READ_ONLY"
 // GoGuardRule is the Go-specific part of the write guard: only .go files, never generated ones.
 func GoGuardRule(c edits.FileChange) error {
 	if filepath.Ext(c.Path) != ".go" {
-		return toolerr.Inputf("%s is not a .go file", filepath.Base(c.Path))
+		return toolerr.Inputf("%s", notGoFile(filepath.Base(c.Path)))
 	}
 	if c.Old != nil && gosrc.IsGenerated(*c.Old) {
 		return generatedRefusal(c.Path)
 	}
 	return nil
+}
+
+// notGoFile is the refusal for a file the write tools do not edit (EDIT-008): it says what the file is and
+// where to make the change instead. name is the file as the caller named it.
+func notGoFile(name string) string {
+	switch filepath.Base(name) {
+	case "go.mod", "go.work", "go.sum":
+		return fmt.Sprintf("%s is a module file, not Go source: edit it with your normal file tools (this server edits only .go files).", name)
+	}
+	return fmt.Sprintf("%s is not a .go file: edit it with your normal file tools (this server edits only .go files).", name)
 }
 
 // generatedRefusal is the refusal for a generated file (the write guard and quick_fix's up-front check).
@@ -91,6 +101,12 @@ func finishPlan(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply b
 
 // finishPlanID is finishPlan that also returns the id of the edit when it was written ("" otherwise).
 func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply bool, maxNew int, includeDeps, allowLarge bool) (string, string, error) {
+	return finishPlanWith(ctx, w, plan, apply, maxNew, includeDeps, allowLarge, nil)
+}
+
+// finishPlanWith is finishPlanID with the hints of the tool that made the plan: tool, when set, names the next
+// step for the new errors of the simulated edit, after the hints every tool gets (refusalHints).
+func finishPlanWith(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply bool, maxNew int, includeDeps, allowLarge bool, tool func(diagdelta.Delta) []string) (string, string, error) {
 	if len(plan.Changes) == 0 {
 		return "No changes: the edit leaves the code as it is.", "", nil
 	}
@@ -113,7 +129,61 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 	// Recorded after the simulation, the state the check ran under: a Go configuration change before the write
 	// refuses the plan (txn.CheckFresh).
 	plan.ConfigFP = gomod.Fingerprint(w.Root)
-	return conclude(w, plan, delta, apply, maxNew, allowLarge, nil)
+	hints := refusalHints(plan.Description, delta)
+	if tool != nil {
+		hints = append(hints, tool(delta)...)
+	}
+	return conclude(w, plan, delta, apply, maxNew, allowLarge, nil, hints)
+}
+
+// refusalHints are the next steps for the new errors of a simulated edit, one per kind of error: the diagnostic
+// says what is wrong, the hint names the call that fixes it. desc is the plan's description ("delete X" for a
+// delete).
+func refusalHints(desc string, delta diagdelta.Delta) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, e := range delta.NewErrors() {
+		if seen[e.Code] {
+			continue
+		}
+		switch {
+		case e.Code == "InvalidIfaceAssign":
+			// ESYM-003: a value no longer implements an interface its type is asserted to satisfy.
+			out = append(out, "quick_fix can declare the missing method in the implementer (quick_fix with file_path and the line of the error).")
+		case e.Code == "UnusedImport" && strings.HasPrefix(desc, "delete "):
+			// ESYM-004: a delete keeps the imports only it used when prune_imports is false.
+			out = append(out, "if prune_imports is false, pass prune_imports=true to drop the import the delete leaves unused; otherwise remove it with quick_fix organize_imports=true.")
+		default:
+			continue
+		}
+		seen[e.Code] = true
+	}
+	return out
+}
+
+// editImportHints is the edit tool's hint for an import error (EDIT-004). edit never adds or removes imports
+// (a guess between same-named packages could compile and be wrong), so the answer says where the change goes.
+func editImportHints(plan *edits.EditPlan, delta diagdelta.Delta) []string {
+	for _, e := range delta.NewErrors() {
+		if e.Code == "UnusedImport" || (e.Code == "UndeclaredName" && usesQualifier(plan, e.Message)) {
+			return []string{"edit does not manage imports: put the import change in the same edit (old_string spanning the import block, or new_text), or write with max_new_errors=1 and run quick_fix(file_path, organize_imports=true)."}
+		}
+	}
+	return nil
+}
+
+// usesQualifier reports whether an "undefined: X" message names a package that the new text uses as X.
+func usesQualifier(plan *edits.EditPlan, msg string) bool {
+	name, ok := strings.CutPrefix(msg, "undefined: ")
+	if !ok || name == "" {
+		return false
+	}
+	for _, c := range plan.Changes {
+		if c.New != nil && strings.Contains(*c.New, name+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // unformattedNotes names the modified files that were not gofmt-clean before the edit and are not now:
@@ -214,13 +284,16 @@ func nestedModuleNotes(ctx context.Context, root string, plan *edits.EditPlan, p
 
 // conclude writes plan when apply is set and its new errors stay within maxNew, and answers with the diagnostics,
 // the notes and the outcome. overridden are the holds a write past them (apply_edit) goes through: restated
-// before Applied, so the reply never reads as if nothing was held.
-func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool, overridden []string) (string, string, error) {
+// before Applied, so the reply never reads as if nothing was held. hints are the next steps for the new errors.
+func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply bool, maxNew int, allowLarge bool, overridden, hints []string) (string, string, error) {
 	var out []string
 	editID := ""
 	out = append(out, plan.Description, plan.Summary(w.Root), "", diagdelta.Format(delta, 15))
 	for _, n := range plan.Notes {
 		out = append(out, "Note: "+n)
+	}
+	for _, h := range hints {
+		out = append(out, "Hint: "+h)
 	}
 	newErrs := len(delta.NewErrors())
 	readOnly := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv) != nil
@@ -232,12 +305,12 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
 		out = append(out, "", "Not written: "+strings.Join(plan.Holds, " ")+fmt.Sprintf(" Preview id %s; call apply_edit(id=%q%s) to write it anyway.", id, id, largeArg(w, plan)))
-		out = append(out, "", plan.Diff(w.Root, 2, 120))
+		out = append(out, "", plan.RefusedDiff(w.Root, 2, 120))
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
 			// The diff still goes with the refusal: a read-only server exists to show what would change.
 			refused = true
-			out = append(out, "", "Not written: "+err.Error(), "", plan.Diff(w.Root, 2, 200))
+			out = append(out, "", "Not written: "+err.Error(), "", plan.RefusedDiff(w.Root, 2, 200))
 			break
 		}
 		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
@@ -260,13 +333,13 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
 	case apply && readOnly:
 		refused = true
-		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s, and write tools are disabled (%s).", newErrs, maxErrors(maxNew), ReadOnlyEnv), "", plan.Diff(w.Root, 2, 120))
+		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s, and write tools are disabled (%s).", newErrs, maxErrors(maxNew), ReadOnlyEnv), "", plan.RefusedDiff(w.Root, 2, 120))
 	case apply:
 		refused = true
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Not written: %s exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q%s) to write it anyway.", newErrorsText(delta), maxErrors(maxNew), id, id, largeArg(w, plan)))
-		out = append(out, "", plan.Diff(w.Root, 2, 120))
+		out = append(out, "", plan.RefusedDiff(w.Root, 2, 120))
 	case readOnly:
 		out = append(out, "", "Preview only (apply=false); write tools are disabled ("+ReadOnlyEnv+").")
 		if maxNew >= 0 && newErrs > maxNew {
@@ -404,7 +477,7 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		return nil, err
 	}
 	if filepath.Ext(abs) != ".go" {
-		return nil, toolerr.Argf("%q is not a .go file.", in.FilePath)
+		return nil, toolerr.Argf("%s", notGoFile(in.FilePath))
 	}
 	old, bom, rerr := edits.ReadSource(abs)
 	exists := rerr == nil
@@ -431,9 +504,9 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		n := strings.Count(hay, needle)
 		switch {
 		case n == 0:
-			return nil, toolerr.Argf("old_string was not found in %s (it must match exactly, including whitespace).", in.FilePath)
+			return nil, toolerr.Argf("%s", notFoundText(hay, needle, in.FilePath))
 		case n > 1 && !in.ReplaceAll:
-			return nil, toolerr.Argf("old_string matches %d times in %s; add context to make it unique or pass replace_all=true.", n, in.FilePath)
+			return nil, toolerr.Argf("old_string matches %d times in %s (%s); add context to make it unique or pass replace_all=true.", n, in.FilePath, matchLines(hay, needle))
 		}
 		count := 1
 		if in.ReplaceAll {
@@ -444,6 +517,58 @@ func planEdit(w *Workspace, in editIn) (*edits.EditPlan, error) {
 		return nil, toolerr.Inputf("pass either old_string + new_string or the complete new_text.")
 	}
 	return planFile(abs, "edit "+in.FilePath, next, old, exists, bom)
+}
+
+// notFoundText is the refusal for an old_string the file does not contain (EDIT-003). It quotes the closest line
+// when the first line of old_string matches one after whitespace is normalised, and says Go files are
+// tab-indented when old_string starts with spaces.
+func notFoundText(hay, needle, file string) string {
+	msg := fmt.Sprintf("old_string was not found in %s (it must match exactly, including whitespace).", file)
+	first := ""
+	for _, l := range strings.Split(needle, "\n") {
+		if strings.TrimSpace(l) != "" {
+			first = l
+			break
+		}
+	}
+	if first == "" {
+		return msg
+	}
+	if strings.HasPrefix(first, " ") {
+		msg += " Go files are indented with tabs, and old_string starts with spaces: copy the indentation from the file."
+	}
+	key := strings.Join(strings.Fields(first), " ")
+	for i, l := range strings.Split(hay, "\n") {
+		if strings.Join(strings.Fields(l), " ") == key {
+			return msg + fmt.Sprintf(" The closest line is %d: %s", i+1, edits.ClipLine(fmt.Sprintf("%q", l)))
+		}
+	}
+	return msg
+}
+
+// matchLines names the lines the matches of a non-unique old_string start on (EDIT-002), so the caller can
+// add context that tells them apart. It counts matches the way strings.Count does (non-overlapping).
+func matchLines(hay, needle string) string {
+	const shown = 10
+	var nums []string
+	count := 0
+	for pos := 0; ; {
+		i := strings.Index(hay[pos:], needle)
+		if i < 0 {
+			break
+		}
+		at := pos + i
+		count++
+		if len(nums) < shown {
+			nums = append(nums, fmt.Sprint(strings.Count(hay[:at], "\n")+1))
+		}
+		pos = at + len(needle)
+	}
+	s := "lines " + strings.Join(nums, ", ")
+	if count > shown {
+		s += fmt.Sprintf(" and %d more", count-shown)
+	}
+	return s
 }
 
 // pkgOfFile is the package a file belongs to: its package clause, minus the _test suffix of an external
@@ -612,7 +737,7 @@ type verifyIn struct {
 // With readOnly, apply_edit and undo_edit are not offered: nothing can be written or reverted.
 func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 	addWrite(s, h, readOnly, "edit", "Edit text in a Go file, type-checked: edit(file_path, old_string, new_string) or edit(file_path, new_text). "+
-		"old_string must match exactly once unless replace_all=true. The result must parse; it is gofmt-ed. Writes when the new errors in the file and the packages importing it stay within max_new_errors (default 0); otherwise nothing is written and the result lists them plus an id for apply_edit. apply=false always previews; undo_edit reverts.",
+		"old_string must match exactly once unless replace_all=true. The result must parse and is gofmt-ed; imports are not added or removed (put the import change in the same edit, or run quick_fix with organize_imports=true). Writes when the new errors in the file and the packages importing it stay within max_new_errors (default 0); otherwise nothing is written and the result lists them plus an id for apply_edit. apply=false always previews; undo_edit reverts.",
 		func(ctx context.Context, w *Workspace, in editIn) (string, error) {
 			plan, err := planEdit(w, in)
 			if err != nil {
@@ -621,7 +746,9 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 			if err := packageClauseRefusal(w, plan, limit(in.MaxNewErrors)); err != nil {
 				return "", err
 			}
-			return finishPlan(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
+			out, _, err := finishPlanWith(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false,
+				func(d diagdelta.Delta) []string { return editImportHints(plan, d) })
+			return out, err
 		})
 
 	addWrite(s, h, readOnly, "edit_symbol", "Replace, insert or delete a top-level func, method, type, const or var by name, type-checked like edit. "+
@@ -689,7 +816,7 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 					}
 				}
 				plan.Holds = nil
-				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge, overridden)
+				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge, overridden, nil)
 				if err != nil {
 					return "", err
 				}
