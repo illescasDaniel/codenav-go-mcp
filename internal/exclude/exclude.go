@@ -2,8 +2,10 @@
 package exclude
 
 import (
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -16,14 +18,44 @@ var dirNames = map[string]bool{
 // IsDirName reports whether a directory name is skipped.
 func IsDirName(name string) bool { return dirNames[name] }
 
+// writeSkipUnlessGo are names that are ordinary Go package names too (a package in build/, dist/ or venv/).
+// The write tools skip them only in a directory that holds no Go files directly; IsDirName still skips them
+// everywhere, so the symbol index is unchanged.
+var writeSkipUnlessGo = map[string]bool{"build": true, "dist": true, "venv": true}
+
 // IsExcluded reports whether path (absolute, or relative to root) has an excluded directory below root.
+// build, dist and venv count only where the directory holds no .go file itself; a file being written
+// counts as one of its directory's Go files.
 func IsExcluded(path, root string) bool {
 	rel := path
 	if r, err := filepath.Rel(root, path); err == nil {
 		rel = r
 	}
-	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
-		if dirNames[part] {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i, part := range parts {
+		if !dirNames[part] {
+			continue
+		}
+		if writeSkipUnlessGo[part] {
+			dir := filepath.Join(append([]string{root}, parts[:i+1]...)...)
+			writing := i == len(parts)-2 && strings.HasSuffix(parts[len(parts)-1], ".go")
+			if writing || dirHoldsGo(dir) {
+				continue
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// dirHoldsGo reports whether dir has a .go file directly inside it.
+func dirHoldsGo(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".go") {
 			return true
 		}
 	}
@@ -96,11 +128,61 @@ func RelativeTo(path, root string) string {
 	return filepath.ToSlash(path)
 }
 
-// IsCgoGenerated: a file cgo wrote into the go build cache. Nobody wrote it, and its path is of no use
-// to anyone, so results never list it.
+// goBuildTempRE and goCacheShapeRE are fallbacks for cgo output whose temporary root is unknown: a
+// go-build<random>/b<nnn>/ work directory, or a build cache's go-build/<2 hex>/ fan-out directory. A bare
+// project directory go-build/use.go matches neither.
+var (
+	goBuildTempRE  = regexp.MustCompile(`(^|/)go-build[0-9a-f]*/b[0-9]+/`)
+	goCacheShapeRE = regexp.MustCompile(`/go-build/[0-9a-f]{2}/`)
+)
+
+// IsCgoGenerated: a file cgo wrote into the go build cache or into its work directory. Nobody wrote it, and
+// its path is of no use to anyone, so results never list it. The work directory is go-build<random> inside
+// $GOTMPDIR or, when that is unset, os.TempDir(); both sides are compared with symlinks resolved too, since
+// gopls may report /private/var for /var on macOS. A project directory that merely has that name
+// (go-build/use.go) is not cgo output.
 func IsCgoGenerated(p string) bool {
-	cache := GoCache()
-	return cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) || strings.Contains(filepath.ToSlash(p), "/go-build/")
+	if cache := GoCache(); cache != "" && strings.HasPrefix(p, cache+string(filepath.Separator)) {
+		return true
+	}
+	paths := []string{p}
+	if r, err := filepath.EvalSymlinks(p); err == nil && r != p {
+		paths = append(paths, r)
+	}
+	for _, root := range tempRoots() {
+		for _, c := range paths {
+			if inGoBuildDir(c, root) {
+				return true
+			}
+		}
+	}
+	slashed := filepath.ToSlash(p)
+	return goBuildTempRE.MatchString(slashed) || goCacheShapeRE.MatchString(slashed)
+}
+
+// tempRoots lists the directories cgo's work directories may sit in, each also with its symlinks resolved.
+func tempRoots() []string {
+	var roots []string
+	for _, d := range []string{os.Getenv("GOTMPDIR"), os.TempDir()} {
+		if d == "" {
+			continue
+		}
+		roots = append(roots, d)
+		if r, err := filepath.EvalSymlinks(d); err == nil && r != d {
+			roots = append(roots, r)
+		}
+	}
+	return roots
+}
+
+// inGoBuildDir reports whether p lies in a go-build<random> directory directly inside root.
+func inGoBuildDir(p, root string) bool {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+	return len(parts) == 2 && strings.HasPrefix(parts[0], "go-build")
 }
 
 // syntheticPrefixes start the names cgo generates (`_Cfunc_add`, `_cgoexp_<hash>_f`, `_cgo_...`); nobody wrote them.

@@ -307,10 +307,10 @@ func TestIntentLogLeftoverAfterCrash(t *testing.T) {
 	j.Notify = func(m string) { got = append(got, m) }
 	j.CheckPending()
 	if len(got) != 1 || !strings.Contains(got[0], "a.go") || !strings.Contains(got[0], "already has the new content") ||
-		!strings.Contains(got[0], "b.go") || !strings.Contains(got[0], "rm "+b) || !strings.Contains(got[0], "cp ") {
+		!strings.Contains(got[0], "b.go") || !strings.Contains(got[0], "rm -- "+b) || !strings.Contains(got[0], "cp ") {
 		t.Fatalf("notice does not describe the half-written files:\n%v", got)
 	}
-	orig, err := os.ReadFile(strings.Fields(strings.SplitN(got[0][strings.Index(got[0], "cp "):], "\n", 2)[0])[1])
+	orig, err := os.ReadFile(strings.Fields(strings.SplitN(got[0][strings.Index(got[0], "cp "):], "\n", 2)[0])[2])
 	if err != nil || string(orig) != "one\n" {
 		t.Errorf("stored original: %q, %v", orig, err)
 	}

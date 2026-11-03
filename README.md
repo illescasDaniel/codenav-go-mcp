@@ -42,7 +42,7 @@ from your home directory. Prebuilt binaries are attached to each GitHub release.
 | Tool | Answers |
 |------|---------|
 | `symbol_info` | What is this? Header, hover, definition and references in one call |
-| `outline` | What's in this file? |
+| `outline` | What's in this file? Blank `func _()` declarations are not listed (nothing can refer to them) |
 | `callers` | Who calls this function? (call hierarchy) |
 | `implementations` | Which types implement this interface, or which interfaces does this type satisfy? |
 | `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters). Exact and prefix matches come from an own declaration index, so they are never capped or missed and give the count; gopls adds the fuzzy ones after them, as a labelled sample when it is capped at 100 |
@@ -57,7 +57,7 @@ aliases. A missing required parameter (of any tool; an explicit JSON `null` coun
 The edit is applied to in-memory copies first (a gopls overlay), gopls re-checks the edited
 files, their package and the packages importing them (including external `_test`
 packages), and the response says which diagnostics the edit adds or fixes. Nothing is
-written until that is on the table. Output is gofmt-ed with imports fixed, except in a file that was not gofmt-clean before the edit: that one keeps its formatting, so the diff shows the edit only (the output says so).
+written until that is on the table. Output is gofmt-ed; imports are not added or removed (put the import change in the same edit, or run `quick_fix` with `organize_imports=true`, and the refusal says so), except in a file that was not gofmt-clean before the edit: that one keeps its formatting, so the diff shows the edit only (the output says so).
 
 | Tool | Does |
 |------|------|
@@ -175,7 +175,10 @@ constraints is invisible to the type check (the response says when an edit touch
   A file that was not is written with the edit alone (it must still parse), and the output names it; there is
   no partial, region-only gofmt. Run `gofmt -w` once if you want the whole file formatted.
 - **Output caps:** `hover` and `symbol_info` print at most about 4 KB of hover text (a package's documentation can be
-  tens of KB); the end is cut with a `(truncated, N more bytes)` note.
+  tens of KB); the end is cut with a `(truncated, N more bytes)` note. Hover text is gopls' markdown rendering of the doc
+  comment, so `<`, `*` and `[` can show backslash-escaped and a link target can appear nested in brackets.
+- **Stdlib interfaces in `implementations`:** a concrete type is matched against the standard-library interfaces only in
+  packages gopls has loaded for the workspace, so an import added elsewhere (for example `fmt` for `fmt.Stringer`) can change the list.
 - **Struct tags:** renames change Go identifiers only. `rename_symbol` on a field that has a struct tag, and
   `edit_symbol` `replace` of a struct type whose tags changed (or whose tagged field disappeared), say so in a
   note; there is no note for fields without tags, and no guessing about reflection or `encoding/json` use.
@@ -193,8 +196,8 @@ constraints is invisible to the type check (the response says when an edit touch
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `CODENAV_GO_MCP_WORKSPACE` | unset: follows the client's MCP roots when they name a worktree of the same git repository, else `CLAUDE_PROJECT_DIR`, else the working directory | Pins the project root |
-| `CODENAV_GO_MCP_READ_ONLY` | unset | `1`/`true`: write tools refuse to write |
-| `CODENAV_GO_MCP_GOPLS` | auto | Path to the gopls binary |
+| `CODENAV_GO_MCP_READ_ONLY` | unset | `1`, `true`, `yes` or `on` (any case): write tools refuse to write. Any other value, including `0`, `false`, `no` or empty, leaves them writable |
+| `CODENAV_GO_MCP_GOPLS` | auto | Path to the gopls binary. The value is split on whitespace, so a path with a space does not work |
 | `CODENAV_GO_MCP_BUILD_FLAGS` | none | Passed to gopls as `buildFlags` and to `go list` (dependents), e.g. `-tags=integration` |
 | `CODENAV_GO_MCP_STATE_DIR` | `<user cache dir>/codenav-go-mcp` | Where the crash-recovery log is kept |
 

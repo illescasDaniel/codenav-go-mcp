@@ -194,25 +194,37 @@ func Leftover(dir, root string) string {
 		lines = append(lines, fmt.Sprintf("  %s (%s; was %s, new %s): %s", rel, f.Kind, short(f.BaseHash), short(f.NewHash), state))
 		switch {
 		case f.Orig != "":
-			restore = append(restore, fmt.Sprintf("cp %s %s", filepath.Join(dst, "orig", f.Orig), f.Path))
+			restore = append(restore, fmt.Sprintf("cp -- %s %s", shellArg(filepath.Join(dst, "orig", f.Orig)), shellArg(f.Path)))
 		case f.BaseHash == "":
-			restore = append(restore, "rm "+f.Path)
+			restore = append(restore, "rm -- "+shellArg(f.Path))
 		}
 		// A kill between writeAtomic's temp file and its rename leaves that temp file; the log does not name it.
 		for _, tmp := range leftoverTemps(f.Path) {
 			lines = append(lines, fmt.Sprintf("  %s (temporary file of the interrupted write)", edits.RelativeName(tmp, root)))
-			restore = append(restore, "rm "+tmp)
+			restore = append(restore, "rm -- "+shellArg(tmp))
 		}
 	}
 	verb := "applying"
 	if in.Op == "undo" {
 		verb = "undoing"
 	}
-	return fmt.Sprintf("an earlier run was interrupted while %s %q (started %s), so these files may be half-written:\n%s\nThe original contents were saved in %s. To roll back, run:\n  %s\n(or review them with git diff; hashes are the first 12 characters of sha256)",
+	return fmt.Sprintf("an earlier run was interrupted while %s %q (started %s), so these files may be half-written:\n%s\nThe original contents were saved in %s. To roll back, run (bash/zsh quoting):\n  %s\n(or review them with git diff; hashes are the first 12 characters of sha256)",
 		verb, in.Description, in.Started.Format(time.RFC3339), strings.Join(lines, "\n"), filepath.Join(dst, "orig"), strings.Join(restore, "\n  "))
 }
 
 var tempIDRE = regexp.MustCompile(`^[0-9a-f]+$`)
+
+// plainArgRE matches the paths a shell reads as one word unchanged; ordinary paths are printed as they are.
+var plainArgRE = regexp.MustCompile(`^[A-Za-z0-9_./:@%+,=-]+$`)
+
+// shellArg quotes a path for a POSIX shell (bash, zsh, and fish for this quoting) so the printed restore
+// command runs as shown, even when the path has spaces or quotes.
+func shellArg(s string) string {
+	if plainArgRE.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
 
 // leftoverTemps lists the temp files writeAtomic names "." + base + "." + id + ".tmp" beside path. Only a name of
 // that exact shape counts, so an unrelated file is never offered for removal.

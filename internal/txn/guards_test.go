@@ -92,7 +92,7 @@ func TestLeftoverNamesTempFileOfInterruptedWrite(t *testing.T) {
 	var got []string
 	j.Notify = func(m string) { got = append(got, m) }
 	j.CheckPending()
-	if len(got) != 1 || !strings.Contains(got[0], tmp) || !strings.Contains(got[0], "rm "+tmp) {
+	if len(got) != 1 || !strings.Contains(got[0], tmp) || !strings.Contains(got[0], "rm -- "+tmp) {
 		t.Fatalf("notice does not name the temp file:\n%v", got)
 	}
 	if strings.Contains(got[0], other) {

@@ -72,8 +72,49 @@ func readLines(p string) []string {
 	return l
 }
 
+// snippetMaxRunes caps one source line in a snippet. A longer line is cut to a window around the match.
+const snippetMaxRunes = 140
+
+// clipLine returns at most snippetMaxRunes runes of line. The window holds utf16Col (the LSP column: 0-based,
+// UTF-16 units; 0 keeps the start of the line), and "..." marks each side where text was cut.
+func clipLine(line string, utf16Col int) string {
+	runes := []rune(line)
+	if len(runes) <= snippetMaxRunes {
+		return line
+	}
+	idx, units := 0, 0
+	for idx < len(runes) && units < utf16Col {
+		if runes[idx] >= 0x10000 {
+			units += 2
+		} else {
+			units++
+		}
+		idx++
+	}
+	lo := max(0, idx-snippetMaxRunes/2)
+	hi := lo + snippetMaxRunes
+	if hi > len(runes) {
+		hi = len(runes)
+		lo = hi - snippetMaxRunes
+	}
+	out := string(runes[lo:hi])
+	if lo > 0 {
+		out = "..." + out
+	}
+	if hi < len(runes) {
+		out += "..."
+	}
+	return out
+}
+
 // Snippet is lines [start,end] (0-based, inclusive) plus context, numbered 1-based.
 func Snippet(uri string, start, end, context int) string {
+	return snippetAt(uri, start, end, context, -1, 0)
+}
+
+// snippetAt is Snippet with the match position: line matchLine is cut around column matchCol, the other lines
+// from their start.
+func snippetAt(uri string, start, end, context, matchLine, matchCol int) string {
 	lines := readLines(lsp.URIToPath(uri))
 	if lines == nil {
 		return ""
@@ -81,14 +122,20 @@ func Snippet(uri string, start, end, context int) string {
 	lo, hi := max(0, start-context), min(len(lines), end+1+context)
 	var out []string
 	for i := lo; i < hi; i++ {
-		out = append(out, fmt.Sprintf("%5d | %s", i+1, lines[i]))
+		text := lines[i]
+		if i == matchLine {
+			text = clipLine(text, matchCol)
+		} else {
+			text = clipLine(text, 0)
+		}
+		out = append(out, fmt.Sprintf("%5d | %s", i+1, text))
 	}
 	return strings.Join(out, "\n")
 }
 
 func FormatLocation(loc lsp.Location, root string) string {
 	header := fmt.Sprintf("%s:%d:%d", Relative(loc.URI, root), loc.Range.Start.Line+1, loc.Range.Start.Character+1)
-	if body := Snippet(loc.URI, loc.Range.Start.Line, loc.Range.End.Line, 2); body != "" {
+	if body := snippetAt(loc.URI, loc.Range.Start.Line, loc.Range.End.Line, 2, loc.Range.Start.Line, loc.Range.Start.Character); body != "" {
 		return header + "\n" + body
 	}
 	return header
