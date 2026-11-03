@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/scanner"
 	"go/token"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
@@ -447,6 +450,51 @@ func friendlyNavErr(err error, file string, line, col int) error {
 	return err
 }
 
+// siblingSyntaxNote names the first sibling file of abs in the same build that does not parse. gopls type-checks
+// the package on the parser's partial trees, so a clean file can report "undefined: X" for a name declared in the
+// broken file; the note points at the syntax error to fix first. A _test.go sibling counts only for a _test.go
+// file, since the package a non-test file is built into does not contain test files. src is abs's text; "" when
+// abs itself does not parse (gopls reports that error) or no sibling fails.
+func siblingSyntaxNote(root, abs, src string) string {
+	if _, err := parser.ParseFile(token.NewFileSet(), abs, src, parser.SkipObjectResolution); err != nil {
+		return ""
+	}
+	entries, err := os.ReadDir(filepath.Dir(abs))
+	if err != nil {
+		return ""
+	}
+	self := filepath.Base(abs)
+	build := buildscope.Context()
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || name == self || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		if strings.HasSuffix(name, "_test.go") && !strings.HasSuffix(self, "_test.go") {
+			continue
+		}
+		p := filepath.Join(filepath.Dir(abs), name)
+		if _, excluded := buildscope.Excluded(build, p); excluded {
+			continue
+		}
+		text, _, rerr := edits.ReadSource(p)
+		if rerr != nil {
+			continue
+		}
+		_, perr := parser.ParseFile(token.NewFileSet(), p, text, parser.SkipObjectResolution)
+		if perr == nil {
+			continue
+		}
+		at := exclude.RelativeTo(p, root)
+		var list scanner.ErrorList
+		if errors.As(perr, &list) && len(list) > 0 {
+			at = fmt.Sprintf("%s:%d:%d", at, list[0].Pos.Line, list[0].Pos.Column)
+		}
+		return fmt.Sprintf("(note: package has a syntax error in %s; type errors here such as undefined names may be consequences of it, so fix that first)", at)
+	}
+	return ""
+}
+
 // RegisterNav registers the navigation tools.
 func RegisterNav(s *mcp.Server, h Host) {
 	add(s, h, "workspace", "Which directory is codenav navigating, and why? Use when results look like they come from the wrong checkout/worktree.",
@@ -563,9 +611,14 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", friendlyNavErr(err, in.FilePath, 0, 0)
 			}
-			out := format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit)
-			if src, _, rerr := edits.ReadSource(abs); rerr == nil && gomod.HasBuildConstraint(src) {
-				out += "\n(build-constrained: this file has a build constraint, and diagnostics only cover the current GOOS/GOARCH/tags; if the constraint excludes it here, it was not type-checked.)"
+			out := format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit, w.Root)
+			if src, _, rerr := edits.ReadSource(abs); rerr == nil {
+				if note := siblingSyntaxNote(w.Root, abs, src); note != "" {
+					out += "\n" + note
+				}
+				if gomod.HasBuildConstraint(src) {
+					out += "\n(build-constrained: this file has a build constraint, and diagnostics only cover the current GOOS/GOARCH/tags; if the constraint excludes it here, it was not type-checked.)"
+				}
 			}
 			return out, nil
 		})

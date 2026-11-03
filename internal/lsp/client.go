@@ -243,7 +243,7 @@ func (c *Client) Start(ctx context.Context) error {
 		"capabilities": map[string]any{
 			"textDocument": map[string]any{
 				"synchronization":    map[string]any{"didSave": true},
-				"publishDiagnostics": map[string]any{},
+				"publishDiagnostics": map[string]any{"relatedInformation": true},
 				"documentSymbol":     map[string]any{"hierarchicalDocumentSymbolSupport": true},
 				"callHierarchy":      map[string]any{},
 				"typeHierarchy":      map[string]any{},

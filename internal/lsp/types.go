@@ -29,6 +29,14 @@ type Diagnostic struct {
 	// edits are found only for diagnostics that carry the same tags (e.g. Unnecessary).
 	Tags            []int           `json:"tags,omitempty"`
 	CodeDescription json.RawMessage `json:"codeDescription,omitempty"`
+	// RelatedInformation names companion locations, e.g. the other declaration of a redeclared name.
+	RelatedInformation []DiagnosticRelated `json:"relatedInformation,omitempty"`
+}
+
+// DiagnosticRelated is one companion location of a diagnostic (LSP DiagnosticRelatedInformation).
+type DiagnosticRelated struct {
+	Location Location `json:"location"`
+	Message  string   `json:"message"`
 }
 
 // Symbol covers both DocumentSymbol (hierarchical: Range, SelectionRange,

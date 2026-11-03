@@ -441,25 +441,62 @@ func codeString(raw []byte) string {
 	return strings.Trim(string(raw), `"`)
 }
 
-func FormatDiagnostic(d lsp.Diagnostic) string {
+// FormatDiagnostic renders one diagnostic: position, [severity code] and message, then the companion locations
+// of its related information, workspace-relative to root.
+func FormatDiagnostic(d lsp.Diagnostic, root string) string {
 	sev := severities[d.Severity]
 	if sev == "" {
 		sev = "?"
 	}
 	tag := sev
-	if c := codeString(d.Code); c != "" && c != "null" {
-		tag += " " + c
+	// gopls sets the code to "default" for analyzer findings; the analyzer's name is then the source (printf).
+	name := codeString(d.Code)
+	if name == "" || name == "null" || name == "default" {
+		name = d.Source
+	}
+	if name != "" {
+		tag += " " + name
 	}
 	msg := strings.Split(d.Message, "\n")
 	out := []string{fmt.Sprintf("%d:%d [%s] %s", d.Range.Start.Line+1, d.Range.Start.Character+1, tag, msg[0])}
 	for _, l := range msg[1:] {
 		out = append(out, "    "+l)
 	}
+	for _, r := range d.RelatedInformation {
+		loc := fmt.Sprintf("%s:%d:%d", Relative(r.Location.URI, root), r.Location.Range.Start.Line+1, r.Location.Range.Start.Character+1)
+		// gopls sends an empty message on one side of a redeclaration: the location alone is shown then.
+		if r.Message != "" {
+			loc += ": " + r.Message
+		}
+		out = append(out, "    "+loc)
+	}
 	return strings.Join(out, "\n")
 }
 
-func FormatDiagnostics(items []lsp.Diagnostic, limit int) string {
-	items = append([]lsp.Diagnostic(nil), lsp.DedupeDiagnostics(items)...)
+// missingMetadata is gopls' wording for an import it cannot load.
+var missingMetadata = regexp.MustCompile(`\(missing metadata for import of "[^"]*"\)`)
+
+// explainCycle rewrites gopls' "missing metadata" wording when the same diagnostics also report an import cycle:
+// the import cannot be loaded because it is part of that cycle. items is changed in place.
+func explainCycle(items []lsp.Diagnostic) []lsp.Diagnostic {
+	cycle := false
+	for _, d := range items {
+		if strings.Contains(d.Message, "import cycle not allowed") {
+			cycle = true
+			break
+		}
+	}
+	if cycle {
+		for i := range items {
+			items[i].Message = missingMetadata.ReplaceAllString(items[i].Message, "(its package is part of an import cycle, so it cannot be loaded)")
+		}
+	}
+	return items
+}
+
+// FormatDiagnostics renders diagnostics sorted by position, at most limit of them, with paths relative to root.
+func FormatDiagnostics(items []lsp.Diagnostic, limit int, root string) string {
+	items = explainCycle(append([]lsp.Diagnostic(nil), lsp.DedupeDiagnostics(items)...))
 	if len(items) == 0 {
 		return "No diagnostics."
 	}
@@ -470,7 +507,7 @@ func FormatDiagnostics(items []lsp.Diagnostic, limit int) string {
 	shown := items[:min(len(items), max(0, limit))]
 	lines := make([]string, len(shown))
 	for i, d := range shown {
-		lines[i] = FormatDiagnostic(d)
+		lines[i] = FormatDiagnostic(d, root)
 	}
 	if omitted := len(items) - len(shown); omitted > 0 {
 		lines = append(lines, fmt.Sprintf("… and %d more (showing first %d)", omitted, len(shown)))
