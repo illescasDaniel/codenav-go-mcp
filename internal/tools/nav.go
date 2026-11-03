@@ -13,9 +13,12 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -26,6 +29,7 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/goplscmd"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
@@ -677,8 +681,8 @@ func excludedUsesNote(w *Workspace, sym resolve.Symbol) string {
 // RegisterNav registers the navigation tools.
 func RegisterNav(s *mcp.Server, h Host) {
 	add(s, h, "workspace", "Which directory is codenav navigating, and why? Use when results look like they come from the wrong checkout/worktree.",
-		func(_ context.Context, w *Workspace, _ struct{}) (string, error) {
-			return fmt.Sprintf("%s\nchosen because: %s", w.Root, h.Explain(w.Source)), nil
+		func(ctx context.Context, w *Workspace, _ struct{}) (string, error) {
+			return workspaceReport(ctx, h, w), nil
 		})
 
 	add(s, h, "hover", "Type/documentation info for the symbol at a position. line/column are 1-indexed; column is a UTF-16 offset.",
@@ -748,7 +752,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", w.navErr(ctx, err, in.FilePath, in.Line, in.Column)
 			}
-			return splitTests(dropGeneratedLocs(locs), w.Root), nil
+			return referencesAnswer(dropGeneratedLocs(locs), w.Root, toolchainLocs(w.Root)), nil
 		})
 
 	add(s, h, "search_symbol", "Search the workspace for a symbol by name. Returns positions to feed to definition/references/hover. Production code ranks before tests.",
@@ -912,6 +916,13 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if note := excludedUsesNote(w, sym); note != "" {
 				out += "\n" + note
 			}
+			if inInterface(sym) {
+				note := "Note: calls through in-workspace concrete implementations are included"
+				if sc := nestedScan(w.Root); len(sc.mods) > 0 || sc.truncated {
+					note += "; calls from nested modules the workspace does not cover are not"
+				}
+				out += "\n" + note + "."
+			}
 			if note := caseNote(w, name, sym); note != "" {
 				out = note + "\n" + out
 			}
@@ -935,14 +946,12 @@ func RegisterNav(s *mcp.Server, h Host) {
 				}
 				return "", err
 			}
-			if len(locs) == 0 {
-				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
-			}
 			locs = dropGeneratedLocs(dropForeignUnexported(locs, w.Root))
-			if len(locs) == 0 {
-				return fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name), nil
+			out := fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name)
+			if len(locs) > 0 {
+				out = implementerNames(locs, w.Root) + splitTests(locs, w.Root)
 			}
-			out := implementerNames(locs) + splitTests(locs, w.Root)
+			out = withNote(nestedImplementersNote(w, name), out)
 			if note := caseNote(w, name, sym); note != "" {
 				out = note + "\n" + out
 			}
@@ -950,11 +959,55 @@ func RegisterNav(s *mcp.Server, h Host) {
 		})
 }
 
-// implementerNames lists the type behind each location ("Implementers: A, B, ..."), so the answer
-// names them before the source excerpts. "" when no location is inside a type or a method.
-func implementerNames(locs []lsp.Location) string {
+// implementerNames lists the type behind each location, grouped (see implementerGroups). "" when no location is
+// inside a type or a method.
+func implementerNames(locs []lsp.Location, root string) string {
+	return implementerGroups(locs, root, toolchainLocs(root))
+}
+
+// The classes of a location: the workspace's own files, the standard library, or a dependency.
+const (
+	clsWorkspace = iota
+	clsStdlib
+	clsDeps
+)
+
+// locClass classifies the file p of a workspace rooted at root. work are the directories of the go.work's other
+// modules (their files are the workspace's); vendor files are dependencies even under root.
+func locClass(root string, work []string, dirs toolchainDirs, p string) int {
+	if under(filepath.Join(root, "vendor"), p) {
+		return clsDeps
+	}
+	if under(root, p) {
+		return clsWorkspace
+	}
+	for _, d := range work {
+		if under(d, p) {
+			return clsWorkspace
+		}
+	}
+	if dirs.GOROOT != "" && under(dirs.GOROOT, p) {
+		return clsStdlib
+	}
+	return clsDeps
+}
+
+// packageName is the package clause of the file p (its directory's name when the clause cannot be read).
+func packageName(p, text string) string {
+	if f, err := parser.ParseFile(token.NewFileSet(), p, text, parser.PackageClauseOnly); err == nil && f.Name != nil {
+		return f.Name.Name
+	}
+	return filepath.Base(filepath.Dir(p))
+}
+
+// implementerGroups lists the types behind the locations in three groups, each on its own line: the workspace's own
+// types as "Types (N)", then the standard library's and the dependencies' as "Standard library" and "Dependencies",
+// qualified by their package name (io.Writer), so a name is not mistaken for a workspace type.
+func implementerGroups(locs []lsp.Location, root string, dirs toolchainDirs) string {
 	const shown = 20
-	var names []string
+	labels := [3]string{"Types", "Standard library", "Dependencies"}
+	work := gomod.WorkModules(root)
+	var names [3][]string
 	seen := map[string]bool{}
 	for _, l := range locs {
 		p := lsp.URIToPath(l.URI)
@@ -967,20 +1020,129 @@ func implementerNames(locs []lsp.Location) string {
 		if name == "" {
 			name = receiverTypeAt(p, text, off)
 		}
-		if name != "" && !seen[name] {
-			seen[name] = true
-			names = append(names, name)
+		if name == "" {
+			continue
+		}
+		g := locClass(root, work, dirs, p)
+		if g != clsWorkspace {
+			name = packageName(p, text) + "." + name
+		}
+		key := fmt.Sprintf("%d %s", g, name)
+		if !seen[key] {
+			seen[key] = true
+			names[g] = append(names[g], name)
 		}
 	}
-	if len(names) == 0 {
+	var parts []string
+	for g := range names {
+		if len(names[g]) == 0 {
+			continue
+		}
+		list, more := names[g], ""
+		if len(list) > shown {
+			more = fmt.Sprintf(", ... (+%d more)", len(list)-shown)
+			list = list[:shown]
+		}
+		parts = append(parts, fmt.Sprintf("%s (%d): %s%s", labels[g], len(names[g]), strings.Join(list, ", "), more))
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	more := ""
-	if len(names) > shown {
-		more = fmt.Sprintf(", ... (+%d more)", len(names)-shown)
-		names = names[:shown]
+	return strings.Join(parts, "\n") + "\n\n"
+}
+
+// The nested-module scan: at most nestedLimit modules, within nestedBudget, and the answer is kept for nestedTTL per
+// root so that repeated implementations and callers calls do not walk the tree again.
+const (
+	nestedLimit  = 3
+	nestedBudget = 2 * time.Second
+	nestedTTL    = 30 * time.Second
+)
+
+// nestedScanResult lists the modules below the root that the workspace does not cover. truncated says the scan
+// stopped at the limit or the time budget, so a module it did not reach may exist.
+type nestedScanResult struct {
+	mods      []gomod.Nested
+	truncated bool
+}
+
+var nestedCache struct {
+	sync.Mutex
+	at  map[string]time.Time
+	res map[string]nestedScanResult
+}
+
+// nestedScan returns the scan of root, from the cache while it is fresh.
+func nestedScan(root string) nestedScanResult {
+	nestedCache.Lock()
+	defer nestedCache.Unlock()
+	if t, ok := nestedCache.at[root]; ok && time.Since(t) < nestedTTL {
+		return nestedCache.res[root]
 	}
-	return fmt.Sprintf("Types (%d): %s%s\n\n", len(seen), strings.Join(names, ", "), more)
+	res := scanNested(root, time.Now().Add(nestedBudget))
+	if nestedCache.at == nil {
+		nestedCache.at = map[string]time.Time{}
+		nestedCache.res = map[string]nestedScanResult{}
+	}
+	nestedCache.at[root] = time.Now()
+	nestedCache.res[root] = res
+	return res
+}
+
+// scanNested walks root for go.mod files of modules the workspace does not cover, until the limit or the deadline.
+func scanNested(root string, deadline time.Time) nestedScanResult {
+	var res nestedScanResult
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			res.truncated = true
+			return filepath.SkipAll
+		}
+		if d.IsDir() {
+			if p != root && (exclude.IsDirName(d.Name()) || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "go.mod" || filepath.Dir(p) == root {
+			return nil
+		}
+		n, ok := gomod.Uncovered(root, filepath.Join(filepath.Dir(p), "x.go"))
+		if !ok {
+			return nil
+		}
+		if len(res.mods) == nestedLimit {
+			res.truncated = true
+			return filepath.SkipAll
+		}
+		res.mods = append(res.mods, n)
+		return nil
+	})
+	return res
+}
+
+// nestedImplementersNote says when a module below the workspace that its go.mod/go.work does not cover mentions the
+// queried name: gopls does not see its implementers, so an answer that lists none may be incomplete. A scan that
+// stopped early is said so as well, since a module it did not reach may mention the name. "" otherwise.
+func nestedImplementersNote(w *Workspace, query string) string {
+	if strings.TrimSpace(query) == "" {
+		return ""
+	}
+	scan := nestedScan(w.Root)
+	var lines []string
+	for _, n := range scan.mods {
+		if !mayLiveIn(n, query) {
+			continue
+		}
+		rel := edits.RelativeName(n.Dir, w.Root)
+		lines = append(lines, fmt.Sprintf("Note: nested module %s (%s/go.mod) is not covered by the workspace's go.mod/go.work and mentions %s; its implementers and implemented interfaces are not listed here. A go.work listing the modules (go work init . ./%s) joins them.", n.Path, rel, query, rel))
+	}
+	if scan.truncated {
+		lines = append(lines, fmt.Sprintf("Note: the scan for nested modules the workspace does not cover stopped early (after %d modules or %s); a module it did not reach may mention %s too.", nestedLimit, nestedBudget, query))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // receiverTypeAt is the receiver type of the method declared around offset off ("" if none).
@@ -1009,14 +1171,15 @@ func receiverTypeAt(filename, src string, off int) string {
 	return ""
 }
 
-// dropForeignUnexported removes interfaces declared outside the workspace under an unexported name
-// (the stdlib's `stringer` copies in context or runtime): nobody can name them. It keeps everything
-// when nothing else would remain.
+// dropForeignUnexported removes types declared outside the workspace under an unexported name (the stdlib's
+// `stringer` copies in context or runtime, `pp` in fmt): nobody can name them. A location on a method counts as
+// its receiver's type. It keeps everything when nothing else would remain.
 func dropForeignUnexported(locs []lsp.Location, root string) []lsp.Location {
+	work := gomod.WorkModules(root)
 	var kept []lsp.Location
 	for _, l := range locs {
 		p := lsp.URIToPath(l.URI)
-		if rel, err := filepath.Rel(root, p); err == nil && !strings.HasPrefix(rel, "..") {
+		if locClass(root, work, toolchainDirs{}, p) == clsWorkspace {
 			kept = append(kept, l)
 			continue
 		}
@@ -1025,7 +1188,12 @@ func dropForeignUnexported(locs []lsp.Location, root string) []lsp.Location {
 			kept = append(kept, l)
 			continue
 		}
-		if name := enclosingTypeName(p, text, edits.Offset(text, l.Range.Start.Line, l.Range.Start.Character)); name != "" {
+		off := edits.Offset(text, l.Range.Start.Line, l.Range.Start.Character)
+		name := enclosingTypeName(p, text, off)
+		if name == "" {
+			name = receiverTypeAt(p, text, off)
+		}
+		if name != "" {
 			if r, _ := utf8.DecodeRuneInString(name); unicode.IsLower(r) || r == '_' {
 				continue
 			}
@@ -1158,4 +1326,228 @@ func shortQuery(q string) string {
 		return string(r[:max]) + "..."
 	}
 	return q
+}
+
+// workspaceReport is the workspace tool's answer: the root, why it was chosen, and the settings that decide what
+// the other answers mean (read-only mode, build flags, gopls, the Go toolchain and the go.work in use). The go
+// command is asked in the root, so GOWORK and GOFLAGS are the values the server runs with.
+func workspaceReport(ctx context.Context, h Host, w *Workspace) string {
+	lines := []string{w.Root, "chosen because: " + h.Explain(w.Source)}
+	readOnly := "no"
+	if (w.Journal != nil && w.Journal.Guard.ReadOnly) || (w.Journal == nil && envTrue(ReadOnlyEnv)) {
+		readOnly = "yes (" + ReadOnlyEnv + ")"
+	}
+	lines = append(lines, "read-only: "+readOnly)
+	lines = append(lines, "build flags (CODENAV_GO_MCP_BUILD_FLAGS): "+orNone(redactFlags(envOr("CODENAV_GO_MCP_BUILD_FLAGS", ""))))
+	lines = append(lines, "gopls: "+goplsDescribe(ctx))
+	vals, err := goEnv(ctx, w.Root, "GOVERSION", "GOFLAGS", "GOWORK")
+	if err != nil {
+		vals = []string{"unknown", "unknown", "unknown"}
+	}
+	lines = append(lines, "go: "+orNone(vals[0]), "GOFLAGS: "+orNone(redactFlags(vals[1])))
+	lines = append(lines, "GOWORK env: "+envOr("GOWORK", "unset"), "go.work in use: "+orNone(vals[2]))
+	return strings.Join(lines, "\n")
+}
+
+// envTrue reports whether the environment variable is set to a true-like value (as the server reads its flags).
+func envTrue(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// envOr is the variable's value, or fallback when it is unset or blank.
+func envOr(name, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(name)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// orNone is s, or "none" when it is empty.
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// redactFlags prints a flag string with the values of -ldflags and -X hidden: those carry -X name=value pairs,
+// which are often secrets. The flag names stay, so the build is still described; the other flags are printed as
+// they are.
+func redactFlags(s string) string {
+	var out []string
+	eliding := false
+	for _, f := range strings.Fields(s) {
+		if !strings.HasPrefix(f, "-") {
+			if !eliding {
+				out = append(out, f)
+			}
+			continue
+		}
+		name, _, _ := strings.Cut(f, "=")
+		switch strings.TrimLeft(name, "-") {
+		case "ldflags", "X":
+			out = append(out, name+"=<redacted>")
+			eliding = true
+		default:
+			out = append(out, f)
+			eliding = false
+		}
+	}
+	return strings.Join(out, " ")
+}
+
+// goEnv runs `go env` for names in dir and returns one trimmed value per name (empty when unset). It is an error
+// when the go command cannot run.
+func goEnv(ctx context.Context, dir string, names ...string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", append([]string{"env"}, names...)...)
+	cmd.Dir = dir
+	b, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	vals := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	out := make([]string, len(names))
+	for i := range names {
+		if i < len(vals) {
+			out[i] = strings.TrimSpace(vals[i])
+		}
+	}
+	return out, nil
+}
+
+// goplsDescribe names the gopls the server runs, with its version. It runs the same command the server starts, with
+// `version` after its arguments. An unusable pin or a missing gopls is said as such; a go run fallback is named, not
+// run, since running it would fetch gopls.
+func goplsDescribe(ctx context.Context) string {
+	cmd, warn, err := goplscmd.Command()
+	if err != nil {
+		return "not usable: " + err.Error()
+	}
+	shown := strings.Join(cmd, " ")
+	if warn != "" {
+		return shown + " (fallback: gopls is not installed; its version is not asked, since go run would fetch it)"
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	args := append(append([]string{}, cmd[1:]...), "version")
+	out, err := exec.CommandContext(ctx, cmd[0], args...).Output()
+	version := "version unknown"
+	if err != nil {
+		version = "version failed: " + err.Error()
+	} else if first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n"); first != "" {
+		version = first
+	}
+	return fmt.Sprintf("%s (%s)", shown, version)
+}
+
+// toolchainDirs are the Go root and the module cache: the places whose files are dependencies of the workspace.
+type toolchainDirs struct{ GOROOT, GOMODCACHE string }
+
+var toolchain struct {
+	sync.Mutex
+	byRoot map[string]toolchainDirs
+}
+
+// toolchainLocs returns the Go root and module cache as the go command run in root reports them. A successful
+// answer is kept per root; a failed `go env` is not kept, so the next call asks again. Empty values when unknown.
+func toolchainLocs(root string) toolchainDirs {
+	toolchain.Lock()
+	defer toolchain.Unlock()
+	if d, ok := toolchain.byRoot[root]; ok {
+		return d
+	}
+	vals, err := goEnv(context.Background(), root, "GOROOT", "GOMODCACHE")
+	if err != nil {
+		return toolchainDirs{}
+	}
+	d := toolchainDirs{GOROOT: vals[0], GOMODCACHE: vals[1]}
+	if d.GOROOT != "" && d.GOMODCACHE != "" {
+		if toolchain.byRoot == nil {
+			toolchain.byRoot = map[string]toolchainDirs{}
+		}
+		toolchain.byRoot[root] = d
+	}
+	return d
+}
+
+// plural is "s" for every count but one.
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// inInterface reports whether the symbol is declared inside an interface type (an interface method).
+func inInterface(sym resolve.Symbol) bool {
+	path := lsp.URIToPath(sym.URI)
+	text, _, err := edits.ReadSource(path)
+	if err != nil {
+		return false
+	}
+	return interfaceTypeAt(path, text, edits.Offset(text, sym.Line, sym.Column))
+}
+
+// interfaceTypeAt reports whether byte offset off of filename lies in a type declaration whose type is an interface.
+func interfaceTypeAt(filename, src string, off int) bool {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, filename, src, parser.SkipObjectResolution)
+	if err != nil {
+		return false
+	}
+	for _, d := range f.Decls {
+		g, ok := d.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+		for _, sp := range g.Specs {
+			ts, ok := sp.(*ast.TypeSpec)
+			if !ok || off < fset.Position(ts.Pos()).Offset || off >= fset.Position(ts.End()).Offset {
+				continue
+			}
+			_, isIface := ts.Type.(*ast.InterfaceType)
+			return isIface
+		}
+	}
+	return false
+}
+
+// dropDependencyLocs removes the locations of dependencies: the Go root, the module cache and the vendor directory.
+// A workspace module's own file is kept even when it sits under one of those directories. It returns the rest and
+// how many it dropped.
+func dropDependencyLocs(locs []lsp.Location, root string, dirs toolchainDirs) ([]lsp.Location, int) {
+	work := gomod.WorkModules(root)
+	var kept []lsp.Location
+	dropped := 0
+	for _, l := range locs {
+		p := lsp.URIToPath(l.URI)
+		c := locClass(root, work, dirs, p)
+		inModcache := dirs.GOMODCACHE != "" && under(dirs.GOMODCACHE, p)
+		inVendor := under(filepath.Join(root, "vendor"), p)
+		if c == clsStdlib || (c == clsDeps && (inModcache || inVendor)) {
+			dropped++
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return kept, dropped
+}
+
+// referencesAnswer is the references answer for locs: the workspace's references and the count of dependency call
+// sites left out. When every reference is a dependency's, the answer says that instead of "No references found".
+func referencesAnswer(locs []lsp.Location, root string, dirs toolchainDirs) string {
+	kept, deps := dropDependencyLocs(locs, root, dirs)
+	switch {
+	case deps == 0:
+		return splitTests(kept, root)
+	case len(kept) == 0:
+		return fmt.Sprintf("%d reference(s) inside dependencies not shown (references lists the workspace only).", deps)
+	}
+	return splitTests(kept, root) + fmt.Sprintf("\n(%d reference(s) inside dependencies not shown)", deps)
 }
