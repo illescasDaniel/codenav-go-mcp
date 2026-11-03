@@ -235,9 +235,19 @@ func leftoverTemps(path string) []string {
 		return nil
 	}
 	prefix, suffix := "."+base+".", ".tmp"
+	// The short form (tempName) is used only for a base name whose long form would be too long; only then is it
+	// one of ours beside this file.
+	short := len(prefix)+8+len(suffix) > maxNameLen
+	const shortPrefix, shortLen = ".codenav-", 8
 	var out []string
 	for _, e := range entries {
 		n := e.Name()
+		if short && len(n) == len(shortPrefix)+shortLen+len(suffix) && strings.HasPrefix(n, shortPrefix) && strings.HasSuffix(n, suffix) {
+			if id := n[len(shortPrefix) : len(n)-len(suffix)]; tempIDRE.MatchString(id) {
+				out = append(out, filepath.Join(dir, n))
+				continue
+			}
+		}
 		if len(n) <= len(prefix)+len(suffix) || !strings.HasPrefix(n, prefix) || !strings.HasSuffix(n, suffix) {
 			continue
 		}

@@ -110,7 +110,9 @@ func finishPlanWith(ctx context.Context, w *Workspace, plan *edits.EditPlan, app
 	if len(plan.Changes) == 0 {
 		return "No changes: the edit leaves the code as it is.", "", nil
 	}
-	if err := w.Journal.Guard.CheckPlan(plan, allowLarge || !apply); err != nil {
+	// The file limit is not checked here: conclude refuses an over-limit write after the simulation, with the
+	// diagnostics, and stores the plan then (so its config fingerprint is set).
+	if err := w.Journal.Guard.CheckPlan(plan, true); err != nil {
 		return "", "", err
 	}
 	delta, err := Simulate(ctx, w, plan, includeDeps)
@@ -306,6 +308,13 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		id := w.Store.Add(plan)
 		out = append(out, "", "Not written: "+strings.Join(plan.Holds, " ")+fmt.Sprintf(" Preview id %s; call apply_edit(id=%q%s) to write it anyway.", id, id, largeArg(w, plan)))
 		out = append(out, "", plan.RefusedDiff(w.Root, 2, 120))
+	case apply && !readOnly && w.Journal.Guard.OverLimit(plan, allowLarge):
+		// Over the file limit: held as a preview, with the diagnostics above. apply_edit(id, allow_large=true) writes it.
+		// PreviewID returns the id the plan already has when apply_edit refuses it again.
+		refused = true
+		plan.AllowLarge = false
+		id := w.Store.PreviewID(plan)
+		out = append(out, "", "Not written: "+txn.LargeRefusal(len(plan.Changes), w.Journal.Guard.FileLimit(), id), "", plan.RefusedDiff(w.Root, 2, 120))
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
 			// The diff still goes with the refusal: a read-only server exists to show what would change.
@@ -801,7 +810,8 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 					return "", err
 				}
 				allowLarge := in.AllowLarge || plan.AllowLarge
-				if err := w.Journal.Guard.CheckPlan(plan, allowLarge); err != nil {
+				// The file limit is checked by conclude, after the simulation, so the refusal names this preview id.
+				if err := w.Journal.Guard.CheckPlan(plan, true); err != nil {
 					return "", err
 				}
 				delta, err := Simulate(ctx, w, plan, true)

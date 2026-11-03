@@ -4,6 +4,7 @@ package txn
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,6 +19,12 @@ import (
 )
 
 const DefaultMaxFiles = 40
+
+// maxNameLen is NAME_MAX on Linux and most file systems: the longest legal file name, in bytes.
+const maxNameLen = 255
+
+// memoryNote says where previews and undo history live: only in the running server process.
+const memoryNote = "previews and undo history live in memory in this server process and are gone after a restart"
 
 func newID() string {
 	b := make([]byte, 4)
@@ -135,10 +142,28 @@ func (g WriteGuard) CheckPlan(p *edits.EditPlan, allowLarge bool) error {
 	if limit == 0 {
 		limit = DefaultMaxFiles
 	}
-	if len(p.Changes) > limit && !allowLarge {
-		return toolerr.Inputf("the edit touches %d files (limit %d); review the preview and pass allow_large=true to proceed", len(p.Changes), limit)
+	if g.OverLimit(p, allowLarge) {
+		return toolerr.Inputf("the edit touches %d files (limit %d); pass allow_large=true to proceed", len(p.Changes), g.FileLimit())
 	}
 	return nil
+}
+
+// FileLimit is the most files one write may touch.
+func (g WriteGuard) FileLimit() int {
+	if g.MaxFiles == 0 {
+		return DefaultMaxFiles
+	}
+	return g.MaxFiles
+}
+
+// OverLimit reports whether p touches more files than one write may, without allowLarge.
+func (g WriteGuard) OverLimit(p *edits.EditPlan, allowLarge bool) bool {
+	return len(p.Changes) > g.FileLimit() && !allowLarge
+}
+
+// LargeRefusal is the refusal for a plan over the file limit: it names the preview id that apply_edit takes.
+func LargeRefusal(count, limit int, id string) string {
+	return fmt.Sprintf("the edit touches %d files (limit %d). Preview id %s; call apply_edit(id=%q, allow_large=true) to write it anyway.", count, limit, id, id)
 }
 
 // Applied is a written edit that can be undone.
@@ -187,13 +212,22 @@ func writeAtomic(path string, data []byte, mode *os.FileMode) error {
 	return nil
 }
 
-// createTemp creates "." + base + "." + id + ".tmp" beside path (os.CreateTemp would always give 0600). It is
+// tempName is the base name of a temp file beside a file named base: "." + base + "." + id + ".tmp" (the shape
+// leftoverTemps recognises), or a short fixed form when that would be longer than a legal name.
+func tempName(base, id string) string {
+	if n := "." + base + "." + id + ".tmp"; len(n) <= maxNameLen {
+		return n
+	}
+	return ".codenav-" + id + ".tmp"
+}
+
+// createTemp creates the temp file of writeAtomic beside path (os.CreateTemp would always give 0600). It is
 // created with 0644, so a new file ends up 0644 less the umask, as os.WriteFile gives it.
 func createTemp(path string) (*os.File, string, error) {
 	dir, base := filepath.Dir(path), filepath.Base(path)
 	var err error
 	for range 10 {
-		name := filepath.Join(dir, "."+base+"."+newID()+".tmp")
+		name := filepath.Join(dir, tempName(base, newID()))
 		var f *os.File
 		if f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644); err == nil {
 			return f, name, nil
@@ -203,6 +237,19 @@ func createTemp(path string) (*os.File, string, error) {
 		}
 	}
 	return nil, "", err
+}
+
+// cause is the reason in a file error without the path and the temp name, which make a long answer.
+func cause(err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return pe.Err
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return le.Err
+	}
+	return err
 }
 
 func writeChange(c edits.FileChange) error {
@@ -262,10 +309,30 @@ type Journal struct {
 	// Notify receives out-of-band messages (a degraded log, dropped history); may be nil.
 	Notify func(msg string)
 
-	mu      sync.Mutex
-	entries []*Applied
-	undone  map[string]bool // ids of edits reverted by Undo
-	max     int
+	mu         sync.Mutex
+	entries    []*Applied
+	undone     map[string]bool   // ids of edits reverted by Undo
+	dropped    map[string]string // ids of edits dropped by a workspace switch -> the switch
+	droppedIDs []string          // the same ids, oldest first (see remember)
+	max        int
+}
+
+// maxDropped caps how many dropped ids are remembered for the "dropped by" answers; the oldest are forgotten.
+const maxDropped = 200
+
+// remember records id as dropped with reason, keeping the newest maxDropped ids. m is initialised here.
+func remember(m map[string]string, order *[]string, id, reason string) {
+	if m == nil {
+		return
+	}
+	if _, seen := m[id]; !seen {
+		*order = append(*order, id)
+	}
+	m[id] = reason
+	for len(*order) > maxDropped {
+		delete(m, (*order)[0])
+		*order = (*order)[1:]
+	}
 }
 
 func NewJournal(g WriteGuard) *Journal {
@@ -284,6 +351,12 @@ func (j *Journal) Rebind(g WriteGuard) {
 	defer j.mu.Unlock()
 	if n := len(j.entries); n > 0 {
 		j.notify(fmt.Sprintf("the workspace changed to %s: the undo history of %d edit(s) in %s was dropped and cannot be reverted with undo_edit", g.Root, n, j.Guard.Root))
+	}
+	if j.dropped == nil {
+		j.dropped = map[string]string{}
+	}
+	for _, e := range j.entries {
+		remember(j.dropped, &j.droppedIDs, e.ID, "workspace switch to "+g.Root)
 	}
 	j.Guard, j.entries, j.undone, j.LogDir = g, nil, nil, DefaultLogDir(g.Root)
 }
@@ -415,7 +488,7 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 		if err != nil {
 			ilog.setState("rolling back")
 			stuck := j.rollback(written)
-			msg := fmt.Sprintf("writing %s failed (%v); ", edits.RelativeName(c.Path, j.Guard.Root), err)
+			msg := fmt.Sprintf("writing %s failed (%v); ", edits.RelativeName(c.Path, j.Guard.Root), cause(err))
 			if len(stuck) > 0 {
 				msg += "COULD NOT RESTORE: " + strings.Join(stuck, ", ")
 			} else {
@@ -459,9 +532,12 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			if j.undone[id] {
 				return nil, toolerr.Inputf("edit %q was already undone; no other edits are left to undo", id)
 			}
-			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server (or all were undone)", id)
+			if reason, ok := j.dropped[id]; ok {
+				return nil, droppedEdit(id, reason)
+			}
+			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server (or all were undone); %s", id, memoryNote)
 		}
-		return nil, toolerr.Inputf("nothing to undo: no edits were applied by this server")
+		return nil, toolerr.Inputf("nothing to undo: no edits were applied by this server; %s", memoryNote)
 	}
 	idx := len(j.entries) - 1
 	if id != "" {
@@ -474,6 +550,9 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			}
 		}
 		if idx < 0 {
+			if reason, ok := j.dropped[id]; ok {
+				return nil, droppedEdit(id, reason)
+			}
 			msg := fmt.Sprintf("unknown edit id %q (known: %s", id, strings.Join(known, ", "))
 			var gone []string
 			for u := range j.undone {
@@ -483,7 +562,7 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			if len(gone) > 0 {
 				msg += "; already undone: " + strings.Join(gone, ", ")
 			}
-			return nil, toolerr.Inputf("%s)", msg)
+			return nil, toolerr.Inputf("%s); %s", msg, memoryNote)
 		}
 	}
 	e := j.entries[idx]
@@ -534,7 +613,7 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 		if err != nil {
 			ilog.setState("rolling back")
 			stuck := j.rollback(written)
-			msg := fmt.Sprintf("undo of %s failed (%v); ", e.ID, err)
+			msg := fmt.Sprintf("undo of %s failed (%v); ", e.ID, cause(err))
 			if len(stuck) > 0 {
 				msg += "COULD NOT RESTORE: " + strings.Join(stuck, ", ")
 			} else {
@@ -558,6 +637,11 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 	return e, nil
 }
 
+// droppedEdit refuses an undo of an edit that a workspace switch dropped from the undo history.
+func droppedEdit(id, reason string) error {
+	return toolerr.Inputf("edit %q was dropped by the %s; undo_edit cannot revert it in this workspace", id, reason)
+}
+
 // WasUndone reports whether the edit with this id was reverted by Undo.
 func (j *Journal) WasUndone(id string) bool {
 	j.mu.Lock()
@@ -571,15 +655,34 @@ type PlanStore struct {
 	ids   []string
 	plans map[string]*edits.EditPlan
 	used  map[string]string // preview ids already applied -> the edit id they became
+	// dropped holds the preview ids that Clear dropped -> the reason it gave; droppedIDs keeps them oldest first.
+	dropped    map[string]string
+	droppedIDs []string
 }
 
 func NewPlanStore() *PlanStore {
-	return &PlanStore{plans: map[string]*edits.EditPlan{}, used: map[string]string{}}
+	return &PlanStore{plans: map[string]*edits.EditPlan{}, used: map[string]string{}, dropped: map[string]string{}}
 }
 
 func (s *PlanStore) Add(p *edits.EditPlan) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.addLocked(p)
+}
+
+// PreviewID is the id of p in the store: its id when it is stored already, else the id of a new preview.
+func (s *PlanStore) PreviewID(p *edits.EditPlan) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, q := range s.plans {
+		if q == p {
+			return id
+		}
+	}
+	return s.addLocked(p)
+}
+
+func (s *PlanStore) addLocked(p *edits.EditPlan) string {
 	id := newID()
 	p.Previewed = true
 	s.plans[id] = p
@@ -599,10 +702,13 @@ func (s *PlanStore) Get(id string) (*edits.EditPlan, error) {
 		if eid, done := s.used[id]; done {
 			return nil, toolerr.Inputf("preview %q was already applied as edit %s; undo_edit(id=%q) reverts it", id, eid, eid)
 		}
-		if len(s.ids) == 0 {
-			return nil, toolerr.Inputf("unknown or expired preview id %q (no previews are pending)", id)
+		if reason, gone := s.dropped[id]; gone {
+			return nil, toolerr.Inputf("preview %q was dropped by the %s; run the refactoring again in this workspace for a fresh preview", id, reason)
 		}
-		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s)", id, strings.Join(s.ids, ", "))
+		if len(s.ids) == 0 {
+			return nil, toolerr.Inputf("unknown or expired preview id %q (no previews are pending); %s; use undo_edit with an applied edit id", id, memoryNote)
+		}
+		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s); %s; use undo_edit with an applied edit id", id, strings.Join(s.ids, ", "), memoryNote)
 	}
 	return p, nil
 }
@@ -635,8 +741,16 @@ func (s *PlanStore) MarkApplied(id, editID string) {
 	s.used[id] = editID
 }
 
-func (s *PlanStore) Clear() {
+// Clear drops every pending preview. reason says why (for example "workspace switch to <root>"); a later
+// apply_edit of a dropped id says so.
+func (s *PlanStore) Clear(reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.dropped == nil {
+		s.dropped = map[string]string{}
+	}
+	for _, id := range s.ids {
+		remember(s.dropped, &s.droppedIDs, id, reason)
+	}
 	s.plans, s.ids, s.used = map[string]*edits.EditPlan{}, nil, map[string]string{}
 }

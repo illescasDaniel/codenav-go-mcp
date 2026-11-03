@@ -178,7 +178,7 @@ func (m *Manager) Acquire(ctx context.Context, sess *mcp.ServerSession) (*tools.
 		case sel.Root != m.sel.Root:
 			m.journal.Rebind(guardFor(sel.Root)) // posts a notice when undo history is dropped
 			m.journal.CheckPending()
-			m.store.Clear()
+			m.store.Clear("workspace switch to " + sel.Root)
 		}
 		// Same workspace after a gopls restart: edits and previews are still valid.
 		m.sel = sel
