@@ -1,0 +1,216 @@
+package buildscope
+
+import (
+	"fmt"
+	"go/build"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
+)
+
+// linuxAMD64 is the build of the tests: linux/amd64 with the given tags only.
+func linuxAMD64(tags ...string) *build.Context {
+	c := build.Default
+	c.GOOS, c.GOARCH, c.BuildTags = "linux", "amd64", tags
+	return &c
+}
+
+func write(t *testing.T, root, rel, src string) string {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+var kindNames = map[Kind]string{Use: "use", Decl: "decl", Member: "member", Asm: "asm"}
+
+// summary renders hits as sorted "file:line kind" lines, relative to root.
+func summary(root string, hs []Hit) []string {
+	var out []string
+	for _, h := range hs {
+		rel, _ := filepath.Rel(root, h.Path)
+		out = append(out, fmt.Sprintf("%s:%d %s", filepath.ToSlash(rel), h.Line, kindNames[h.Kind]))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func equalLines(t *testing.T, got, want []string) {
+	t.Helper()
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
+	}
+}
+
+// bed is a module example.com/m whose package p (the declaring package) holds Plat and Run.
+func bed(t *testing.T) (root, declFile string) {
+	t.Helper()
+	root = t.TempDir()
+	write(t, root, "go.mod", "module example.com/m\n\ngo 1.24\n")
+	declFile = write(t, root, "p/p.go", "package p\n\nfunc Plat(n int) int { return n }\n\nfunc Run() int { return Plat(1) }\n")
+	return root, declFile
+}
+
+func TestExcludedReasons(t *testing.T) {
+	c := linuxAMD64()
+	dir := t.TempDir()
+	for i, tc := range []struct {
+		name, src, reason string
+		excluded          bool
+	}{
+		{"a.go", "package p\n", "", false},
+		{"a_linux.go", "package p\n", "", false},
+		{"a_windows.go", "package p\n", "file name suffix _windows", true},
+		{"a_linux_amd64.go", "package p\n", "", false},
+		{"a_linux_arm64.go", "package p\n", "file name suffix _linux_arm64", true},
+		{"linux_amd64.go", "package p\n", "", false},
+		{"a_windows_test.go", "package p\n", "file name suffix _windows", true},
+		{"a_test.go", "package p\n", "", false},
+		{"a.go", "//go:build linux && arm64\n\npackage p\n", "//go:build linux && arm64", true},
+		{"a.go", "//go:build ignore\n\npackage main\n", "//go:build ignore", true},
+		{"_a.go", "package p\n", "its name starts with _ or . (the go tool ignores it)", true},
+	} {
+		p := write(t, dir, fmt.Sprintf("case%d/%s", i, tc.name), tc.src)
+		reason, excluded := Excluded(c, p)
+		if excluded != tc.excluded || reason != tc.reason {
+			t.Errorf("%s %q: Excluded = (%q, %v), want (%q, %v)", tc.name, tc.src, reason, excluded, tc.reason, tc.excluded)
+		}
+	}
+}
+
+func TestNameConstraintAndNeverBuilt(t *testing.T) {
+	for file, want := range map[string]string{
+		"x_windows.go": "file name suffix _windows", "x_linux_arm64.go": "file name suffix _linux_arm64",
+		"x_amd64.go": "file name suffix _amd64", "x_windows_test.go": "file name suffix _windows",
+		"linux.go": "", "x_y.go": "", "x_test.go": "",
+	} {
+		if got := NameConstraint(file); got != want {
+			t.Errorf("NameConstraint(%q) = %q, want %q", file, got, want)
+		}
+	}
+	for cons, want := range map[string]bool{
+		"//go:build ignore": true, "//go:build ignore || !ignore": false, "//go:build linux": false,
+		"//go:build !linux": false, "// not a constraint": false,
+	} {
+		if got := NeverBuilt(cons); got != want {
+			t.Errorf("NeverBuilt(%q) = %v, want %v", cons, got, want)
+		}
+	}
+}
+
+func TestContextReadsBuildFlagTags(t *testing.T) {
+	t.Setenv(gomod.EnvBuildFlags, "-race -tags=integration,e2e --tags=mock")
+	if got := Context().BuildTags; strings.Join(got, ",") != "integration,e2e,mock" {
+		t.Errorf("tags %v", got)
+	}
+	t.Setenv(gomod.EnvBuildFlags, "-tags wasm")
+	if got := Context().BuildTags; strings.Join(got, ",") != "wasm" {
+		t.Errorf("tags %v", got)
+	}
+	t.Setenv(gomod.EnvBuildFlags, "")
+	if got := Context().BuildTags; len(got) != 0 {
+		t.Errorf("no flags, tags %v", got)
+	}
+}
+
+func TestMentionsSameDirectory(t *testing.T) {
+	root, declFile := bed(t)
+	write(t, root, "p/x_windows.go", "package p\n\nfunc WinRun() int { return Plat(2) }\n")
+	write(t, root, "p/y_linux.go", "package p\n\nfunc Y() int { return Plat(3) }\n")                     // built: not reported
+	write(t, root, "p/z.go", "//go:build integration\n\npackage p\n\nfunc Z() int { return Plat(4) }\n") // excluded without the tag
+	write(t, root, "p/gen.go", "//go:build ignore\n\npackage main\n\nfunc main() { _ = Plat(0) }\n")     // never built
+	write(t, root, "p/_scratch.go", "package p\n\nfunc S() int { return Plat(5) }\n")                    // ignored by the go tool
+	write(t, root, "p/decl_windows.go", "package p\n\nfunc Plat(n int) int { return n }\n")
+	write(t, root, "p/quiet_windows.go", "package p\n\n// Plat is named in a comment.\nvar label = \"Plat\"\n\ntype box struct{ Plat int }\n\nfunc Sh() int {\n\tPlat := 3\n\tb := box{}\n\treturn b.Plat + Plat\n}\n")
+	q := Query{Root: root, DeclFile: declFile, Name: "Plat"}
+
+	equalLines(t, summary(root, Mentions(linuxAMD64(), q)), []string{
+		"p/decl_windows.go:3 decl", "p/x_windows.go:3 use", "p/z.go:5 use",
+	})
+	// With the integration tag, z.go is part of the build (gopls sees it), so it is not reported.
+	equalLines(t, summary(root, Mentions(linuxAMD64("integration"), q)), []string{
+		"p/decl_windows.go:3 decl", "p/x_windows.go:3 use",
+	})
+}
+
+func TestMentionsReasonAndAsm(t *testing.T) {
+	root, declFile := bed(t)
+	write(t, root, "p/x_windows.go", "package p\n\nfunc WinRun() int { return Plat(2) }\n")
+	write(t, root, "p/z.go", "//go:build integration\n\npackage p\n\nfunc Z() int { return Plat(4) }\n")
+	write(t, root, "p/asm_amd64.s", "#include \"textflag.h\"\n\nTEXT ·Plat(SB), NOSPLIT, $0-16\n\tRET\n")
+	write(t, root, "p/asm_arm64.s", "TEXT ·Plat(SB), NOSPLIT, $0-16\n\tRET\n")
+	hs := Mentions(linuxAMD64(), Query{Root: root, DeclFile: declFile, Name: "Plat"})
+	reasons := map[string]string{}
+	for _, h := range hs {
+		rel, _ := filepath.Rel(root, h.Path)
+		reasons[filepath.ToSlash(rel)+" "+kindNames[h.Kind]] = h.Reason
+	}
+	if reasons["p/x_windows.go use"] != "file name suffix _windows" {
+		t.Errorf("use reason: %v", reasons)
+	}
+	if r, ok := reasons["p/asm_amd64.s asm"]; !ok || r != "" {
+		t.Errorf("built asm file should be a hit without a reason: %v", reasons)
+	}
+	if r := reasons["p/asm_arm64.s asm"]; r != "file name suffix _arm64" {
+		t.Errorf("excluded asm file reason %q in %v", r, reasons)
+	}
+	if _, ok := reasons["p/z.go use"]; !ok {
+		t.Errorf("the integration-tagged file is excluded without the tag and must be reported: %v", reasons)
+	}
+	// Positions are 1-based; the column is the name's own (the call is "return Plat(2)" on line 3).
+	for _, h := range hs {
+		if h.Kind == Use && filepath.Base(h.Path) == "x_windows.go" && (h.Line != 3 || h.Col != 28) {
+			t.Errorf("use at %d:%d, want 3:28", h.Line, h.Col)
+		}
+	}
+}
+
+func TestMentionsOtherPackagesNeedAnImport(t *testing.T) {
+	root, declFile := bed(t)
+	write(t, root, "q/q_windows.go", "package q\n\nimport alias \"example.com/m/p\"\n\nfunc Q() int { return alias.Plat(6) }\n")
+	write(t, root, "q/r_windows.go", "package q\n\nimport \"example.com/m/p\"\n\nfunc R() int { return p.Plat(7) }\n")
+	write(t, root, "q/own_windows.go", "package q\n\nfunc Plat(n int) int { return n }\n\nfunc O() int { return Plat(8) }\n")
+	write(t, root, "q/shadow_windows.go", "package q\n\nimport \"example.com/m/p\"\n\nfunc S(p int) int { return p }\n")
+	q := Query{Root: root, DeclFile: declFile, Name: "Plat", ImportPath: "example.com/m/p"}
+
+	// The package q's own Plat is a different object; the files that import p are the uses.
+	equalLines(t, summary(root, Mentions(linuxAMD64(), q)), []string{"q/q_windows.go:5 use", "q/r_windows.go:5 use"})
+
+	// An unexported name is not reachable from other packages.
+	q.Name = "plat"
+	if got := Mentions(linuxAMD64(), q); len(got) != 0 {
+		t.Errorf("unexported name in other packages: %v", summary(root, got))
+	}
+}
+
+func TestMentionsMembers(t *testing.T) {
+	root, declFile := bed(t)
+	write(t, root, "p/m_windows.go", "package p\n\ntype Store struct{}\n\nfunc (Store) Get() int { return 1 }\n\nfunc useGet(s Store) int { return s.Get() }\n")
+	q := Query{Root: root, DeclFile: declFile, Name: "Get", Member: true}
+	equalLines(t, summary(root, Mentions(linuxAMD64(), q)), []string{"p/m_windows.go:5 member", "p/m_windows.go:7 member"})
+	// As a package-level name, Get is not declared at top level (the method is a member): nothing to report.
+	q.Member = false
+	if got := Mentions(linuxAMD64(), q); len(got) != 0 {
+		t.Errorf("package-level Get: %v", summary(root, got))
+	}
+}
+
+func TestMentionsReadsTextsOverDisk(t *testing.T) {
+	root, declFile := bed(t)
+	x := write(t, root, "p/x_windows.go", "package p\n\nfunc WinRun() int { return Plat(2) }\n")
+	q := Query{Root: root, DeclFile: declFile, Name: "Plat", Texts: map[string]string{
+		x: "package p\n\nfunc WinRun() int { return 2 }\n",
+	}}
+	if got := Mentions(linuxAMD64(), q); len(got) != 0 {
+		t.Errorf("the edited text has no mention: %v", summary(root, got))
+	}
+}

@@ -260,6 +260,9 @@ type EditPlan struct {
 	BaseHashes  map[string]string // path -> hash of bytes at plan time ("" = absent)
 	AllowLarge  bool              // allow_large was given when the plan was made; apply_edit honours it
 	Previewed   bool              // kept in the plan store: a preview exists for it
+	// Holds are reasons the gate cannot check the plan (code the build leaves out still uses what it changes):
+	// apply=true keeps the plan as a preview while any is set. apply_edit clears them, it is the override.
+	Holds []string
 }
 
 func NewPlan(desc string, changes []FileChange, notes ...string) *EditPlan {

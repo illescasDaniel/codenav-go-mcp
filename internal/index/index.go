@@ -22,6 +22,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
 )
 
@@ -219,37 +220,6 @@ func (ix *Index) Prefix(q string) []Entry {
 	return out
 }
 
-var knownOS = setOf("aix", "android", "darwin", "dragonfly", "freebsd", "hurd", "illumos", "ios", "js", "linux", "nacl", "netbsd", "openbsd", "plan9", "solaris", "wasip1", "windows", "zos")
-var knownArch = setOf("386", "amd64", "amd64p32", "arm", "armbe", "arm64", "arm64be", "loong64", "mips", "mipsle", "mips64", "mips64le", "mips64p32", "mips64p32le", "ppc", "ppc64", "ppc64le", "riscv", "riscv64", "s390", "s390x", "sparc", "sparc64", "wasm")
-
-func setOf(s ...string) map[string]bool {
-	m := map[string]bool{}
-	for _, x := range s {
-		m[x] = true
-	}
-	return m
-}
-
-// nameConstraint is the GOOS/GOARCH suffix of a file name (foo_linux.go, foo_linux_arm64.go), "" if none.
-func nameConstraint(file string) string {
-	name := strings.TrimSuffix(strings.TrimSuffix(filepath.Base(file), ".go"), "_test")
-	parts := strings.Split(name, "_")
-	if len(parts) < 2 {
-		return ""
-	}
-	last := parts[len(parts)-1]
-	if knownArch[last] {
-		if len(parts) >= 3 && knownOS[parts[len(parts)-2]] {
-			return "file name suffix _" + parts[len(parts)-2] + "_" + last
-		}
-		return "file name suffix _" + last
-	}
-	if knownOS[last] {
-		return "file name suffix _" + last
-	}
-	return ""
-}
-
 // headerConstraint is the //go:build (or legacy // +build) line before the package clause.
 func headerConstraint(f *ast.File) string {
 	plus := ""
@@ -293,25 +263,7 @@ func UnbuildableText(path, src string) bool {
 		return true
 	}
 	f, _ := parser.ParseFile(token.NewFileSet(), path, src, parser.PackageClauseOnly|parser.ParseComments)
-	return f != nil && f.Name != nil && neverBuilt(headerConstraint(f))
-}
-
-// neverBuilt: the constraint needs the conventional "ignore" tag (//go:build ignore), which no build sets,
-// whatever the other tags are. Such files are scratch programs and generators, not part of any package.
-func neverBuilt(cons string) bool {
-	if !constraint.IsGoBuild(cons) {
-		return false
-	}
-	expr, err := constraint.Parse(cons)
-	if err != nil {
-		return false
-	}
-	for _, other := range []bool{true, false} {
-		if expr.Eval(func(tag string) bool { return tag != "ignore" && other }) {
-			return false
-		}
-	}
-	return true
+	return f != nil && f.Name != nil && buildscope.NeverBuilt(headerConstraint(f))
 }
 
 // utf16Col is the UTF-16 length of the line's text before byte offset off.
@@ -338,11 +290,11 @@ func parseFile(path string) []Entry {
 	}
 	tf := fset.File(f.Pos())
 	cons := headerConstraint(f)
-	if neverBuilt(cons) {
+	if buildscope.NeverBuilt(cons) {
 		return nil
 	}
 	if cons == "" {
-		cons = nameConstraint(path)
+		cons = buildscope.NameConstraint(path)
 	}
 	dir := filepath.Dir(path)
 	test := strings.HasSuffix(path, "_test.go")

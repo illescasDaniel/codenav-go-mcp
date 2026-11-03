@@ -210,6 +210,13 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	readOnly := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv) != nil
 	refused := false // a write that was not made: the answer is a refusal (isError), the text still shows the diff
 	switch {
+	case apply && len(plan.Holds) > 0 && !readOnly:
+		// A check the gate cannot make (code the build leaves out): held as a preview, like new errors.
+		refused = true
+		plan.AllowLarge = allowLarge
+		id := w.Store.Add(plan)
+		out = append(out, "", "Not written: "+strings.Join(plan.Holds, " ")+fmt.Sprintf(" Preview id %s; call apply_edit(id=%q%s) to write it anyway.", id, id, largeArg(w, plan)))
+		out = append(out, "", plan.Diff(w.Root, 2, 120))
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
 			// The diff still goes with the refusal: a read-only server exists to show what would change.
@@ -243,6 +250,9 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Preview only (apply=false). apply_edit(id=%q%s) writes it.", id, largeArg(w, plan)))
+		if len(plan.Holds) > 0 {
+			out = append(out, "Warning: with apply=true this edit is not written: "+strings.Join(plan.Holds, " "))
+		}
 		if maxNew >= 0 && newErrs > maxNew {
 			out = append(out, fmt.Sprintf("Warning: with apply=true this edit would be refused, because its %d new error(s) exceed max_new_errors=%s; it would apply with max_new_errors=%d (or -1 for no limit). apply_edit(id=%q) writes it regardless.", newErrs, maxErrors(maxNew), newErrs, id))
 		}
@@ -634,6 +644,7 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 				if err != nil {
 					return "", err
 				}
+				plan.Holds = nil // the holds were shown with the preview; apply_edit writes it anyway
 				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge)
 				if err != nil {
 					return "", err
