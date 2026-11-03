@@ -52,7 +52,7 @@ func text(s string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: s}}}
 }
 
-// add registers a read-only text tool; expected errors become tool text.
+// add registers a read-only text tool; expected errors become tool text (isError set, see finishResult).
 func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	registerUsage[In](name)
 	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true}}
@@ -64,22 +64,25 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 				out, err = fn(ctx, w, in)
 			}
 		}
-		res, rerr := finishResult(ctx, h, w, out, err)
+		res, rerr := finishResult(ctx, h, w, false, out, err)
 		return res, nil, rerr
 	})
 }
 
 // finishResult turns a handler's outcome into the tool result, the one place every answer passes: an
 // unexpected error is returned as is; the text is shown with workspace-relative paths and a bounded size,
-// plus the broken-configuration warning (not for plain argument mistakes) and pending notices.
-func finishResult(ctx context.Context, h Host, w *Workspace, out string, err error) (*mcp.CallToolResult, error) {
-	trivial := false
+// plus the broken-configuration warning (not for plain argument mistakes) and pending notices. A refusal or
+// a failure sets isError; a valid query with no match does not (toolerr.InputError.NotFound), except in the
+// write tools (write), where it is a refused change.
+func finishResult(ctx context.Context, h Host, w *Workspace, write bool, out string, err error) (*mcp.CallToolResult, error) {
+	trivial, failed := false, false
 	if err != nil {
 		t, ok := toolerr.Format(err)
 		if !ok {
 			return nil, err
 		}
 		out, trivial = t, toolerr.IsTrivial(err)
+		failed = write || !toolerr.IsNotFound(err)
 	}
 	if w != nil {
 		out = w.scrub(out)
@@ -88,7 +91,9 @@ func finishResult(ctx context.Context, h Host, w *Workspace, out string, err err
 	if !trivial {
 		out = w.withConfigProblem(ctx, out)
 	}
-	return text(h.Notes().Annotate(out)), nil
+	res := text(h.Notes().Annotate(out))
+	res.IsError = failed
+	return res, nil
 }
 
 // maxOutputBytes bounds one answer; the rest is dropped with a note saying how much.
@@ -437,7 +442,7 @@ func friendlyNavErr(err error, file string, line, col int) error {
 	case strings.Contains(re.Message, "no package metadata"):
 		return notCompiledErr(file)
 	case strings.Contains(re.Message, "no identifier found"):
-		return toolerr.Inputf("No identifier at %s:%d:%d.", file, line, col)
+		return toolerr.NotFoundf("No identifier at %s:%d:%d.", file, line, col)
 	}
 	return err
 }

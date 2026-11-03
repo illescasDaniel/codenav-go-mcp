@@ -183,21 +183,33 @@ type qfResult struct {
 	notFixed []string
 	wrote    bool
 	plain    bool // nothing was targeted: no Applied/Not fixed tail
+	refused  bool // the request could not be carried out (a refusal: isError), its reason is in out
 }
 
 // quickFix runs quickFixRun and ends the answer with "Applied:" and "Not fixed:" lines.
 func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) {
 	r, err := quickFixRun(ctx, w, in)
-	if err != nil {
+	if err != nil && r.out == "" {
 		return "", err
 	}
+	answer := quickFixText(r)
+	if err != nil || r.refused {
+		// A refused write (err, its text is in r.out) or a fix that could not be made: the Applied / Not fixed
+		// tail goes with the refusal.
+		return "", toolerr.Inputf("%s", answer)
+	}
+	return answer, nil
+}
+
+// quickFixText is the answer of one quick_fix run, ending with the "Applied:" and "Not fixed:" lines.
+func quickFixText(r qfResult) string {
 	if r.plain || (len(r.titles) == 0 && len(r.notFixed) == 0 && !r.wrote) {
-		return r.out, nil
+		return r.out
 	}
 	if !r.wrote && len(r.notFixed) == 0 {
 		// A preview (or a refusal) where everything targeted is fixable: "Applied: nothing (not written ...)" and
 		// "Not fixed: none" would only repeat what the Preview / Not written line says.
-		return r.out, nil
+		return r.out
 	}
 	applied := "nothing"
 	switch {
@@ -213,7 +225,7 @@ func quickFix(ctx context.Context, w *Workspace, in quickFixIn) (string, error) 
 			left += fmt.Sprintf("; +%d more", n-12)
 		}
 	}
-	return r.out + "\nApplied: " + applied + "\nNot fixed: " + left, nil
+	return r.out + "\nApplied: " + applied + "\nNot fixed: " + left
 }
 
 func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, error) {
@@ -253,7 +265,7 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 		}
 		if len(acts) == 0 {
 			if len(cmdOnly) > 0 {
-				return qfResult{out: fmt.Sprintf("gopls offers '%s' only as a command (not supported).", cmdOnly[0])}, nil
+				return qfResult{out: fmt.Sprintf("gopls offers '%s' only as a command (not supported).", cmdOnly[0]), refused: true}, nil
 			}
 			return qfResult{out: clean}, nil
 		}
@@ -308,7 +320,7 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 				if len(codes) > 0 {
 					have += "; codes present: " + strings.Join(codes, ", ")
 				}
-				return qfResult{out: fmt.Sprintf("No diagnostics %s in %s (%s).", what, rel, have), plain: true}, nil
+				return qfResult{out: fmt.Sprintf("No diagnostics %s in %s (%s).", what, rel, have), plain: true, refused: true}, nil
 			}
 			return qfResult{out: "No diagnostics to fix in " + rel + at + ".", plain: true}, nil
 		}
@@ -430,10 +442,10 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 		skipped := skippedDiagnostics(wanted)
 		if len(ambiguous) > 0 {
 			return qfResult{out: "Several fixes apply; nothing was changed. Repeat with choice=\"<part of a title>\":\n  " + strings.Join(ambiguous, "\n  ") + skipped,
-				notFixed: left("not applied: other diagnostics need a choice")}, nil
+				notFixed: left("not applied: other diagnostics need a choice"), refused: true}, nil
 		}
 		if len(noMatch) > 0 && len(all) == 0 && len(importSpecs) == 0 {
-			return qfResult{out: fmt.Sprintf("No fix matches choice=%q; nothing was changed. Offered:\n  %s%s", in.Choice, strings.Join(noMatch, "\n  "), skipped), notFixed: left("")}, nil
+			return qfResult{out: fmt.Sprintf("No fix matches choice=%q; nothing was changed. Offered:\n  %s%s", in.Choice, strings.Join(noMatch, "\n  "), skipped), notFixed: left(""), refused: true}, nil
 		}
 		if len(all) == 0 && len(importSpecs) == 0 {
 			hint := ""
@@ -451,9 +463,9 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 					unfixable = append(unfixable, fmt.Sprintf("line %d: %s", d.Range.Start.Line+1, strings.SplitN(d.Message, "\n", 2)[0]))
 				}
 				return qfResult{out: fmt.Sprintf("gopls offers no quick fix that changes anything for the %d diagnostic(s): %s.%s%s", len(wanted), strings.Join(unfixable, "; "), hint, skipped),
-					notFixed: left("the fix offered changes nothing")}, nil
+					notFixed: left("the fix offered changes nothing"), refused: true}, nil
 			}
-			return qfResult{out: "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint + skipped, notFixed: left("")}, nil
+			return qfResult{out: "gopls offers no quick fix for: " + strings.Join(unfixable[:min(len(unfixable), 6)], "; ") + "." + hint + skipped, notFixed: left(""), refused: true}, nil
 		}
 		// A strict run applies all or nothing; a choice that fits only some diagnostics is usually aimed
 		// at one fix, so it is strict unless asked otherwise.

@@ -238,7 +238,7 @@ func editSymbol(ctx context.Context, w *Workspace, in editSymbolIn) (string, err
 		var refused string
 		plan, refused, err = deleteSymbol(ctx, w, in, prune)
 		if err == nil && refused != "" {
-			return refused, nil
+			return "", toolerr.Inputf("%s", refused)
 		}
 	default:
 		return "", toolerr.Inputf("unknown action %q: use replace, insert or delete.", in.Action)

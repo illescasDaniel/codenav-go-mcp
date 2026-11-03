@@ -208,11 +208,14 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 	}
 	newErrs := len(delta.NewErrors())
 	readOnly := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv) != nil
+	refused := false // a write that was not made: the answer is a refusal (isError), the text still shows the diff
 	switch {
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
 			// The diff still goes with the refusal: a read-only server exists to show what would change.
-			return strings.Join(append(out, "", "Not written: "+err.Error(), "", plan.Diff(w.Root, 2, 200)), "\n"), "", nil
+			refused = true
+			out = append(out, "", "Not written: "+err.Error(), "", plan.Diff(w.Root, 2, 200))
+			break
 		}
 		e, err := w.Journal.Apply(plan, allowLarge, ReadOnlyEnv)
 		if err != nil {
@@ -222,8 +225,10 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		_ = w.Client.NoteWritten(planPaths(plan))
 		out = append(out, "", fmt.Sprintf("Applied (edit id %s); undo_edit reverts it.", e.ID))
 	case apply && readOnly:
+		refused = true
 		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s, and write tools are disabled (%s).", newErrs, maxErrors(maxNew), ReadOnlyEnv), "", plan.Diff(w.Root, 2, 120))
 	case apply:
+		refused = true
 		plan.AllowLarge = allowLarge
 		id := w.Store.Add(plan)
 		out = append(out, "", fmt.Sprintf("Not written: %d new error(s) exceed max_new_errors=%s. Preview id %s; call apply_edit(id=%q%s) to write it anyway.", newErrs, maxErrors(maxNew), id, id, largeArg(w, plan)))
@@ -243,7 +248,12 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		}
 		out = append(out, "", plan.Diff(w.Root, 2, 200))
 	}
-	return strings.Join(out, "\n"), editID, nil
+	answer := strings.Join(out, "\n")
+	if refused {
+		// The text is the answer and the error carries it too (a refusal is isError; the caller keeps the text).
+		return answer, "", toolerr.Inputf("%s", answer)
+	}
+	return answer, editID, nil
 }
 
 // largeArg is the extra apply_edit argument a preview over the file limit needs: none when
@@ -319,7 +329,7 @@ func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, f
 				out, err = fn(ctx, w, in)
 			}
 		}
-		res, rerr := finishResult(ctx, h, w, out, err)
+		res, rerr := finishResult(ctx, h, w, true, out, err)
 		return res, nil, rerr
 	})
 }

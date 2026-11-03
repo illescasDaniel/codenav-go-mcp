@@ -21,12 +21,21 @@ type InputError struct {
 	// Trivial marks a mistake in the arguments themselves (a bad identifier, an old_string that is not in the
 	// file): the Go configuration of the workspace has nothing to do with it.
 	Trivial bool
+	// NotFound marks a valid query that names nothing in the workspace (no symbol of that name, no identifier
+	// at that position). The read tools answer it as a result, not a failed call (isError false); the write
+	// tools still report it as an error, because the change they were asked for was not made.
+	NotFound bool
 }
 
 func (e *InputError) Error() string { return e.Msg }
 
-// Inputf builds an InputError.
+// Inputf builds an InputError: a refused call (isError true).
 func Inputf(format string, args ...any) error { return &InputError{Msg: fmt.Sprintf(format, args...)} }
+
+// NotFoundf builds an InputError for a valid query with no match (see InputError.NotFound).
+func NotFoundf(format string, args ...any) error {
+	return &InputError{Msg: fmt.Sprintf(format, args...), NotFound: true}
+}
 
 // Argf builds an InputError for a mistake in the call's arguments, unrelated to the workspace.
 func Argf(format string, args ...any) error {
@@ -37,6 +46,12 @@ func Argf(format string, args ...any) error {
 func IsTrivial(err error) bool {
 	var ie *InputError
 	return errors.As(err, &ie) && ie.Trivial
+}
+
+// IsNotFound reports whether err is a valid query with no match (see InputError.NotFound).
+func IsNotFound(err error) bool {
+	var ie *InputError
+	return errors.As(err, &ie) && ie.NotFound
 }
 
 // Format turns err into the text a tool returns; ok is false for unexpected errors.

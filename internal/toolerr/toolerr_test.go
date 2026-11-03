@@ -1,6 +1,8 @@
 package toolerr
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -30,5 +32,25 @@ func TestFriendlyLSP(t *testing.T) {
 		if strings.Contains(got, "file://") || strings.Contains(got, "LSP error") || strings.Contains(got, "codenav_probe") {
 			t.Errorf("%s: raw text leaked: %q", name, got)
 		}
+	}
+}
+
+// BUG-SRCH-009: only a valid query with no match is NotFound; a refusal and an unexpected error are not.
+func TestNotFoundMarking(t *testing.T) {
+	for name, c := range map[string]struct {
+		err      error
+		notFound bool
+	}{
+		"not found":         {NotFoundf("No symbol found matching %q.", "X"), true},
+		"wrapped not found": {fmt.Errorf("wrap: %w", NotFoundf("No identifier at a.go:1:1.")), true},
+		"refusal":           {Inputf("%s is not a .go file.", "x"), false},
+		"unexpected":        {errors.New("boom"), false},
+	} {
+		if got := IsNotFound(c.err); got != c.notFound {
+			t.Errorf("%s: IsNotFound=%v, want %v", name, got, c.notFound)
+		}
+	}
+	if got, ok := Format(NotFoundf("No identifier at %s:%d:%d.", "a.go", 2, 3)); !ok || got != "No identifier at a.go:2:3." {
+		t.Errorf("NotFoundf text: %q %v", got, ok)
 	}
 }

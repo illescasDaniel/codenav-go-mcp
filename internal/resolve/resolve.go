@@ -162,8 +162,9 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 	return strings.Join(lines, "\n")
 }
 
-// NotFoundError is a name that matches no workspace symbol. It reads as an input error; callers
-// that know more about the language can replace the hint (see Query).
+// NotFoundError is a name that matches no workspace symbol. Its Err is an InputError marked NotFound
+// (a valid query with no match, not a refusal); callers that know more about the language can replace
+// the hint (see Query).
 type NotFoundError struct {
 	Query string
 	Err   *toolerr.InputError
@@ -355,7 +356,7 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 				}
 			}
 			sug = closestSpellings(sug, query)
-			return Symbol{}, &NotFoundError{Query: query, Suggest: sug, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q (names are case-sensitive).", query), Hint: sug}}
+			return Symbol{}, &NotFoundError{Query: query, Suggest: sug, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q (names are case-sensitive).", query), Hint: sug, NotFound: true}}
 		}
 		cands = loose
 		folded = len(loose) > 0
@@ -392,7 +393,7 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 			if _, serr := os.Stat(fp); serr != nil {
 				return Symbol{}, toolerr.Inputf("File %q does not exist in the workspace; %q is declared in %d other place(s):\n%s", file, query, len(cands), candidateLines(cands, root))
 			}
-			return Symbol{}, toolerr.Inputf("No symbol %q in %q; %d match(es) elsewhere:\n%s", query, file, len(cands), candidateLines(cands, root))
+			return Symbol{}, toolerr.NotFoundf("No symbol %q in %q; %d match(es) elsewhere:\n%s", query, file, len(cands), candidateLines(cands, root))
 		}
 		cands = narrowed
 	}
@@ -411,7 +412,7 @@ func resolve(ctx context.Context, c *lsp.Client, ix *index.Index, root, query, f
 		if !strings.Contains(query, ".") {
 			hint = " (struct fields and methods are named Type.Name)"
 		}
-		return Symbol{}, &NotFoundError{Query: query, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q%s.", query, hint)}}
+		return Symbol{}, &NotFoundError{Query: query, Err: &toolerr.InputError{Msg: fmt.Sprintf("No symbol found matching %q%s.", query, hint), NotFound: true}}
 	case 1:
 		sym := fromLSP(cands[0])
 		sym.Unbuilt = onlyIndex[cands[0]] && cands[0].Detail != ""

@@ -32,7 +32,7 @@ func resolveSymbol(ctx context.Context, w *Workspace, name, file string) (resolv
 	sym, err := resolve.ResolveExact(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if errors.As(err, &nf) {
-		return sym, &toolerr.InputError{Msg: notFoundMessage(ctx, w, nf.Query, false, nf.Suggest), Hint: nf.Suggest}
+		return sym, &toolerr.InputError{Msg: notFoundMessage(ctx, w, nf.Query, false, nf.Suggest), Hint: nf.Suggest, NotFound: true}
 	}
 	return sym, err
 }
@@ -52,11 +52,11 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	case perr == nil:
 		return psym, nil
 	case errors.Is(perr, resolve.ErrNoProbe):
-		return sym, toolerr.Inputf("%s", notFoundMessage(ctx, w, nf.Query, false, nil))
+		return sym, toolerr.NotFoundf("%s", notFoundMessage(ctx, w, nf.Query, false, nil))
 	}
 	var pe *resolve.ProbeError
 	if errors.As(perr, &pe) {
-		return sym, toolerr.Inputf("No symbol found matching %q: %s.", nf.Query, pe.Msg)
+		return sym, toolerr.NotFoundf("No symbol found matching %q: %s.", nf.Query, pe.Msg)
 	}
 	return sym, perr
 }
