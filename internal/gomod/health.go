@@ -18,13 +18,22 @@ import (
 // noGoMsg is the health problem when the go command is not on PATH (gopls and every load need it).
 const noGoMsg = "the go command was not found on PATH"
 
+// gopathMsg is the health problem with GO111MODULE=off: gopls does not load GOPATH-mode packages, and `go list -m`
+// refuses to run, which used to be reported as a broken configuration.
+const gopathMsg = "GOPATH mode is not supported by gopls; add a go.mod"
+
+// gopathMode reports GO111MODULE=off, the go command's GOPATH mode.
+func gopathMode() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("GO111MODULE")), "off")
+}
+
 // Fingerprint identifies the Go configuration that loads the workspace at root: the content of every module file
-// ConfigFiles lists (an absent file counts as absent), GOWORK, GOFLAGS and GOTOOLCHAIN, and the go command PATH
-// resolves to. A load result or health answer made under one fingerprint is stale under another, and a plan records
-// the fingerprint it was simulated under so that a change in between is caught before the write.
+// ConfigFiles lists (an absent file counts as absent), GOWORK, GOFLAGS, GO111MODULE and GOTOOLCHAIN, and the go command
+// PATH resolves to. A load result or health answer made under one fingerprint is stale under another, and a plan
+// records the fingerprint it was simulated under so that a change in between is caught before the write.
 func Fingerprint(root string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "GOWORK=%s\nGOFLAGS=%s\nGOTOOLCHAIN=%s\ngo=%s\n", os.Getenv("GOWORK"), os.Getenv("GOFLAGS"), os.Getenv("GOTOOLCHAIN"), goCommand())
+	fmt.Fprintf(h, "GOWORK=%s\nGOFLAGS=%s\nGO111MODULE=%s\nGOTOOLCHAIN=%s\ngo=%s\n", os.Getenv("GOWORK"), os.Getenv("GOFLAGS"), os.Getenv("GO111MODULE"), os.Getenv("GOTOOLCHAIN"), goCommand())
 	files := ConfigFiles(root)
 	sort.Strings(files)
 	for i, p := range files {
@@ -84,6 +93,9 @@ func Health(ctx context.Context, root string) string {
 func probeHealth(ctx context.Context, root string) (msg string, conclusive bool) {
 	if goCommand() == "" {
 		return noGoMsg, true
+	}
+	if gopathMode() {
+		return gopathMsg, true
 	}
 	if msg, ok := goFailure(ctx, root, "env", "GOWORK", "GOVERSION"); !ok || msg != "" {
 		return msg, ok

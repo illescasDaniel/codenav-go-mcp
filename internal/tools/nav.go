@@ -704,14 +704,15 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if !filepath.IsAbs(abs) {
 				abs = filepath.Join(w.Root, abs)
 			}
-			if rel, err := filepath.Rel(w.Root, abs); err != nil || strings.HasPrefix(rel, "..") {
+			rel, err := filepath.Rel(w.Root, abs)
+			if err != nil || strings.HasPrefix(rel, "..") {
 				return "", toolerr.Inputf("%s is outside the workspace: diagnostics only cover files of the workspace's own modules. Files of the standard library, the module cache and replaced modules elsewhere can be read (outline, hover, references) but are not type-checked as part of this workspace.", in.FilePath)
 			}
 			items, err := w.Client.Diagnostics(ctx, in.FilePath)
 			if err != nil {
 				return "", friendlyNavErr(err, in.FilePath, 0, 0)
 			}
-			out := format.FormatDiagnostics(items, format.DefaultDiagnosticsLimit, w.Root)
+			out := format.FormatDiagnosticsIn(items, format.DefaultDiagnosticsLimit, w.Root, filepath.ToSlash(rel))
 			if src, _, rerr := edits.ReadSource(abs); rerr == nil {
 				if note := siblingSyntaxNote(w.Root, abs, src); note != "" {
 					out += "\n" + note

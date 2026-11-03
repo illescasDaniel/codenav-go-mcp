@@ -696,8 +696,16 @@ func explainCycle(items []lsp.Diagnostic) []lsp.Diagnostic {
 }
 
 // FormatDiagnostics renders diagnostics sorted by position, at most limit of them, with paths relative to root.
+// The file they belong to is unknown here: see FormatDiagnosticsIn.
 func FormatDiagnostics(items []lsp.Diagnostic, limit int, root string) string {
-	items = explainCycle(append([]lsp.Diagnostic(nil), lsp.DedupeDiagnostics(items)...))
+	return FormatDiagnosticsIn(items, limit, root, "")
+}
+
+// FormatDiagnosticsIn is FormatDiagnostics for the diagnostics of one file, given by its path relative to root.
+// A cgo failure dump is placed on gcc's error in that file only. With file "" nothing is ever relocated, and every
+// gcc error keeps its file name in the message.
+func FormatDiagnosticsIn(items []lsp.Diagnostic, limit int, root, file string) string {
+	items = explainCycle(append([]lsp.Diagnostic(nil), lsp.DedupeDiagnostics(lsp.CondenseCgo(file, items))...))
 	if len(items) == 0 {
 		return "No diagnostics."
 	}

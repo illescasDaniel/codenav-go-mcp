@@ -92,7 +92,7 @@ func friendlyMessage(msg string) string {
 // FromLSP converts diagnostics of the file whose current text is text.
 func FromLSP(rel, text string, items []lsp.Diagnostic) []Entry {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-	items = lsp.DedupeDiagnostics(items)
+	items = lsp.DedupeDiagnostics(lsp.CondenseCgo(rel, items))
 	out := make([]Entry, 0, len(items))
 	for _, it := range items {
 		l := it.Range.Start.Line
