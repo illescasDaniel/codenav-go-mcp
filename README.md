@@ -197,7 +197,7 @@ constraints is invisible to the type check (the response says when an edit touch
 |----------|---------|---------|
 | `CODENAV_GO_MCP_WORKSPACE` | unset: follows the client's MCP roots when they name a worktree of the same git repository, else `CLAUDE_PROJECT_DIR`, else the working directory | Pins the project root |
 | `CODENAV_GO_MCP_READ_ONLY` | unset | `1`, `true`, `yes` or `on` (any case): write tools refuse to write. Any other value, including `0`, `false`, `no` or empty, leaves them writable |
-| `CODENAV_GO_MCP_GOPLS` | auto | Path to the gopls binary. The value is split on whitespace, so a path with a space does not work |
+| `CODENAV_GO_MCP_GOPLS` | auto | Path to the gopls binary. If the whole value is an existing executable file it is used as is (so a path with a space works); otherwise it is split on whitespace into a command and arguments |
 | `CODENAV_GO_MCP_BUILD_FLAGS` | none | Passed to gopls as `buildFlags` and to `go list` (dependents), e.g. `-tags=integration` |
 | `CODENAV_GO_MCP_STATE_DIR` | `<user cache dir>/codenav-go-mcp` | Where the crash-recovery log is kept |
 
