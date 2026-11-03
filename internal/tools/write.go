@@ -32,9 +32,14 @@ func GoGuardRule(c edits.FileChange) error {
 		return toolerr.Inputf("%s is not a .go file", filepath.Base(c.Path))
 	}
 	if c.Old != nil && gosrc.IsGenerated(*c.Old) {
-		return toolerr.Inputf("%s is generated (// Code generated ... DO NOT EDIT.); change its generator instead", filepath.Base(c.Path))
+		return generatedRefusal(c.Path)
 	}
 	return nil
+}
+
+// generatedRefusal is the refusal for a generated file (the write guard and quick_fix's up-front check).
+func generatedRefusal(path string) error {
+	return toolerr.Inputf("%s is generated (// Code generated ... DO NOT EDIT.); change its generator instead", filepath.Base(path))
 }
 
 // argPath is absPath for a path the caller wrote (file_path, to_file): one that lies outside the workspace is

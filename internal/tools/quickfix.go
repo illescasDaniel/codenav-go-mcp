@@ -244,11 +244,34 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 	if index.Unbuildable(abs) {
 		return qfResult{}, notCompiledErr(rel)
 	}
+	// A generated file is refused before any fix is listed: a listing would suggest a choice the write refuses.
+	if gosrc.IsGenerated(text) {
+		return qfResult{}, generatedRefusal(rel)
+	}
 	all := map[string][]lsp.TextEdit{}
 	var titles []string
 
 	if in.OrganizeImports && in.FixAll {
 		return qfResult{}, toolerr.Inputf("pass either organize_imports or fix_all, not both.")
+	}
+	if in.OrganizeImports || in.FixAll {
+		// These flags only shape the diagnostic fixes; the whole-file actions would silently ignore them.
+		var set []string
+		for _, f := range []struct {
+			name string
+			on   bool
+		}{{"line", in.Line > 0}, {"code", in.Code != ""}, {"choice", in.Choice != ""}, {"strict", in.Strict != nil}} {
+			if f.on {
+				set = append(set, f.name)
+			}
+		}
+		if len(set) > 0 {
+			which := "organize_imports"
+			if in.FixAll {
+				which = "fix_all"
+			}
+			return qfResult{}, toolerr.Inputf("%s applies to diagnostic fixes, not to %s: drop it, or run without %s.", strings.Join(set, ", "), which, which)
+		}
 	}
 	var importSpecs []string
 	var notes []string
@@ -259,7 +282,18 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			kind, clean = "source.fixAll", "gopls' fix-all has nothing to change in "+rel+"."
 		}
 		endLine, endCh := edits.PositionOf(text, len(text))
-		acts, cmdOnly, err := actions(ctx, w, abs, lsp.Range{End: lsp.Position{Line: endLine, Character: endCh}}, []string{kind}, nil)
+		// gopls matches the context diagnostics against the ones it published, so fix-all is asked with those.
+		var diags []lsp.Diagnostic
+		if in.FixAll {
+			pulled, err := w.Client.Diagnostics(ctx, abs)
+			if err != nil {
+				return qfResult{}, err
+			}
+			if diags, err = w.Client.PublishedCovering(ctx, abs, pulled); err != nil {
+				return qfResult{}, err
+			}
+		}
+		acts, cmdOnly, err := actions(ctx, w, abs, lsp.Range{End: lsp.Position{Line: endLine, Character: endCh}}, []string{kind}, diags)
 		if err != nil {
 			return qfResult{}, err
 		}
@@ -267,14 +301,36 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 			if len(cmdOnly) > 0 {
 				return qfResult{out: fmt.Sprintf("gopls offers '%s' only as a command (not supported).", cmdOnly[0]), refused: true}, nil
 			}
+			if len(diags) > 0 {
+				return qfResult{out: fmt.Sprintf("gopls offers no fix-all edit for the %d diagnostic(s) in %s.", len(diags), rel)}, nil
+			}
 			return qfResult{out: clean}, nil
 		}
-		by, err := edits.ParseWorkspaceEdit(acts[0].Edit)
-		if err != nil {
-			return qfResult{}, err
+		if in.FixAll {
+			// Every fix-all edit is applied in gopls' order; one that overlaps an earlier edit is left out.
+			for _, a := range acts {
+				by, err := edits.ParseWorkspaceEdit(a.Edit)
+				if err != nil {
+					return qfResult{}, err
+				}
+				trial := map[string][]lsp.TextEdit{}
+				addEdits(trial, all)
+				addEdits(trial, by)
+				if _, err := edits.ChangesFromEdits(trial); err != nil {
+					notFixed = append(notFixed, tidy(a.Title)+" (overlaps an earlier fix-all edit)")
+					continue
+				}
+				all = trial
+				titles = append(titles, tidy(a.Title))
+			}
+		} else {
+			by, err := edits.ParseWorkspaceEdit(acts[0].Edit)
+			if err != nil {
+				return qfResult{}, err
+			}
+			addEdits(all, by)
+			titles = append(titles, tidy(acts[0].Title))
 		}
-		addEdits(all, by)
-		titles = append(titles, tidy(acts[0].Title))
 	} else {
 		diags, err := w.Client.Diagnostics(ctx, abs)
 		if err != nil {
@@ -351,6 +407,62 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 				if a, ok := removeUnusedAction(abs, text, d); ok {
 					acts = append(acts, a)
 				}
+			}
+			if q, sel, ok := undefinedQualifier(text, d); ok && hasAddImport(acts) {
+				// An undefined qualifier: every package that could stand for it is an option, not only gopls' one.
+				opts, dropped := importOptionsFor(ctx, w, abs, q, sel, acts)
+				if len(opts) == 0 {
+					reasons[i] = "only " + strings.Join(dropped, ", ") + " offered, not in go.mod; run go get first"
+					unfixable = append(unfixable, label+" ("+reasons[i]+")")
+					continue
+				}
+				var drop string
+				if len(dropped) > 0 {
+					quoted := make([]string, len(dropped))
+					for k, p := range dropped {
+						quoted[k] = strconv.Quote(p)
+					}
+					drop = "gopls offered " + strings.Join(quoted, ", ") + ", which no module of the build list provides; not listed"
+				}
+				if in.Choice != "" {
+					var kept []importOption
+					for _, o := range opts {
+						if strings.Contains(strings.ToLower(importTitle(o)), strings.ToLower(in.Choice)) {
+							kept = append(kept, o)
+						}
+					}
+					if len(kept) == 0 {
+						var lines, titles []string
+						for _, o := range opts {
+							lines = append(lines, "      - "+importTitle(o))
+							titles = append(titles, importTitle(o))
+						}
+						noMatch = append(noMatch, label+"\n"+strings.Join(lines, "\n"))
+						reasons[i] = "choice matched none of: " + strings.Join(titles, " | ")
+						continue
+					}
+					opts = kept
+				}
+				if len(opts) > 1 {
+					var lines, titles []string
+					for _, o := range opts {
+						lines = append(lines, "      - "+importTitle(o))
+						titles = append(titles, importTitle(o))
+					}
+					block := label + "\n" + strings.Join(lines, "\n")
+					if drop != "" {
+						block += "\n      (" + drop + ")"
+					}
+					ambiguous = append(ambiguous, block)
+					reasons[i] = "ambiguous, several fixes apply: " + strings.Join(titles, " | ")
+					continue
+				}
+				if drop != "" {
+					notes = append(notes, drop)
+				}
+				importSpecs = append(importSpecs, importSpec(opts[0]))
+				titles = append(titles, importTitle(opts[0]))
+				continue
 			}
 			if in.Choice != "" {
 				kept := acts[:0:0]

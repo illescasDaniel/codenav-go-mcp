@@ -25,6 +25,10 @@ type Diagnostic struct {
 	Code     json.RawMessage `json:"code,omitempty"`
 	Source   string          `json:"source,omitempty"`
 	Message  string          `json:"message"`
+	// Tags and CodeDescription are sent back in a codeAction context as gopls published them: gopls' fix-all
+	// edits are found only for diagnostics that carry the same tags (e.g. Unnecessary).
+	Tags            []int           `json:"tags,omitempty"`
+	CodeDescription json.RawMessage `json:"codeDescription,omitempty"`
 }
 
 // Symbol covers both DocumentSymbol (hierarchical: Range, SelectionRange,

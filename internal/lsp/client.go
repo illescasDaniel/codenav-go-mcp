@@ -1065,6 +1065,54 @@ func (c *Client) PullDiagnostics(ctx context.Context, uri string) ([]Diagnostic,
 	if !errors.As(err, &re) || re.Code != -32601 {
 		return nil, err
 	}
+	return c.pushedDiagnostics(ctx, uri)
+}
+
+// PublishedCovering returns the diagnostics gopls has published for the file once they include every one of
+// want (a pull of the same file). gopls matches a codeAction context diagnostic only against its published set,
+// and it publishes the analysis results (the simplify hints fix-all needs) after an earlier, smaller publish.
+// It waits up to PushDiagnosticsTimeout, then returns what it has.
+func (c *Client) PublishedCovering(ctx context.Context, path string, want []Diagnostic) ([]Diagnostic, error) {
+	uri, err := c.EnsureOpen(path)
+	if err != nil {
+		return nil, err
+	}
+	deadline := time.Now().Add(PushDiagnosticsTimeout)
+	for {
+		got, err := c.pushedDiagnostics(ctx, uri)
+		if err != nil {
+			return nil, err
+		}
+		if coversDiagnostics(got, want) || time.Now().After(deadline) {
+			return got, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+// coversDiagnostics says every diagnostic of want is in got (same message, range and source).
+func coversDiagnostics(got, want []Diagnostic) bool {
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g.Message == w.Message && g.Range == w.Range && g.Source == w.Source {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// pushedDiagnostics is the push cache of uri (waiting up to PushDiagnosticsTimeout for a fresh one).
+func (c *Client) pushedDiagnostics(ctx context.Context, uri string) ([]Diagnostic, error) {
 	c.mu.Lock()
 	cached, have := c.diags[uri]
 	ev := c.diagEv[uri]

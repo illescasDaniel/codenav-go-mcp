@@ -25,6 +25,7 @@ const EnvBuildFlags = "CODENAV_GO_MCP_BUILD_FLAGS"
 
 type pkg struct {
 	ImportPath   string
+	Name         string
 	Dir          string
 	GoFiles      []string
 	CgoFiles     []string
@@ -226,7 +227,7 @@ func runListDir(ctx context.Context, root string, flags []string) ([]pkg, error)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	args := append([]string{"list", "-e"}, flags...)
-	args = append(args, "-json=ImportPath,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports,Error,DepsErrors", "./...")
+	args = append(args, "-json=ImportPath,Name,Dir,GoFiles,CgoFiles,TestGoFiles,XTestGoFiles,Imports,TestImports,XTestImports,Error,DepsErrors", "./...")
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = root
 	var out bytes.Buffer
