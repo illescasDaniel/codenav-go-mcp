@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -63,7 +64,7 @@ func (l *intentLog) save() error {
 	if err != nil {
 		return err
 	}
-	return writeAtomic(filepath.Join(l.dir, intentFile), b)
+	return writeAtomic(filepath.Join(l.dir, intentFile), b, nil)
 }
 
 func (l *intentLog) setState(state string) {
@@ -197,6 +198,11 @@ func Leftover(dir, root string) string {
 		case f.BaseHash == "":
 			restore = append(restore, "rm "+f.Path)
 		}
+		// A kill between writeAtomic's temp file and its rename leaves that temp file; the log does not name it.
+		for _, tmp := range leftoverTemps(f.Path) {
+			lines = append(lines, fmt.Sprintf("  %s (temporary file of the interrupted write)", edits.RelativeName(tmp, root)))
+			restore = append(restore, "rm "+tmp)
+		}
 	}
 	verb := "applying"
 	if in.Op == "undo" {
@@ -204,6 +210,30 @@ func Leftover(dir, root string) string {
 	}
 	return fmt.Sprintf("an earlier run was interrupted while %s %q (started %s), so these files may be half-written:\n%s\nThe original contents were saved in %s. To roll back, run:\n  %s\n(or review them with git diff; hashes are the first 12 characters of sha256)",
 		verb, in.Description, in.Started.Format(time.RFC3339), strings.Join(lines, "\n"), filepath.Join(dst, "orig"), strings.Join(restore, "\n  "))
+}
+
+var tempIDRE = regexp.MustCompile(`^[0-9a-f]+$`)
+
+// leftoverTemps lists the temp files writeAtomic names "." + base + "." + id + ".tmp" beside path. Only a name of
+// that exact shape counts, so an unrelated file is never offered for removal.
+func leftoverTemps(path string) []string {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	prefix, suffix := "."+base+".", ".tmp"
+	var out []string
+	for _, e := range entries {
+		n := e.Name()
+		if len(n) <= len(prefix)+len(suffix) || !strings.HasPrefix(n, prefix) || !strings.HasSuffix(n, suffix) {
+			continue
+		}
+		if id := n[len(prefix) : len(n)-len(suffix)]; tempIDRE.MatchString(id) {
+			out = append(out, filepath.Join(dir, n))
+		}
+	}
+	return out
 }
 
 func short(h string) string {

@@ -107,9 +107,22 @@ func outsideMessage(path, given, root string) string {
 	return msg + "; point CODENAV_GO_MCP_WORKSPACE at a directory containing every module involved"
 }
 
+// checkWritable refuses a write over an existing file whose owner write bit is clear. The write is a rename, which
+// the mode does not stop, so the bit is checked here: a file made read-only was made so on purpose.
+func checkWritable(path, root string) error {
+	st, err := os.Stat(path)
+	if err != nil || st.Mode().Perm()&0o200 != 0 {
+		return nil
+	}
+	return toolerr.Inputf("%s is read-only (mode %04o); make it writable (chmod u+w) first", edits.RelativeName(path, root), st.Mode().Perm())
+}
+
 func (g WriteGuard) CheckPlan(p *edits.EditPlan, allowLarge bool) error {
 	for _, c := range p.Changes {
 		if err := g.CheckPath(c.Path); err != nil {
+			return err
+		}
+		if err := checkWritable(c.Path, g.Root); err != nil {
 			return err
 		}
 		if g.Extra != nil {
@@ -133,17 +146,21 @@ type Applied struct {
 	ID            string
 	Plan          *edits.EditPlan
 	AppliedHashes map[string]string
+	// CreatedDirs are the directories the edit created (deepest first): undo removes them once they are empty.
+	CreatedDirs []string
 }
 
-func writeAtomic(path string, data []byte) error {
+// writeAtomic replaces path with data through a temp file beside it, renamed over path, so a crash leaves the old
+// or the new file. An existing file keeps its mode. A new file gets mode when given, else 0644 less the umask, as
+// os.WriteFile(path, data, 0644) gives (the kernel applies the umask when the temp file is created).
+func writeAtomic(path string, data []byte, mode *os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*.tmp")
+	tmp, name, err := createTemp(path)
 	if err != nil {
 		return err
 	}
-	name := tmp.Name()
 	fail := func(err error) error { _ = tmp.Close(); _ = os.Remove(name); return err }
 	if _, err := tmp.Write(data); err != nil {
 		return fail(err)
@@ -154,16 +171,38 @@ func writeAtomic(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fail(err)
 	}
-	mode := os.FileMode(0o644)
 	if st, err := os.Stat(path); err == nil {
-		mode = st.Mode().Perm()
+		if err := os.Chmod(name, st.Mode().Perm()); err != nil {
+			return fail(err)
+		}
+	} else if mode != nil {
+		if err := os.Chmod(name, *mode); err != nil {
+			return fail(err)
+		}
 	}
-	_ = os.Chmod(name, mode)
 	if err := os.Rename(name, path); err != nil {
 		_ = os.Remove(name)
 		return err
 	}
 	return nil
+}
+
+// createTemp creates "." + base + "." + id + ".tmp" beside path (os.CreateTemp would always give 0600). It is
+// created with 0644, so a new file ends up 0644 less the umask, as os.WriteFile gives it.
+func createTemp(path string) (*os.File, string, error) {
+	dir, base := filepath.Dir(path), filepath.Base(path)
+	var err error
+	for range 10 {
+		name := filepath.Join(dir, "."+base+"."+newID()+".tmp")
+		var f *os.File
+		if f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644); err == nil {
+			return f, name, nil
+		}
+		if !os.IsExist(err) {
+			break
+		}
+	}
+	return nil, "", err
 }
 
 func writeChange(c edits.FileChange) error {
@@ -173,7 +212,7 @@ func writeChange(c edits.FileChange) error {
 		}
 		return nil
 	}
-	return writeAtomic(c.Path, c.NewBytes())
+	return writeAtomic(c.Path, c.NewBytes(), c.Mode)
 }
 
 func restore(c edits.FileChange) error {
@@ -183,7 +222,27 @@ func restore(c edits.FileChange) error {
 		}
 		return nil
 	}
-	return writeAtomic(c.Path, c.OldBytes())
+	return writeAtomic(c.Path, c.OldBytes(), c.Mode)
+}
+
+// createdDirs lists the directories that writing p creates, deepest first within each chain, so that undo
+// removes only what the edit made. Directories that exist already, the workspace root included, are not listed.
+func createdDirs(p *edits.EditPlan, root string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range p.Changes {
+		if c.New == nil {
+			continue
+		}
+		for d := filepath.Dir(c.Path); d != root && strings.HasPrefix(d, root) && !seen[d]; d = filepath.Dir(d) {
+			if _, err := os.Lstat(d); err == nil || !os.IsNotExist(err) {
+				break
+			}
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func pruneEmptyDirs(path, stop string) {
@@ -338,6 +397,13 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 	if err := j.CheckFresh(p); err != nil {
 		return nil, err
 	}
+	for i := range p.Changes {
+		if st, err := os.Stat(p.Changes[i].Path); err == nil {
+			m := st.Mode().Perm()
+			p.Changes[i].Mode = &m
+		}
+	}
+	created := createdDirs(p, j.Guard.Root)
 	ilog, note := beginIntent(j.LogDir, "apply", p)
 	j.notify(note)
 	var written []edits.FileChange
@@ -369,7 +435,7 @@ func (j *Journal) Apply(p *edits.EditPlan, allowLarge bool, readOnlyHint string)
 			pruneEmptyDirs(c.Path, j.Guard.Root)
 		}
 	}
-	e := &Applied{ID: newID(), Plan: p, AppliedHashes: map[string]string{}}
+	e := &Applied{ID: newID(), Plan: p, AppliedHashes: map[string]string{}, CreatedDirs: created}
 	for _, c := range p.Changes {
 		// Hash what we wrote, not what is on disk now: a concurrent writer must not look like ours.
 		e.AppliedHashes[c.Path] = ""
@@ -480,10 +546,9 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 		written = append(written, c)
 	}
 	ilog.done()
-	for _, c := range inv.Changes {
-		if c.Kind() == "delete" {
-			pruneEmptyDirs(c.Path, j.Guard.Root)
-		}
+	// Only the directories the edit created: a directory the user made stays, empty or not.
+	for _, d := range e.CreatedDirs {
+		_ = os.Remove(d)
 	}
 	j.entries = append(j.entries[:idx], j.entries[idx+1:]...)
 	if j.undone == nil {

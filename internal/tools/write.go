@@ -102,6 +102,7 @@ func finishPlanID(ctx context.Context, w *Workspace, plan *edits.EditPlan, apply
 		return "", "", err
 	}
 	plan.Notes = append(plan.Notes, unformattedNotes(w.Root, plan)...)
+	plan.Notes = append(plan.Notes, txn.HardLinkNotes(plan, w.Root)...)
 	for _, c := range plan.Changes {
 		plan.Notes = append(plan.Notes, c.Notes...)
 	}

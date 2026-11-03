@@ -153,6 +153,9 @@ type FileChange struct {
 	OldBOM, NewBOM bool
 	// Notes are things worth telling about this file's change (e.g. an import that was listed twice).
 	Notes []string
+	// Mode is the permission bits the file had before the change, recorded when the change is written (nil: not
+	// recorded). A file the change recreates (undo of a deletion) gets it back.
+	Mode *os.FileMode
 }
 
 func (c FileChange) Kind() string {
@@ -184,7 +187,7 @@ func (c FileChange) NewBytes() []byte {
 }
 
 func (c FileChange) Inverse() FileChange {
-	return FileChange{Path: c.Path, Old: c.New, New: c.Old, OldBOM: c.NewBOM, NewBOM: c.OldBOM}
+	return FileChange{Path: c.Path, Old: c.New, New: c.Old, OldBOM: c.NewBOM, NewBOM: c.OldBOM, Mode: c.Mode}
 }
 
 func Str(s string) *string { return &s }

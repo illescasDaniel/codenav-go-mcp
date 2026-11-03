@@ -2,6 +2,7 @@
 package gosrc
 
 import (
+	"go/ast"
 	"go/format"
 	"go/parser"
 	"go/token"
@@ -40,13 +41,19 @@ func Format(filename, src string) (string, error) {
 
 var generatedRE = regexp.MustCompile(`(?m)^// Code generated .* DO NOT EDIT\.$`)
 
-// IsGenerated: the file carries the standard generated-code header.
+// IsGenerated: the file carries the standard generated-code header, a "Code generated ... DO NOT EDIT." comment
+// before the package clause (the go/ast rule). A marker after the clause, or inside a string, does not count.
 func IsGenerated(src string) bool {
-	head := src
-	if len(head) > 4096 {
-		head = head[:4096]
+	f, err := parser.ParseFile(token.NewFileSet(), "", src, parser.PackageClauseOnly|parser.ParseComments)
+	if err != nil {
+		// No readable package clause: the old text match, which is what it was before the header was parsed.
+		head := src
+		if len(head) > 4096 {
+			head = head[:4096]
+		}
+		return generatedRE.MatchString(head)
 	}
-	return generatedRE.MatchString(head)
+	return ast.IsGenerated(f)
 }
 
 // GofmtClean: text (LF line endings) is what plain gofmt leaves unchanged.
