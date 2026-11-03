@@ -3,12 +3,15 @@ package tools
 import (
 	"context"
 	"fmt"
+	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
@@ -332,12 +335,209 @@ func Simulate(ctx context.Context, w *Workspace, plan *edits.EditPlan, includeDe
 		case c.Old != nil:
 			src, ok = *c.Old, true
 		}
-		if ok && gomod.HasBuildConstraint(src) && !seenConstraint[src] {
+		if !ok || seenConstraint[src] {
+			continue
+		}
+		// Only a file the build leaves out (by its name or its header, in the edit's text) gets the note.
+		if reason, excluded := buildscope.ExcludedText(buildscope.Context(), c.Path, src); excluded {
 			seenConstraint[src] = true // a moved file appears under its old and new path: one note
-			plan.Notes = appendUnique(plan.Notes, edits.RelativeName(c.Path, w.Root)+" has a build constraint; diagnostics only cover the current GOOS/GOARCH/tags, so the check may not see this file's own errors.")
+			plan.Notes = appendUnique(plan.Notes, excludedNote(edits.RelativeName(c.Path, w.Root), reason))
 		}
 	}
 	return d, nil
+}
+
+// maxExcludedNames caps the names noteExcludedUses looks for in one edit. The scan reads the tree once, but every
+// name is matched against each file that names it, so a large edit is cut short and the note says so.
+const maxExcludedNames = 50
+
+// topDeclShapes maps each top-level func (not a method), type, var and const name of src to its shape: the text of
+// a func's signature (without its body), of a type or of a var or const without a type (the whole declaration), or
+// of a typed var or const (its name and type). A grouped declaration counts as a whole, since an iota or an implicit
+// repeat depends on the group.
+func topDeclShapes(src string) map[string]string {
+	out := map[string]string{}
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.SkipObjectResolution)
+	if err != nil {
+		return out
+	}
+	text := func(from, to token.Pos) string {
+		return src[fset.Position(from).Offset:fset.Position(to).Offset]
+	}
+	for _, d := range f.Decls {
+		switch d := d.(type) {
+		case *ast.FuncDecl:
+			if d.Recv == nil {
+				end := d.End()
+				if d.Body != nil {
+					end = d.Body.Pos() // an edit to the body alone does not change the signature
+				}
+				out[d.Name.Name] = text(d.Pos(), end)
+			}
+		case *ast.GenDecl:
+			for _, s := range d.Specs {
+				switch s := s.(type) {
+				case *ast.TypeSpec:
+					out[s.Name.Name] = text(d.Pos(), d.End())
+				case *ast.ValueSpec:
+					for _, id := range s.Names {
+						if s.Type != nil {
+							out[id.Name] = id.Name + " " + text(s.Type.Pos(), s.Type.End())
+						} else {
+							out[id.Name] = text(d.Pos(), d.End())
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// noteExcludedUses adds a note for the top-level names that plan changes (added, removed, or given a new
+// signature or type; an edit to a body alone changes none) and that a file the build leaves out still uses or
+// declares again: gopls does not check those files, so the write gate cannot see the breakage. A note only: the
+// write is not held. Files of the plan are not reported, nor a re-declaration in a file that cannot be built with
+// the edited one (a _linux and a _windows file). The scan reads each declaring directory once and the tree once,
+// for at most maxExcludedNames names; ctx cancels it.
+func noteExcludedUses(ctx context.Context, w *Workspace, plan *edits.EditPlan) {
+	texts, inPlan := map[string]string{}, map[string]bool{}
+	for _, c := range plan.Changes {
+		if filepath.Ext(c.Path) != ".go" {
+			continue
+		}
+		inPlan[c.Path] = true
+		if c.New != nil {
+			texts[c.Path] = *c.New
+		}
+	}
+	type nameKey struct{ dir, ip, name string }
+	found := map[nameKey]string{}     // a changed name -> a file of its declaring package
+	declared := map[string][]string{} // dir + "\x00" + name -> the constraint of each new declaration of it
+	for _, c := range plan.Changes {
+		if filepath.Ext(c.Path) != ".go" {
+			continue
+		}
+		before, after := map[string]string{}, map[string]string{}
+		if c.Old != nil {
+			before = topDeclShapes(*c.Old)
+		}
+		if c.New != nil {
+			after = topDeclShapes(*c.New)
+		}
+		dir := filepath.Dir(c.Path)
+		ip := ""
+		if m, err := moduleOf(dir); err == nil {
+			ip, _ = importPathOf(m, dir)
+		}
+		names := map[string]bool{}
+		for n := range before {
+			names[n] = true
+		}
+		for n := range after {
+			names[n] = true
+		}
+		for n := range names {
+			if n == "_" || before[n] == after[n] {
+				continue
+			}
+			k := nameKey{dir, ip, n}
+			if _, ok := found[k]; !ok {
+				found[k] = c.Path
+			}
+			if _, ok := after[n]; ok {
+				dn := dir + "\x00" + n
+				declared[dn] = append(declared[dn], buildscope.FileConstraint(c.Path, *c.New))
+			}
+		}
+	}
+	keys := make([]nameKey, 0, len(found))
+	for k := range found {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, b := keys[i], keys[j]
+		if a.dir != b.dir {
+			return a.dir < b.dir
+		}
+		if a.ip != b.ip {
+			return a.ip < b.ip
+		}
+		return a.name < b.name
+	})
+	total := len(keys)
+	if total > maxExcludedNames {
+		keys = keys[:maxExcludedNames]
+	}
+	var targets []buildscope.Target
+	index := map[string]int{} // dir + "\x00" + import path -> its target
+	for _, k := range keys {
+		g := k.dir + "\x00" + k.ip
+		i, ok := index[g]
+		if !ok {
+			i = len(targets)
+			index[g] = i
+			targets = append(targets, buildscope.Target{DeclFile: found[k], ImportPath: k.ip})
+		}
+		targets[i].Names = append(targets[i].Names, k.name)
+	}
+	res, err := buildscope.MentionsAll(ctx, buildscope.Context(), w.Root, texts, targets)
+	if err != nil {
+		plan.Notes = appendUnique(plan.Notes, "The check of uses in files the build leaves out was cancelled, so it may be incomplete.")
+	}
+	uses, decls := map[string][]string{}, map[string][]string{}
+	for _, h := range res.Hits {
+		if inPlan[h.Path] {
+			continue
+		}
+		where := fmt.Sprintf("%s:%d (%s)", edits.RelativeName(h.Path, w.Root), h.Line, h.Reason)
+		switch h.Kind {
+		case buildscope.Use:
+			uses[h.Name] = append(uses[h.Name], where)
+		case buildscope.Decl:
+			if declClashes(h.Path, declared[filepath.Dir(h.Path)+"\x00"+h.Name]) {
+				decls[h.Name] = append(decls[h.Name], where)
+			}
+		}
+	}
+	seen := map[string]bool{}
+	for _, k := range keys {
+		if seen[k.name] {
+			continue
+		}
+		seen[k.name] = true
+		name := k.name
+		if len(uses[name]) > 0 {
+			plan.Notes = appendUnique(plan.Notes, fmt.Sprintf("%d use(s) of %s in files the build leaves out were not checked: %s. Check them with a build that includes them (GOOS=... go build, or -tags in CODENAV_GO_MCP_BUILD_FLAGS).", len(uses[name]), name, listing(uses[name])))
+		}
+		if len(decls[name]) > 0 {
+			plan.Notes = appendUnique(plan.Notes, fmt.Sprintf("%s is declared again in files the build leaves out: %s.", name, listing(decls[name])))
+		}
+	}
+	if total > maxExcludedNames {
+		plan.Notes = appendUnique(plan.Notes, fmt.Sprintf("Uses in files the build leaves out were checked for %d of the %d changed names only; check the others with a build that includes their files.", maxExcludedNames, total))
+	}
+}
+
+// declClashes reports whether the file at path, which the build leaves out, can clash with one of the new
+// declarations of a name whose constraints are cons: it cannot when no build has both files (a _linux and a
+// _windows file). A removed name has no new declaration, so nothing clashes; a file that cannot be read clashes.
+func declClashes(path string, cons []string) bool {
+	if len(cons) == 0 {
+		return false
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return true
+	}
+	mine := buildscope.FileConstraint(path, string(src))
+	for _, c := range cons {
+		if !buildscope.Exclusive(c, mine) {
+			return true
+		}
+	}
+	return false
 }
 
 type diagdeltaResult = diagdelta.Delta

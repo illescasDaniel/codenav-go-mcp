@@ -11,11 +11,15 @@
 //	                                  CODENAV_GO_MCP_BUILD_FLAGS (-tags=a,b or -tags a,b)
 //	Excluded(c, path) (why, bool)     whether the go tool leaves path out of c's build, and why ("file name
 //	                                  suffix _windows", "//go:build integration")
+//	ExcludedText(c, path, text)       Excluded for a file whose content is text (an edit's result, not on disk yet)
 //	Mentions(c, Query) []Hit          the uses, declarations and member selectors of a name in the files that
 //	                                  c's build leaves out and could refer to the object declared in DeclFile
+//	MentionsAll(ctx, c, root, texts,  Mentions for many names of many declaring files: one walk of root in all
+//	  []Target) (Result, error)       (Result.Walks), and it stops when ctx is done
 //	NameConstraint(file) string       the GOOS/GOARCH suffix of a file name as a reason, "" if none
 //	FileConstraint(path, src) string  the //go:build line that the name and header of a file put on it, normalized
 //	                                  ("" if none): two files with the same one are built under the same conditions
+//	Exclusive(a, b) bool              whether no build satisfies both constraints: such files never clash
 //	NeverBuilt(cons) bool             a //go:build line no build satisfies (the "ignore" tag): scratch programs
 //
 // Mentions returns one Hit per mention: its Path, 1-based Line and Col (bytes), its Kind, and the Reason
@@ -39,6 +43,7 @@
 package buildscope
 
 import (
+	"context"
 	"go/ast"
 	"go/build"
 	"go/build/constraint"
@@ -117,6 +122,12 @@ func Excluded(c *build.Context, path string) (string, bool) {
 	return "build constraints", true
 }
 
+// ExcludedText is Excluded for a file whose content is text (the result of an edit, not yet on disk).
+func ExcludedText(c *build.Context, path, text string) (string, bool) {
+	path = filepath.Clean(path)
+	return Excluded(withTexts(c, map[string]string{path: text}), path)
+}
+
 // NameConstraint is the GOOS/GOARCH suffix of a file name as a reason ("file name suffix _windows",
 // "file name suffix _linux_amd64"), "" when the name has none.
 func NameConstraint(file string) string {
@@ -192,6 +203,71 @@ func Equivalent(a, b string) bool {
 		}
 	}
 	return true
+}
+
+// Exclusive reports whether no build satisfies both constraints a and b (as FileConstraint returns them; "" is no
+// constraint): two files with exclusive constraints are never built together, so they cannot clash. A constraint
+// that does not parse, or is too wide to enumerate, is not exclusive.
+func Exclusive(a, b string) bool {
+	ea, errA := parseOrNil(a)
+	eb, errB := parseOrNil(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	tags := map[string]bool{}
+	collectTags(ea, tags)
+	collectTags(eb, tags)
+	names := make([]string, 0, len(tags))
+	for t := range tags {
+		names = append(names, t)
+	}
+	sort.Strings(names)
+	if len(names) > 16 {
+		return false
+	}
+	for bits := 0; bits < 1<<len(names); bits++ {
+		on := map[string]bool{}
+		for i, t := range names {
+			on[t] = bits&(1<<i) != 0
+		}
+		if realBuild(on, names) && evalOrTrue(ea, on) && evalOrTrue(eb, on) {
+			return false
+		}
+	}
+	return true
+}
+
+// impliedOS is the tag that a build of each GOOS sets besides its own, as suffixMatches has it: an android build
+// also builds the _linux files, an ios build the _darwin files, an illumos build the _solaris files.
+var impliedOS = map[string]string{"android": "linux", "ios": "darwin", "illumos": "solaris"}
+
+// realBuild reports whether the tags on that are among names can all be set in one build: a build has one GOOS,
+// with the tag it implies (see impliedOS), and one GOARCH.
+func realBuild(on map[string]bool, names []string) bool {
+	var oses []string
+	arches := 0
+	for _, t := range names {
+		if !on[t] {
+			continue
+		}
+		if knownOS[t] {
+			oses = append(oses, t)
+		}
+		if knownArch[t] {
+			arches++
+		}
+	}
+	if arches > 1 {
+		return false
+	}
+	switch len(oses) {
+	case 0, 1:
+		return true
+	case 2:
+		a, b := oses[0], oses[1]
+		return impliedOS[a] == b || impliedOS[b] == a
+	}
+	return false
 }
 
 func parseOrNil(s string) (constraint.Expr, error) {
@@ -332,6 +408,21 @@ type Query struct {
 	Texts      map[string]string // contents that replace files on disk (an edit's result), by absolute path
 }
 
+// Target is the names to look for in one declaring package: an entry of MentionsAll.
+type Target struct {
+	DeclFile   string   // a file of the declaring package (absolute path)
+	ImportPath string   // the declaring package's import path; "" = do not search other packages
+	Names      []string // the identifiers; "" and "_" are skipped
+	Member     bool     // the names are methods or fields (Query.Member)
+}
+
+// Result is what MentionsAll found, and what it read to find it.
+type Result struct {
+	Hits  []Hit
+	Walks int // walks of the tree below the root: at most one per MentionsAll call
+	Files int // .go files read, in the declaring directories and below the root
+}
+
 // Kind is what a Hit mentions.
 type Kind int
 
@@ -342,9 +433,10 @@ const (
 	Asm                // a TEXT ·name(SB) line in a .s file of the declaring directory
 )
 
-// Hit is one mention of the name in a file the build leaves out (see the package comment).
+// Hit is one mention of a name in a file the build leaves out (see the package comment).
 type Hit struct {
 	Path   string
+	Name   string // the identifier mentioned
 	Line   int    // 1-based
 	Col    int    // 1-based, in bytes
 	Kind   Kind   // what is mentioned
@@ -355,46 +447,148 @@ type Hit struct {
 // The declaring directory is read first; then, for exported names with an ImportPath, the files below Root
 // that import it.
 func Mentions(c *build.Context, q Query) []Hit {
-	if q.Name == "" || q.Name == "_" {
-		return nil
-	}
-	cc := withTexts(c, q.Texts)
-	dir := filepath.Dir(q.DeclFile)
-	declPkg := packageName(cc, q.DeclFile)
-	var out []Hit
-	ents, _ := os.ReadDir(dir)
-	for _, e := range ents {
-		if e.IsDir() {
+	res, _ := MentionsAll(context.Background(), c, q.Root, q.Texts, []Target{{DeclFile: q.DeclFile, ImportPath: q.ImportPath, Names: []string{q.Name}, Member: q.Member}})
+	return res.Hits
+}
+
+// MentionsAll is Mentions for many declaring files and names at once. Each declaring directory is read once,
+// and the tree below root is walked at most once, for all the exported names that have an ImportPath: a file
+// of it is read only when it mentions one of those names and imports their package. texts are contents that
+// replace files on disk (Query.Texts). MentionsAll stops when ctx is done, returning ctx's error with the hits
+// found so far.
+func MentionsAll(ctx context.Context, c *build.Context, root string, texts map[string]string, targets []Target) (Result, error) {
+	cc := withTexts(c, texts)
+	var res Result
+	var all []*scanTarget
+	byDir := map[string][]*scanTarget{}
+	var dirs []string
+	for _, t := range targets {
+		names := nonBlank(t.Names)
+		if t.DeclFile == "" || len(names) == 0 {
 			continue
 		}
-		p := filepath.Join(dir, e.Name())
-		switch filepath.Ext(p) {
-		case ".go":
-			out = append(out, scanGo(cc, q, p, declPkg, true)...)
-		case ".s":
-			if !q.Member {
-				out = append(out, scanAsm(cc, q, p)...)
+		st := newScanTarget(cc, t, names)
+		all = append(all, st)
+		if _, ok := byDir[st.dir]; !ok {
+			dirs = append(dirs, st.dir)
+		}
+		byDir[st.dir] = append(byDir[st.dir], st)
+	}
+	for _, dir := range dirs {
+		ents, _ := os.ReadDir(dir)
+		for _, e := range ents {
+			if e.IsDir() {
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return res, err
+			}
+			p := filepath.Join(dir, e.Name())
+			switch filepath.Ext(p) {
+			case ".go":
+				src, err := readFile(cc, p)
+				if err != nil {
+					continue
+				}
+				res.Files++
+				for _, st := range byDir[dir] {
+					res.Hits = append(res.Hits, scanGo(cc, st, p, src, true)...)
+				}
+			case ".s":
+				for _, st := range byDir[dir] {
+					if !st.t.Member {
+						res.Hits = append(res.Hits, scanAsm(cc, st, p)...)
+					}
+				}
 			}
 		}
 	}
-	if q.ImportPath != "" && token.IsExported(q.Name) && q.Root != "" {
-		_ = filepath.WalkDir(q.Root, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				if p != q.Root && (exclude.IsDirName(d.Name()) || d.Name() == "testdata" || strings.HasPrefix(d.Name(), ".") || strings.HasPrefix(d.Name(), "_")) {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if strings.HasSuffix(p, ".go") && filepath.Dir(p) != dir {
-				out = append(out, scanGo(cc, q, p, declPkg, false)...)
+	var cross []*scanTarget
+	for _, st := range all {
+		if st.t.ImportPath != "" && root != "" && len(st.exported) > 0 {
+			cross = append(cross, st)
+		}
+	}
+	if len(cross) == 0 {
+		return res, nil
+	}
+	res.Walks++
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if walkErr != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && (exclude.IsDirName(d.Name()) || d.Name() == "testdata" || strings.HasPrefix(d.Name(), ".") || strings.HasPrefix(d.Name(), "_")) {
+				return filepath.SkipDir
 			}
 			return nil
-		})
+		}
+		if !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		var src string
+		read := false
+		for _, st := range cross {
+			if filepath.Dir(p) == st.dir {
+				continue // the declaring directory was scanned above
+			}
+			if !read {
+				s, err := readFile(cc, p)
+				if err != nil {
+					return nil
+				}
+				src, read = s, true
+				res.Files++
+			}
+			res.Hits = append(res.Hits, scanGo(cc, st, p, src, false)...)
+		}
+		return nil
+	})
+	return res, err
+}
+
+// scanTarget is a Target prepared for scanning.
+type scanTarget struct {
+	t        Target
+	dir      string          // the declaring directory
+	declPkg  string          // the package clause name of DeclFile
+	names    map[string]bool // the names
+	exported map[string]bool // the exported names
+}
+
+func newScanTarget(c *build.Context, t Target, names []string) *scanTarget {
+	st := &scanTarget{t: t, dir: filepath.Dir(t.DeclFile), declPkg: packageName(c, t.DeclFile), names: setOf(names...), exported: map[string]bool{}}
+	for _, n := range names {
+		if token.IsExported(n) {
+			st.exported[n] = true
+		}
+	}
+	return st
+}
+
+// nonBlank is names without "" and "_".
+func nonBlank(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if n != "" && n != "_" {
+			out = append(out, n)
+		}
 	}
 	return out
+}
+
+// mentionsAny reports whether src contains one of names: a file that contains none of them cannot mention them,
+// so it is not parsed.
+func mentionsAny(src string, names map[string]bool) bool {
+	for n := range names {
+		if strings.Contains(src, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // withTexts is c with OpenFile reading the given contents first (the go tool reads build headers through it).
@@ -441,11 +635,17 @@ func packageName(c *build.Context, path string) string {
 	return f.Name.Name
 }
 
-// scanGo reports the mentions in one excluded .go file. A file of the declaring directory in the declaring
-// package is read as that package; any other file is read through its import of ImportPath.
-func scanGo(c *build.Context, q Query, path, declPkg string, sameDir bool) []Hit {
-	src, err := readFile(c, path)
-	if err != nil || !strings.Contains(src, q.Name) {
+// scanGo reports the mentions in one excluded .go file, whose text is src. A file of the declaring directory in
+// the declaring package is read as that package; any other file, through its import of the target's ImportPath.
+func scanGo(c *build.Context, st *scanTarget, path, src string, sameDir bool) []Hit {
+	names := st.names
+	if !sameDir {
+		if st.t.ImportPath == "" || !strings.Contains(src, st.t.ImportPath) {
+			return nil // a file that does not import the package is not parsed
+		}
+		names = st.exported
+	}
+	if !mentionsAny(src, names) {
 		return nil
 	}
 	base := filepath.Base(path)
@@ -463,22 +663,22 @@ func scanGo(c *build.Context, q Query, path, declPkg string, sameDir bool) []Hit
 	}
 	mk := func(id *ast.Ident, k Kind) Hit {
 		p := fset.PositionFor(id.Pos(), false)
-		return Hit{Path: path, Line: p.Line, Col: p.Column, Kind: k, Reason: reason}
+		return Hit{Path: path, Name: id.Name, Line: p.Line, Col: p.Column, Kind: k, Reason: reason}
 	}
-	if sameDir && (declPkg == "" || f.Name.Name == declPkg) {
-		return packageHits(f, q.Name, q.Member, true, mk)
+	if sameDir && (st.declPkg == "" || f.Name.Name == st.declPkg) {
+		return packageHits(f, st.names, st.t.Member, true, mk)
 	}
-	if q.ImportPath == "" || !token.IsExported(q.Name) {
+	if st.t.ImportPath == "" || len(st.exported) == 0 {
 		return nil
 	}
-	local, ok := importName(f, q.ImportPath, declPkg)
+	local, ok := importName(f, st.t.ImportPath, st.declPkg)
 	if !ok {
 		return nil
 	}
 	if local == "." {
-		return packageHits(f, q.Name, q.Member, false, mk)
+		return packageHits(f, st.exported, st.t.Member, false, mk)
 	}
-	return qualifiedHits(f, q.Name, local, q.Member, mk)
+	return qualifiedHits(f, st.exported, local, st.t.Member, mk)
 }
 
 // importName is the name under which f imports importPath ("." for a dot import); ok is false when f does
@@ -511,12 +711,12 @@ const (
 	topDecl            // a top-level func, type, var or const
 )
 
-// packageHits finds the mentions of name in a file of its own package. decls says whether the top-level
-// declarations of name count (they do for the package itself, not for a dot import).
-func packageHits(f *ast.File, name string, member, decls bool, mk func(*ast.Ident, Kind) Hit) []Hit {
+// packageHits finds the mentions of the names in a file of their own package. decls says whether the top-level
+// declarations of the names count (they do for the package itself, not for a dot import).
+func packageHits(f *ast.File, names map[string]bool, member, decls bool, mk func(*ast.Ident, Kind) Hit) []Hit {
 	role := map[*ast.Ident]int{}
 	mark := func(id *ast.Ident, r int) {
-		if id != nil && id.Name == name {
+		if id != nil && names[id.Name] {
 			role[id] = r
 		}
 	}
@@ -575,7 +775,7 @@ func packageHits(f *ast.File, name string, member, decls bool, mk func(*ast.Iden
 	var out []Hit
 	ast.Inspect(f, func(n ast.Node) bool {
 		id, ok := n.(*ast.Ident)
-		if !ok || id.Name != name {
+		if !ok || !names[id.Name] {
 			return true
 		}
 		switch r := role[id]; {
@@ -590,7 +790,7 @@ func packageHits(f *ast.File, name string, member, decls bool, mk func(*ast.Iden
 		case r == plainIdent:
 			// A local (parameter, variable, type parameter) shadows the package-level name; the parser's
 			// file scope holds the package-level objects of this file, and an unresolved name is another file's.
-			if id.Obj == nil || f.Scope != nil && f.Scope.Lookup(name) == id.Obj {
+			if id.Obj == nil || f.Scope != nil && f.Scope.Lookup(id.Name) == id.Obj {
 				out = append(out, mk(id, Use))
 			}
 		case r == keyLit:
@@ -601,13 +801,13 @@ func packageHits(f *ast.File, name string, member, decls bool, mk func(*ast.Iden
 	return out
 }
 
-// qualifiedHits finds local.name (the declaring package imported under the name local) and, for a member,
-// every selector of the name.
-func qualifiedHits(f *ast.File, name, local string, member bool, mk func(*ast.Ident, Kind) Hit) []Hit {
+// qualifiedHits finds local.name for the names (the declaring package imported under the name local) and, for
+// members, every selector of the names.
+func qualifiedHits(f *ast.File, names map[string]bool, local string, member bool, mk func(*ast.Ident, Kind) Hit) []Hit {
 	var out []Hit
 	ast.Inspect(f, func(n ast.Node) bool {
 		sel, ok := n.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != name {
+		if !ok || !names[sel.Sel.Name] {
 			return true
 		}
 		if member {
@@ -622,21 +822,22 @@ func qualifiedHits(f *ast.File, name, local string, member bool, mk func(*ast.Id
 
 var asmTextRe = regexp.MustCompile(`(?m)^[ \t]*TEXT[ \t]+[^ \t·]*·([\p{L}_][\p{L}\p{N}_]*)\(SB\)`)
 
-// scanAsm reports the TEXT ·name(SB) lines of one .s file.
-func scanAsm(c *build.Context, q Query, path string) []Hit {
+// scanAsm reports the TEXT ·name(SB) lines of one .s file of the declaring directory.
+func scanAsm(c *build.Context, st *scanTarget, path string) []Hit {
 	src, err := readFile(c, path)
-	if err != nil || !strings.Contains(src, q.Name) {
+	if err != nil || !mentionsAny(src, st.names) {
 		return nil
 	}
 	reason, _ := Excluded(c, path) // "" when the file is built
 	var out []Hit
 	for _, m := range asmTextRe.FindAllStringSubmatchIndex(src, -1) {
-		if src[m[2]:m[3]] != q.Name {
+		name := src[m[2]:m[3]]
+		if !st.names[name] {
 			continue
 		}
 		line := strings.Count(src[:m[2]], "\n") + 1
 		col := m[2] - strings.LastIndex(src[:m[2]], "\n")
-		out = append(out, Hit{Path: path, Line: line, Col: col, Kind: Asm, Reason: reason})
+		out = append(out, Hit{Path: path, Name: name, Line: line, Col: col, Kind: Asm, Reason: reason})
 	}
 	return out
 }

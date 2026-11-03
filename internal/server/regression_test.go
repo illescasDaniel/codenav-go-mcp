@@ -148,15 +148,15 @@ func TestEditSymbolInsertNamesMissingArguments(t *testing.T) {
 func TestDirMoveBuildConstraintNoteOncePerFile(t *testing.T) {
 	cs, root := session(t, nil)
 	writeFile(t, root, "cdir/a.go", "package cdir\n\nfunc A() int { return 1 }\n")
-	writeFile(t, root, "cdir/lin.go", "//go:build linux || darwin\n\npackage cdir\n\nfunc L() int { return 2 }\n")
+	writeFile(t, root, "cdir/lin.go", "//go:build integration\n\npackage cdir\n\nfunc L() int { return 2 }\n")
 	out := call(t, cs, "move", map[string]any{"file_path": "cdir", "to_file": "cdir2", "apply": false})
-	if n := strings.Count(out, "has a build constraint"); n != 1 {
+	if n := strings.Count(out, "is excluded from the current build"); n != 1 {
 		t.Errorf("want the build-constraint note exactly once, got %d:\n%s", n, out)
 	}
 	// Two different constrained files still get one note each.
-	writeFile(t, root, "cdir/dar.go", "//go:build darwin\n\npackage cdir\n\nfunc D() int { return 3 }\n")
+	writeFile(t, root, "cdir/dar.go", "//go:build e2e\n\npackage cdir\n\nfunc D() int { return 3 }\n")
 	out = call(t, cs, "move", map[string]any{"file_path": "cdir", "to_file": "cdir3", "apply": false})
-	if n := strings.Count(out, "has a build constraint"); n != 2 {
+	if n := strings.Count(out, "is excluded from the current build"); n != 2 {
 		t.Errorf("want one note per constrained file (2), got %d:\n%s", n, out)
 	}
 }
@@ -164,13 +164,13 @@ func TestDirMoveBuildConstraintNoteOncePerFile(t *testing.T) {
 // B13: a single edit to a constrained file carries the note once.
 func TestEditConstrainedFileNote(t *testing.T) {
 	cs, root := session(t, nil)
-	writeFile(t, root, "shapes/lin.go", "//go:build linux || darwin\n\npackage shapes\n\nvar L = 1\n")
+	writeFile(t, root, "shapes/lin.go", "//go:build integration\n\npackage shapes\n\nvar L = 1\n")
 	out := call(t, cs, "edit", map[string]any{"file_path": "shapes/lin.go", "old_string": "L = 1", "new_string": "L = 2", "apply": false})
-	if n := strings.Count(out, "shapes/lin.go has a build constraint"); n != 1 {
+	if n := strings.Count(out, "shapes/lin.go is excluded from the current build (//go:build integration)"); n != 1 {
 		t.Errorf("want one note, got %d:\n%s", n, out)
 	}
 	out = call(t, cs, "edit", map[string]any{"file_path": "shapes/shapes.go", "old_string": "package shapes", "new_string": "package shapes // x", "apply": false})
-	if strings.Contains(out, "has a build constraint") {
+	if strings.Contains(out, "is excluded from the current build") {
 		t.Errorf("no constraint, no note:\n%s", out)
 	}
 }

@@ -359,20 +359,6 @@ func uniqueStrings(s []string) []string {
 // maxSiblingModules bounds how many uncovered modules are listed to find importers of an edited one.
 const maxSiblingModules = 20
 
-// IsExcludedFromBuild is a best-effort hint that a file has a build constraint; true when its
-// "//go:build" line is present. gopls only checks the current GOOS/GOARCH/tags.
-func HasBuildConstraint(src string) bool {
-	for _, l := range strings.SplitN(src, "\n", 40) {
-		if strings.HasPrefix(l, "//go:build ") || strings.HasPrefix(l, "// +build ") {
-			return true
-		}
-		if strings.HasPrefix(l, "package ") {
-			return false
-		}
-	}
-	return false
-}
-
 // Nested describes a module below the workspace root that the workspace's build does not cover.
 type Nested struct {
 	Path string // module path from its go.mod ("" if unreadable)

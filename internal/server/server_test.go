@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -2426,8 +2427,8 @@ func TestHoverLinksImplementationsAndConstrainedDiagnostics(t *testing.T) {
 	if !strings.Contains(out, "Types (") || !strings.Contains(out, "Square") {
 		t.Errorf("implementations must name the types:\n%s", out)
 	}
-	writeFile(t, root, "shapes/lin.go", "//go:build linux || darwin\n\npackage shapes\n\nvar L = 1\n")
-	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/lin.go"}); !strings.Contains(out, "build-constrained") {
+	writeFile(t, root, "shapes/lin.go", "//go:build !"+runtime.GOOS+"\n\npackage shapes\n\nvar L = 1\n")
+	if out := call(t, cs, "diagnostics", map[string]any{"file_path": "shapes/lin.go"}); !strings.Contains(out, "excluded from the current build (//go:build !"+runtime.GOOS+")") {
 		t.Errorf("diagnostics of a constrained file:\n%s", out)
 	}
 }

@@ -651,6 +651,7 @@ func quickFixRun(ctx context.Context, w *Workspace, in quickFixIn) (qfResult, er
 		}
 	}
 	plan := edits.NewPlan("quick_fix "+rel+": "+strings.Join(uniq, "; "), changes, notes...)
+	noteExcludedUses(ctx, w, plan)
 	out, id, err := finishPlanID(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false)
 	return qfResult{out: out, titles: uniq, notFixed: notFixed, wrote: id != ""}, err
 }

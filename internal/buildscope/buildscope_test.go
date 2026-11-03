@@ -1,6 +1,7 @@
 package buildscope
 
 import (
+	"context"
 	"fmt"
 	"go/build"
 	"os"
@@ -266,5 +267,100 @@ func TestMentionsReadsTextsOverDisk(t *testing.T) {
 	}}
 	if got := Mentions(linuxAMD64(), q); len(got) != 0 {
 		t.Errorf("the edited text has no mention: %v", summary(root, got))
+	}
+}
+
+// An edit's text decides whether its file is excluded: a file not on disk yet (created by the edit) is judged by
+// its header, and a header the edit changes flips the answer.
+func TestExcludedTextJudgesTheEditedText(t *testing.T) {
+	c := linuxAMD64()
+	root := t.TempDir()
+	p := filepath.Join(root, "p", "new.go")
+	if reason, ex := ExcludedText(c, p, "//go:build integration\n\npackage p\n"); !ex || reason != "//go:build integration" {
+		t.Errorf("integration-tagged text: got %q, %v", reason, ex)
+	}
+	if reason, ex := ExcludedText(c, p, "package p\n"); ex {
+		t.Errorf("plain text is included, got excluded (%q)", reason)
+	}
+	if reason, ex := ExcludedText(c, filepath.Join(root, "p", "x_windows.go"), "package p\n"); !ex || reason != "file name suffix _windows" {
+		t.Errorf("_windows name: got %q, %v", reason, ex)
+	}
+}
+
+func TestExclusive(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"//go:build linux", "//go:build windows", true},
+		{"//go:build linux && windows", "//go:build linux", true}, // no build has both
+		{"//go:build linux", "//go:build integration", false},     // a build with both exists
+		{"//go:build linux", "//go:build linux", false},
+		// An android build also builds the _linux files; an android file and a windows file never meet.
+		{"//go:build android", "//go:build linux", false},
+		{"//go:build android", "//go:build windows", true},
+		{"//go:build ios", "//go:build darwin", false},
+		{"//go:build illumos", "//go:build solaris", false},
+		{"", "//go:build linux", false},
+		{"", "", false},
+		{"//go:build linux &&", "//go:build windows", false}, // unparsable: not exclusive
+	} {
+		if got := Exclusive(c.a, c.b); got != c.want {
+			t.Errorf("Exclusive(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+	// A _linux and a _windows file never build together; a _linux file and an integration file can.
+	lin := FileConstraint("f_linux.go", "package f\n")
+	if !Exclusive(lin, FileConstraint("f_windows.go", "package f\n")) {
+		t.Errorf("f_linux.go and f_windows.go must be exclusive")
+	}
+	if Exclusive(lin, FileConstraint("f_integration.go", "//go:build integration\n\npackage f\n")) {
+		t.Errorf("f_linux.go and an integration file can be built together")
+	}
+}
+
+// MentionsAll reads the tree once for any number of names: the walk count is the check.
+func TestMentionsAllWalksTheTreeOnce(t *testing.T) {
+	root, declFile := bed(t)
+	rFile := write(t, root, "r/r.go", "package r\n\nvar Thing = 1\n")
+	write(t, root, "q/q_windows.go", "package q\n\nimport \"example.com/m/p\"\n\nvar _ = []any{p.Plat, p.Run, p.Name07}\n")
+	write(t, root, "s/s_windows.go", "package s\n\nimport \"example.com/m/r\"\n\nvar _ = r.Thing\n")
+	names := []string{"", "_", "Plat", "Run"}
+	for i := 0; i < 60; i++ {
+		names = append(names, fmt.Sprintf("Name%02d", i))
+	}
+	res, err := MentionsAll(context.Background(), linuxAMD64(), root, nil, []Target{
+		{DeclFile: declFile, ImportPath: "example.com/m/p", Names: names},
+		{DeclFile: rFile, ImportPath: "example.com/m/r", Names: []string{"Thing", "Thing"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Walks != 1 {
+		t.Errorf("walks = %d, want 1 for any number of names and targets", res.Walks)
+	}
+	var got []string
+	for _, h := range res.Hits {
+		got = append(got, h.Name+" "+filepath.ToSlash(strings.TrimPrefix(h.Path, root+string(filepath.Separator))))
+	}
+	sort.Strings(got)
+	equalLines(t, got, []string{"Name07 q/q_windows.go", "Plat q/q_windows.go", "Run q/q_windows.go", "Thing s/s_windows.go"})
+}
+
+func TestMentionsAllWalksOnlyForOtherPackages(t *testing.T) {
+	root, declFile := bed(t)
+	res, err := MentionsAll(context.Background(), linuxAMD64(), root, nil, []Target{{DeclFile: declFile, Names: []string{"Plat"}}})
+	if err != nil || res.Walks != 0 {
+		t.Errorf("a target without an import path walks nothing: walks = %d, err = %v", res.Walks, err)
+	}
+}
+
+func TestMentionsAllStopsWhenCancelled(t *testing.T) {
+	root, declFile := bed(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := MentionsAll(ctx, linuxAMD64(), root, nil, []Target{{DeclFile: declFile, ImportPath: "example.com/m/p", Names: []string{"Plat"}}})
+	if err != context.Canceled {
+		t.Errorf("a cancelled scan returns the context error, got %v", err)
 	}
 }

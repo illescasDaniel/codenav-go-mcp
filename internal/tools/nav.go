@@ -563,6 +563,46 @@ func siblingSyntaxNote(root, abs, src string) string {
 	return ""
 }
 
+// excludedNote says that the build leaves out the file subject (a sentence start, such as "This file"), and why
+// (reason: buildscope's). gopls checks such a file on its own, so the errors it shows may not match the build.
+func excludedNote(subject, reason string) string {
+	if buildscope.NeverBuilt(reason) {
+		return fmt.Sprintf("%s has %s, so no build includes it: it is a standalone program; run it with go run.", subject, reason)
+	}
+	return fmt.Sprintf("%s is excluded from the current build (%s); gopls checked it on its own, so errors that depend on the other files of its package may be missing. To include it, start the server with the GOOS or GOARCH it needs (GOOS=windows for a _windows file), or add its tag to -tags in CODENAV_GO_MCP_BUILD_FLAGS.", subject, reason)
+}
+
+// excludedUsesNote names the uses of a package-level func in files the build leaves out: gopls' callers cannot list
+// them, so a "No callers found." answer needs this. "" when there are none, or sym is a method (its selectors are
+// not told apart by name).
+func excludedUsesNote(w *Workspace, sym resolve.Symbol) string {
+	path := lsp.URIToPath(sym.URI)
+	text, _, err := edits.ReadSource(path)
+	if err != nil {
+		return ""
+	}
+	shape, ok := declShapeAt(path, text, edits.Offset(text, sym.Line, sym.Column))
+	name := identAt(path, sym.Line, sym.Column)
+	if !ok || shape.method || name == "" {
+		return ""
+	}
+	dir := filepath.Dir(path)
+	ip := ""
+	if m, err := moduleOf(dir); err == nil {
+		ip, _ = importPathOf(m, dir)
+	}
+	var uses []string
+	for _, h := range buildscope.Mentions(buildscope.Context(), buildscope.Query{Root: w.Root, DeclFile: path, Name: name, ImportPath: ip}) {
+		if h.Kind == buildscope.Use {
+			uses = append(uses, fmt.Sprintf("%s:%d (%s)", edits.RelativeName(h.Path, w.Root), h.Line, h.Reason))
+		}
+	}
+	if len(uses) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d use(s) of %s in files the build leaves out are not in this list: %s. To include them, start the server with the GOOS or GOARCH they need, or add their tags to -tags in CODENAV_GO_MCP_BUILD_FLAGS.", len(uses), name, listing(uses))
+}
+
 // RegisterNav registers the navigation tools.
 func RegisterNav(s *mcp.Server, h Host) {
 	add(s, h, "workspace", "Which directory is codenav navigating, and why? Use when results look like they come from the wrong checkout/worktree.",
@@ -676,8 +716,8 @@ func RegisterNav(s *mcp.Server, h Host) {
 				if note := siblingSyntaxNote(w.Root, abs, src); note != "" {
 					out += "\n" + note
 				}
-				if gomod.HasBuildConstraint(src) {
-					out += "\n(build-constrained: this file has a build constraint, and diagnostics only cover the current GOOS/GOARCH/tags; if the constraint excludes it here, it was not type-checked.)"
+				if reason, excluded := buildscope.Excluded(buildscope.Context(), abs); excluded {
+					out += "\n" + excludedNote("This file", reason)
 				}
 			}
 			return out, nil
@@ -789,6 +829,9 @@ func RegisterNav(s *mcp.Server, h Host) {
 				out += fmt.Sprintf("\n(%d non-call reference(s) omitted: uses as a function or method value, such as f := %s; see references)", omitted, sym.Name)
 			}
 			if note := uncoveredNote(w, sym); note != "" {
+				out += "\n" + note
+			}
+			if note := excludedUsesNote(w, sym); note != "" {
 				out += "\n" + note
 			}
 			if note := caseNote(w, name, sym); note != "" {

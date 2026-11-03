@@ -3,6 +3,7 @@ package tools
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
@@ -39,5 +40,26 @@ func TestDirFullyDeleted(t *testing.T) {
 	made := &edits.EditPlan{Changes: append([]edits.FileChange{{Path: filepath.Join(dir, "n.go"), New: edits.Str("package p\n")}}, both.Changes...)}
 	if dirFullyDeleted(dir, made, set) {
 		t.Error("a file is created in the directory")
+	}
+}
+
+// A body-only edit changes no top-level shape; a new signature, a type, or a typed var does. Methods have none.
+func TestTopDeclShapesIgnoreBodies(t *testing.T) {
+	src := "package p\n\nfunc F(n int) int { return n }\n\ntype T struct{ A int }\n\nvar V int = 1\n\nfunc (T) M() {}\n"
+	base := topDeclShapes(src)
+	if got := topDeclShapes(strings.Replace(src, "return n }", "return n + 1 }", 1)); got["F"] != base["F"] {
+		t.Errorf("a body-only edit changed the shape of F: %q", got["F"])
+	}
+	if got := topDeclShapes(strings.Replace(src, "F(n int) int", "F(n, m int) int", 1)); got["F"] == base["F"] {
+		t.Errorf("a new signature must change the shape of F")
+	}
+	if got := topDeclShapes(strings.Replace(src, "A int", "A int64", 1)); got["T"] == base["T"] {
+		t.Errorf("a changed field must change the shape of T")
+	}
+	if got := topDeclShapes(strings.Replace(src, "var V int = 1", "var V int64 = 1", 1)); got["V"] == base["V"] {
+		t.Errorf("a changed type must change the shape of V")
+	}
+	if _, ok := base["M"]; ok {
+		t.Errorf("methods are not top-level names: %v", base)
 	}
 }

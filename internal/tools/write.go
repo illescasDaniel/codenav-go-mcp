@@ -746,6 +746,7 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 			if err := packageClauseRefusal(w, plan, limit(in.MaxNewErrors)); err != nil {
 				return "", err
 			}
+			noteExcludedUses(ctx, w, plan)
 			out, _, err := finishPlanWith(ctx, w, plan, flag(in.Apply, true), limit(in.MaxNewErrors), flag(in.IncludeDependents, true), false,
 				func(d diagdelta.Delta) []string { return editImportHints(plan, d) })
 			return out, err
