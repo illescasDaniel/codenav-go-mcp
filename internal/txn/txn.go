@@ -535,7 +535,7 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			if reason, ok := j.dropped[id]; ok {
 				return nil, droppedEdit(id, reason)
 			}
-			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server (or all were undone); %s", id, memoryNote)
+			return nil, toolerr.Inputf("unknown edit id %q: no edits were applied by this server (or all were undone); pass the id an applied edit reported, or run an edit first; %s", id, memoryNote)
 		}
 		return nil, toolerr.Inputf("nothing to undo: no edits were applied by this server; %s", memoryNote)
 	}
@@ -562,7 +562,7 @@ func (j *Journal) Undo(id, readOnlyHint string) (*Applied, error) {
 			if len(gone) > 0 {
 				msg += "; already undone: " + strings.Join(gone, ", ")
 			}
-			return nil, toolerr.Inputf("%s); %s", msg, memoryNote)
+			return nil, toolerr.Inputf("%s); pass one of the known ids, or omit id to undo the latest edit; %s", msg, memoryNote)
 		}
 	}
 	e := j.entries[idx]
@@ -706,9 +706,9 @@ func (s *PlanStore) Get(id string) (*edits.EditPlan, error) {
 			return nil, toolerr.Inputf("preview %q was dropped by the %s; run the refactoring again in this workspace for a fresh preview", id, reason)
 		}
 		if len(s.ids) == 0 {
-			return nil, toolerr.Inputf("unknown or expired preview id %q (no previews are pending); %s; use undo_edit with an applied edit id", id, memoryNote)
+			return nil, toolerr.Inputf("unknown or expired preview id %q (no previews are pending); run edit with apply=false first to get a preview id, or use undo_edit with an applied edit id; %s", id, memoryNote)
 		}
-		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s); %s; use undo_edit with an applied edit id", id, strings.Join(s.ids, ", "), memoryNote)
+		return nil, toolerr.Inputf("unknown or expired preview id %q (pending: %s); run edit with apply=false first to get a preview id, or use undo_edit with an applied edit id; %s", id, strings.Join(s.ids, ", "), memoryNote)
 	}
 	return p, nil
 }

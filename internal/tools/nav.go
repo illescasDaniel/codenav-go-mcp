@@ -411,10 +411,13 @@ func checkGoFile(w *Workspace, p string) error {
 		if _, err := os.Stat(abs); errors.Is(err, os.ErrNotExist) {
 			return &fs.PathError{Op: "open", Path: p, Err: fs.ErrNotExist}
 		}
-		return toolerr.Inputf("%q is not a .go file.", p)
+		return toolerr.Inputf("%q is not a .go file: %s.", p, goOnlyNext)
 	}
 	return nil
 }
+
+// goOnlyNext is the next step for a path that is not a .go file: no tool here takes other file types (LEAK-007).
+const goOnlyNext = "no tool here takes other file types, so use your normal file tools for it"
 
 type posIn struct {
 	FilePath string `json:"file_path" jsonschema:"file path, relative to the workspace root"`

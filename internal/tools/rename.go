@@ -230,7 +230,7 @@ func planRename(ctx context.Context, w *Workspace, in renameIn) (*edits.EditPlan
 	}
 	oldName := text[edits.Offset(text, rng.Start.Line, rng.Start.Character):edits.Offset(text, rng.End.Line, rng.End.Character)]
 	if oldName == in.NewName {
-		return nil, toolerr.Inputf("%s is already called %s.", oldName, in.NewName)
+		return nil, toolerr.Inputf("%s is already called %s: pass a new_name that differs from the current name.", oldName, in.NewName)
 	}
 
 	if in.Parameter == "" {

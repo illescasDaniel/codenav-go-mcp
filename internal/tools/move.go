@@ -126,10 +126,10 @@ func moveSymbol(ctx context.Context, w *Workspace, in moveIn) (string, error) {
 		return "", err
 	}
 	if filepath.Ext(dest) != ".go" {
-		return "", toolerr.Inputf("%q is not a .go file.", in.ToFile)
+		return "", toolerr.Inputf("%q is not a .go file: %s.", in.ToFile, goOnlyNext)
 	}
 	if dest == l.path {
-		return "", toolerr.Inputf("%s is already in %s.", in.Name, in.ToFile)
+		return "", toolerr.Inputf("%s is already in %s: pass a different to_file to move it to another file.", in.Name, in.ToFile)
 	}
 	if d.Method && filepath.Dir(dest) != filepath.Dir(l.path) {
 		return "", toolerr.Inputf("%s is a method of %s; Go methods must stay in their type's package. Move %s (its methods follow) or pick a file in the same directory.", in.Name, d.Recv, d.Recv)

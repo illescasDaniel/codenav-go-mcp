@@ -886,10 +886,10 @@ func (c *Client) checkPosition(abs string, line, column int) error {
 		lines = lines[:n-1] // the empty element after a final newline is not a line
 	}
 	if line < 1 || line > len(lines) {
-		return &InvalidPositionError{fmt.Sprintf("line %d is outside the file (it has %s)", line, lineCount(len(lines)))}
+		return &InvalidPositionError{fmt.Sprintf("line %d is outside the file (it has %s); lines are 1-based, so use 1 to %d", line, lineCount(len(lines)), len(lines))}
 	}
 	if width := Utf16Len(lines[line-1]); column < 1 || column > width+1 {
-		return &InvalidPositionError{fmt.Sprintf("column %d is outside line %d (it has %d UTF-16 columns)", column, line, width)}
+		return &InvalidPositionError{fmt.Sprintf("column %d is outside line %d (it has %d UTF-16 columns); columns are 1-based, so valid columns are 1 to %d", column, line, width, width+1)}
 	}
 	return nil
 }

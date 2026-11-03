@@ -80,13 +80,13 @@ func TestBlock20G2LineCountIgnoresPhantomLine(t *testing.T) {
 		line int
 		want string // "" means the position is accepted
 	}{
-		"final newline, line 28": {body + "\n", 28, "line 28 is outside the file (it has 27 lines)"},
-		"final newline, line 0":  {body + "\n", 0, "line 0 is outside the file (it has 27 lines)"},
+		"final newline, line 28": {body + "\n", 28, "line 28 is outside the file (it has 27 lines); lines are 1-based, so use 1 to 27"},
+		"final newline, line 0":  {body + "\n", 0, "line 0 is outside the file (it has 27 lines); lines are 1-based, so use 1 to 27"},
 		"final newline, line 27": {body + "\n", 27, ""},
-		"no final newline, 28":   {body, 28, "line 28 is outside the file (it has 27 lines)"},
-		"one line with newline":  {"x\n", 2, "line 2 is outside the file (it has 1 line)"},
-		"one line, no newline":   {"x", 2, "line 2 is outside the file (it has 1 line)"},
-		"crlf final newline":     {strings.ReplaceAll(body, "\n", "\r\n") + "\r\n", 28, "line 28 is outside the file (it has 27 lines)"},
+		"no final newline, 28":   {body, 28, "line 28 is outside the file (it has 27 lines); lines are 1-based, so use 1 to 27"},
+		"one line with newline":  {"x\n", 2, "line 2 is outside the file (it has 1 line); lines are 1-based, so use 1 to 1"},
+		"one line, no newline":   {"x", 2, "line 2 is outside the file (it has 1 line); lines are 1-based, so use 1 to 1"},
+		"crlf final newline":     {strings.ReplaceAll(body, "\n", "\r\n") + "\r\n", 28, "line 28 is outside the file (it has 27 lines); lines are 1-based, so use 1 to 27"},
 	}
 	for name, tc := range cases {
 		err := c.checkPosition(write(strings.ReplaceAll(name, " ", "_")+".go", tc.text), tc.line, 1)

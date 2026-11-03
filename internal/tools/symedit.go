@@ -428,7 +428,7 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 		return nil, err
 	}
 	if filepath.Ext(abs) != ".go" {
-		return nil, toolerr.Inputf("%q is not a .go file.", in.FilePath)
+		return nil, toolerr.Inputf("%q is not a .go file: %s.", in.FilePath, goOnlyNext)
 	}
 	text, bom, rerr := edits.ReadSource(abs)
 	exists := rerr == nil
