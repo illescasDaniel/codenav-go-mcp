@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 
@@ -45,6 +46,20 @@ const (
 const maxScanFiles = 50000
 
 var retryDelays = []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, 500 * time.Millisecond}
+
+// requestTimeout bounds a request that has no deadline of its own (a variable so tests can shorten it).
+var requestTimeout = 20 * time.Second
+
+// busyTimeouts is how many requests in a row may time out while the server still sends messages before it
+// is ended: a server that talks but never answers must not keep every call waiting.
+const busyTimeouts = 3
+
+// hungRestartWait bounds the wait for a killed server's exit, so Alive is false when the caller gets the error.
+const hungRestartWait = 2 * time.Second
+
+// hungMessage answers a request on a server that was ended for not answering. It is a Code -1 error (see
+// RequestError) and names no binary.
+const hungMessage = "the language server stopped answering and was restarted; retry"
 
 // RequestError is a JSON-RPC error response.
 type RequestError struct {
@@ -127,6 +142,17 @@ type Client struct {
 	configs  map[string]fileStamp // module files on disk at the last Refresh
 	extra    map[string]bool      // workspace folders besides the root that the server knows
 
+	// lastMsg is the arrival time (UnixNano) of the last message of any kind from the server.
+	lastMsg  atomic.Int64
+	timeouts int  // stalls in a row that ended with the server still talking (guarded by mu)
+	killing  bool // a server found hung is being ended; set once per process (guarded by mu)
+	// lastTimeoutSent is when the last counted timeout fired (guarded by mu). A request sent before it timed
+	// out in the same stall as that one, so it is not counted again.
+	lastTimeoutSent int64
+	// ready is set once the initialize handshake has completed (guarded by mu): a server ended during the
+	// handshake is reported by Start's error, not by a notice.
+	ready bool
+
 	writeMu sync.Mutex
 	// opMu serialises overlay() against refresh()/EnsureOpen from other tool calls.
 	opMu sync.Mutex
@@ -178,6 +204,10 @@ func (c *Client) reset() {
 	c.overlays = map[string]string{}
 	c.stderr = nil
 	c.stopping = false
+	c.timeouts = 0
+	c.killing = false
+	c.lastTimeoutSent = 0
+	c.ready = false
 	c.nextID = 0
 	c.exited = make(chan struct{})
 }
@@ -272,6 +302,9 @@ func (c *Client) Start(ctx context.Context) error {
 		_ = c.Stop()
 		return err
 	}
+	c.mu.Lock()
+	c.ready = true
+	c.mu.Unlock()
 	return c.Notify("initialized", map[string]any{})
 }
 
@@ -425,6 +458,7 @@ func (c *Client) readLoop(r *bufio.Reader) {
 		if _, err := io.ReadFull(r, body); err != nil {
 			return
 		}
+		c.lastMsg.Store(time.Now().UnixNano())
 		var msg struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
@@ -450,6 +484,7 @@ func (c *Client) readLoop(r *bufio.Reader) {
 			c.mu.Lock()
 			ch := c.pending[id]
 			delete(c.pending, id)
+			c.timeouts = 0 // the server answered: it is busy at most, not stuck
 			c.mu.Unlock()
 			if ch != nil {
 				resp := response{Result: msg.Result}
@@ -553,6 +588,12 @@ func (c *Client) kill() {
 	c.mu.Lock()
 	cmd := c.cmd
 	c.mu.Unlock()
+	killProcess(cmd)
+}
+
+// killProcess ends the process of cmd, if it is running. stalled passes the process it checked, so a server
+// started in the meantime is never the one ended.
+func killProcess(cmd *exec.Cmd) {
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
@@ -577,10 +618,13 @@ func (c *Client) Request(ctx context.Context, method string, params any) (json.R
 }
 
 func (c *Client) requestOnce(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	sent := time.Now().UnixNano()
+	ownTimer := false
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
 		defer cancel()
+		ownTimer = true
 	}
 	c.mu.Lock()
 	c.nextID++
@@ -590,6 +634,7 @@ func (c *Client) requestOnce(ctx context.Context, method string, params any) (js
 		c.pending = map[int]chan response{}
 	}
 	c.pending[id] = ch
+	exited := c.exited // the server process this request goes to
 	c.mu.Unlock()
 	if err := c.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
 		c.mu.Lock()
@@ -611,8 +656,58 @@ func (c *Client) requestOnce(ctx context.Context, method string, params any) (js
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return nil, fmt.Errorf("%s: %w", method, ctx.Err())
 		}
+		if ownTimer {
+			return nil, c.stalled(method, sent, exited, ctx.Err())
+		}
 		return nil, fmt.Errorf("%s timed out: %w", method, ctx.Err())
 	}
+}
+
+// stalled answers a request that timed out on the client's own timer. A server that sent nothing since the
+// request was sent is hung (stopped, deadlocked): it is ended at once. A server that keeps sending messages
+// is busy or loading, so it is ended only at the busyTimeouts-th stall in a row: requests that time out
+// together (sent before the last counted timeout) are one stall. Either way the process is ended once, its
+// exit is awaited (so the next call starts a new one), the caller gets a Code -1 error and the user gets one
+// notice (none while the handshake is still running). A request on a process that is already gone, or during
+// Stop, keeps the plain timeout.
+func (c *Client) stalled(method string, sent int64, exited chan struct{}, cause error) error {
+	timeout := fmt.Errorf("%s timed out: %w", method, cause)
+	c.mu.Lock()
+	current := c.exited == exited // the request went to the process that is running now
+	if current && sent > c.lastTimeoutSent {
+		c.timeouts++
+		c.lastTimeoutSent = time.Now().UnixNano()
+	}
+	silent := c.lastMsg.Load() < sent
+	hung := current && !c.stopping && (silent || c.timeouts >= busyTimeouts)
+	first := hung && !c.killing
+	if first {
+		c.killing = true
+	}
+	proc, announce := c.cmd, c.ready
+	c.mu.Unlock()
+	if !hung {
+		return timeout
+	}
+	if first {
+		killProcess(proc)
+		if announce && c.opts.OnNotice != nil {
+			c.opts.OnNotice(fmt.Sprintf("gopls did not answer for %s and was restarted", durationWords(requestTimeout)))
+		}
+	}
+	select {
+	case <-exited:
+	case <-time.After(hungRestartWait):
+	}
+	return &RequestError{Method: method, Code: -1, Message: hungMessage}
+}
+
+// durationWords writes a timeout for a notice: "20 s", or the exact duration when it is not whole seconds.
+func durationWords(d time.Duration) string {
+	if d >= time.Second && d%time.Second == 0 {
+		return fmt.Sprintf("%d s", int(d/time.Second))
+	}
+	return d.String()
 }
 
 // Notify sends a notification.

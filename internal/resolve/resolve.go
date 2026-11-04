@@ -143,6 +143,25 @@ func pkgLabel(c *lsp.Symbol) string {
 // sample of the first candidates in order, and the total.
 const maxCandidates = 50
 
+// capAdvice says how to narrow a capped listing. It counts the files over all the candidates, not only the
+// shown ones: file_path cannot narrow a candidate that has no file, nor a list that all sits in one file.
+func capAdvice(cands []*lsp.Symbol, root string) string {
+	const qualify = "qualify the name (Type.Member) or pass line/column"
+	files := map[string]bool{}
+	for _, c := range cands {
+		if c.Location == nil || c.Location.URI == "" {
+			return qualify
+		}
+		files[c.Location.URI] = true
+	}
+	if len(files) == 1 {
+		for uri := range files {
+			return "all are in " + format.Relative(uri, root) + "; " + qualify
+		}
+	}
+	return "pass file_path or a qualified name"
+}
+
 // candidateLines lists ambiguous candidates alike: package by import path and, as soon as one of them
 // sits behind a build constraint, the constraint (or its absence) on every line. The list is capped at
 // maxCandidates lines; the rest are counted.
@@ -153,7 +172,7 @@ func candidateLines(cands []*lsp.Symbol, root string) string {
 	}
 	more := ""
 	if len(cands) > maxCandidates {
-		more = fmt.Sprintf("\n  ... and %d more; pass file_path or a qualified name", len(cands)-maxCandidates)
+		more = fmt.Sprintf("\n  ... and %d more; %s", len(cands)-maxCandidates, capAdvice(cands, root))
 		cands = cands[:maxCandidates]
 	}
 	lines := make([]string, len(cands))
@@ -295,15 +314,23 @@ func merge(ix *index.Index, query string, exact, loose []*lsp.Symbol) (ex, lo []
 	}
 	ie, il := ix.Lookup(query)
 	fold := func(have []*lsp.Symbol, entries []index.Entry) []*lsp.Symbol {
-		for _, e := range entries {
-			uri := canonPath(lsp.PathToURI(e.File))
-			var hit *lsp.Symbol
-			for _, s := range have {
-				if _, l, _ := format.SymbolPosition(s); l == e.Line && canonPath(s.Location.URI) == uri {
-					hit = s
-					break
-				}
+		// byPos finds an entry's symbol by file and line in one map lookup. It keeps the first symbol at a
+		// position, as a scan of have in order would. (A scan per entry was quadratic: a name declared by
+		// thousands of symbols took about 30 s, SCALE-002.)
+		type declPos struct {
+			file string
+			line int
+		}
+		byPos := make(map[declPos]*lsp.Symbol, len(have)+len(entries))
+		for _, s := range have {
+			_, l, _ := format.SymbolPosition(s)
+			if k := (declPos{canonPath(s.Location.URI), l}); byPos[k] == nil {
+				byPos[k] = s
 			}
+		}
+		for _, e := range entries {
+			k := declPos{canonPath(lsp.PathToURI(e.File)), e.Line}
+			hit := byPos[k]
 			switch {
 			case hit != nil:
 				if e.Constraint != "" && hit.Detail == "" {
@@ -313,6 +340,7 @@ func merge(ix *index.Index, query string, exact, loose []*lsp.Symbol) (ex, lo []
 				s := FromEntry(e)
 				onlyIndex[s] = true
 				have = append(have, s)
+				byPos[k] = s
 			}
 		}
 		return have
