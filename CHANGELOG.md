@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Documentation: the command now has a package comment, shown on pkg.go.dev.
+
 ## 1.0.0
 
 First release. An MCP server for Go, backed by gopls.
