@@ -1,5 +1,10 @@
 # codenav-go-mcp
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/illescasDaniel/codenav-go-mcp.svg)](https://pkg.go.dev/github.com/illescasDaniel/codenav-go-mcp)
+[![Release](https://img.shields.io/github/v/release/illescasDaniel/codenav-go-mcp)](https://github.com/illescasDaniel/codenav-go-mcp/releases)
+[![CI](https://github.com/illescasDaniel/codenav-go-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/illescasDaniel/codenav-go-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An MCP server that gives AI agents type-resolved **Go** navigation, backed by
 [gopls](https://pkg.go.dev/golang.org/x/tools/gopls). Definitions, references,
 implementations and call sites go through the real type checker, not text grep.
