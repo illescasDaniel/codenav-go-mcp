@@ -1,6 +1,8 @@
-codenav-go-mcp
+/codenav-go-mcp
 *.test
 
-# QA scratch (beds, binaries, logs)
-qa/*/bed/*
-!qa/*/bed/.gitkeep
+# QA workspace (beds, bug notes, fix patches, logs)
+qa/
+
+# Local agent worktrees
+.claude/worktrees/
