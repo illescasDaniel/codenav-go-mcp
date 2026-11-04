@@ -42,7 +42,8 @@ at all since the request was sent ends the server at once. A server that keeps s
 loading packages) is not ended on the first timeout: it is ended at the third stall in a row. Requests that time
 out together count as one stall, and any answer from the server resets the count. Each restart posts one notice,
 "gopls did not answer for 20 s and was restarted". The call that timed out gets the message "the language server
-stopped answering and was restarted; retry", and the next call starts a new server.
+stopped answering and was restarted; retry", and the next call starts a new server. Read tools retry the request once on their own after such a restart
+(never a write), so a read normally still answers.
 
 A single legitimate request that stays silent for more than 20 s (for example a heavy references or type-check
 run that sends no progress messages) is treated as hung and ended.
@@ -79,5 +80,15 @@ total, so it stays about 3.5 KB.
   them.
 - An `edit` that breaks a `#include` in a cgo preamble passes silently: overlay edits do not run cgo.
 - `verify_changes` type-checks at most 60 files; the rest are reported as not checked.
+- A Go package in a nested directory under `build/`, `dist/` or `venv/` that has no `.go` file directly in that
+  directory is treated as build output and excluded from write tools (SHAPE-001). A test pins this shape.
+- A `go.mod` created below the root inside the 30 s nested-scan window is not seen until the cache expires.
+- `search_symbol` and the name-resolution errors in symbol lookup are not routed through the "no views" mapping.
+- `readableRoots` runs `go env` without a timeout; a timed-out `go env GOROOT` is remembered as unknown for the
+  process lifetime.
+- The "missing go.sum" hint uses the import path in `go get`, which may not be the module that provides it.
+- A request batch holds all its ids in flight until the whole answer array is written.
+- A repeated id inside one batch is refused with "duplicate request id".
+- Edit previews still describe a broken import with the generic "no required module" wording (`diagdelta`).
 
 Last reviewed: block 21
