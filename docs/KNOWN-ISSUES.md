@@ -86,4 +86,9 @@ total, so it stays about 3.5 KB.
 - A request batch holds all its ids in flight until the whole answer array is written.
 - A repeated id inside one batch is refused with "duplicate request id".
 
-Last reviewed: block 21
+- Edit previews name the cause of a broken import for at most 5 import paths, looked up on disk (not the overlay),
+  so a cause can be stale or generic when the edit itself changes a `go.mod` or a replaced module.
+- `go env` failures are retried only every 30 s, and the first caller after each window can wait up to the 5 s
+  timeout per variable while `go` hangs.
+
+Last reviewed: block 22
