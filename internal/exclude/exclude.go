@@ -112,20 +112,43 @@ func RelativeTo(path, root string) string {
 		return filepath.ToSlash(rel)
 	}
 	if filepath.IsAbs(path) && !isToolchainPath(path) {
-		up := ""
-		for dir := root; ; {
-			parent := filepath.Dir(dir)
-			if parent == dir || parent == string(filepath.Separator) {
-				break
-			}
-			up += "../"
-			if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
-				return up + filepath.ToSlash(rel)
-			}
-			dir = parent
+		if s, ok := upward(path, root, false); ok {
+			return s
 		}
 	}
 	return filepath.ToSlash(path)
+}
+
+// OutsideRelative renders a path for the "outside the workspace" refusals: relative to root inside it, and
+// `../` steps up from root to the first ancestor that holds it, at any depth, "/" included. Unlike RelativeTo it
+// never prints a toolchain path (the module cache, GOROOT) absolute, so the user's home directory does not
+// show (WRX-004).
+func OutsideRelative(path, root string) string {
+	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
+		return filepath.ToSlash(rel)
+	}
+	if s, ok := upward(path, root, true); ok {
+		return s
+	}
+	return filepath.ToSlash(path)
+}
+
+// upward is the `../` walk shared by RelativeTo and OutsideRelative: it climbs from root one ancestor at a time
+// and returns the path relative to the first ancestor that holds it. The "/" ancestor is climbed to only when
+// slash is set; RelativeTo leaves it out, so a file that only "/" holds stays absolute.
+func upward(path, root string, slash bool) (string, bool) {
+	up := ""
+	for dir := root; ; {
+		parent := filepath.Dir(dir)
+		if parent == dir || (!slash && parent == string(filepath.Separator)) {
+			return "", false
+		}
+		up += "../"
+		if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
+			return up + filepath.ToSlash(rel), true
+		}
+		dir = parent
+	}
 }
 
 // goBuildTempRE and goCacheShapeRE are fallbacks for cgo output whose temporary root is unknown: a

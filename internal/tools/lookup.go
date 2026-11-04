@@ -52,7 +52,7 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	if cgoQualified(nf.Query) {
 		// NAVN-007: C is the pseudo-package of cgo, which go list cannot load, so no probe is launched for it. A
 		// workspace type called C still gets its own not-found answer.
-		if !isWorkspaceType(ctx, w, "C") {
+		if !workspaceSymbolNamed(ctx, w, "C") && packageDir(w.Root, "C") == "" {
 			return sym, toolerr.NotFoundf("No symbol found matching %q: %s is a cgo name, not a Go package symbol; use hover or definition at a use of it.", nf.Query, nf.Query)
 		}
 		return sym, toolerr.NotFoundf("%s", notFoundMessage(ctx, w, nf.Query, false, nil))
@@ -312,6 +312,20 @@ func isWorkspaceType(ctx context.Context, w *Workspace, name string) bool {
 	return len(workspaceTypeFiles(ctx, w, name)) > 0
 }
 
+// workspaceSymbolNamed reports whether a symbol called name, of any kind, is declared in the workspace.
+func workspaceSymbolNamed(ctx context.Context, w *Workspace, name string) bool {
+	syms, err := w.Client.WorkspaceSymbol(ctx, name)
+	if err != nil {
+		return false
+	}
+	for _, s := range syms {
+		if s.Name == name && s.Location != nil && w.inWorkspace(filepath.Clean(lsp.URIToPath(s.Location.URI))) {
+			return true
+		}
+	}
+	return false
+}
+
 // workspaceTypeFiles lists the distinct files that declare a type called name in the workspace.
 func workspaceTypeFiles(ctx context.Context, w *Workspace, name string) []string {
 	syms, err := w.Client.WorkspaceSymbol(ctx, name)
@@ -351,6 +365,15 @@ func promotedRefusal(ctx context.Context, w *Workspace, typ, member string) stri
 			}
 			return fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols): %s is declared on %s (embedded in %s); use %s.",
 				typ, member, member, strings.Join(owners, ", "), typ, strings.Join(uses, " or "))
+		}
+		// A qualified embed (pkg.Inner) lies in another package, which is not read: the answer names it instead.
+		if quals := qualifiedEmbeds(dir, typ); len(quals) > 0 {
+			sentences := make([]string, len(quals))
+			for i, q := range quals {
+				sentences[i] = fmt.Sprintf("`%s` embeds `%s` (another package); `%s` may be promoted from it: query `%s.%s`.", typ, q, member, q, member)
+			}
+			return fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols): %s",
+				typ, member, strings.Join(sentences, " "))
 		}
 	}
 	return fmt.Sprintf(": type %s declares no %s (methods promoted through embedding are not declared symbols; query the embedded type's method instead).", typ, member)
@@ -407,6 +430,33 @@ func promotedFrom(dir, typ string, hasMember func(string) bool) []string {
 // name (Inner, *Inner).
 func embeddedTypes(dir string) map[string][]string {
 	out := map[string][]string{}
+	forEachEmbed(dir, func(typ string, t ast.Expr) {
+		if id, ok := t.(*ast.Ident); ok {
+			out[typ] = append(out[typ], id.Name)
+		}
+	})
+	return out
+}
+
+// qualifiedEmbeds lists the qualified types that the struct typ embeds in the non-test Go files of dir, as the
+// source spells them (fmt.Stringer, *inner.Inner -> "inner.Inner"). The other package is not read.
+func qualifiedEmbeds(dir, typ string) []string {
+	var out []string
+	forEachEmbed(dir, func(name string, t ast.Expr) {
+		sel, ok := t.(*ast.SelectorExpr)
+		if !ok || name != typ {
+			return
+		}
+		if pkg, ok := sel.X.(*ast.Ident); ok {
+			out = append(out, pkg.Name+"."+sel.Sel.Name)
+		}
+	})
+	return out
+}
+
+// forEachEmbed calls visit for each embedded field of each struct type declared in the non-test Go files of dir, with
+// the name of the struct and the field's type (a pointer is unwrapped).
+func forEachEmbed(dir string, visit func(typ string, t ast.Expr)) {
 	ents, _ := os.ReadDir(dir)
 	fset := token.NewFileSet()
 	for _, e := range ents {
@@ -440,12 +490,9 @@ func embeddedTypes(dir string) map[string][]string {
 					if star, ok := t.(*ast.StarExpr); ok {
 						t = star.X
 					}
-					if id, ok := t.(*ast.Ident); ok {
-						out[ts.Name.Name] = append(out[ts.Name.Name], id.Name)
-					}
+					visit(ts.Name.Name, t)
 				}
 			}
 		}
 	}
-	return out
 }

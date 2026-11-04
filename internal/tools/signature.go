@@ -552,7 +552,12 @@ func listing(items []string) string {
 // "b.Store.Get changed too because a.Mem implements both a.Store and b.Store". Members of the root's own
 // directory need no note. Where the link is not that simple the note says only that the two are linked.
 func satisfactionNotes(ctx context.Context, w *Workspace, root member, members []member) ([]string, error) {
-	rootText, _, err := edits.ReadSource(root.path)
+	// Each source is read once: the loops below visit the same members again and again (SIG-001 follow-up).
+	texts := newTextCache(func(p string) (string, error) {
+		s, _, err := edits.ReadSource(p)
+		return s, err
+	})
+	rootText, err := texts.text(root.path)
 	if err != nil {
 		return nil, err
 	}
@@ -570,11 +575,12 @@ func satisfactionNotes(ctx context.Context, w *Workspace, root member, members [
 	}
 	var notes []string
 	sat := map[string]map[string]bool{} // concrete member -> the members its implementations list (one query each)
+	concrete := map[string]bool{}       // member -> isConcreteMethod, answered once per member
 	for _, n := range members[1:] {
 		if filepath.Dir(n.path) == filepath.Dir(root.path) {
 			continue
 		}
-		nText, _, err := edits.ReadSource(n.path)
+		nText, err := texts.text(n.path)
 		if err != nil {
 			return nil, err
 		}
@@ -587,11 +593,16 @@ func satisfactionNotes(ctx context.Context, w *Workspace, root member, members [
 			if filepath.Dir(c.path) == filepath.Dir(n.path) {
 				continue
 			}
-			cText, _, err := edits.ReadSource(c.path)
-			if err != nil {
-				return nil, err
+			isConcrete, known := concrete[c.key()]
+			if !known {
+				cText, err := texts.text(c.path)
+				if err != nil {
+					return nil, err
+				}
+				isConcrete = isConcreteMethod(c.path, cText, c.line, c.col)
+				concrete[c.key()] = isConcrete
 			}
-			if !isConcreteMethod(c.path, cText, c.line, c.col) {
+			if !isConcrete {
 				continue
 			}
 			if sat[c.key()] == nil {
@@ -613,13 +624,14 @@ func satisfactionNotes(ctx context.Context, w *Workspace, root member, members [
 		case impl == nil || nOwner == "":
 			notes = append(notes, fmt.Sprintf("%s changed too: it is linked to %s through interface satisfaction.", nLabel, memberLabel(root.path, rootText, root.line, root.col)))
 		case rootOwner != "" && direct[impl.key()]:
-			implText, _, err := edits.ReadSource(impl.path)
+			implText, err := texts.text(impl.path)
 			if err != nil {
 				return nil, err
 			}
 			implType := typeLabel(impl.path, implText, impl.line, impl.col)
-			notes = append(notes, fmt.Sprintf("%s changed too because %s implements both %s.%s and %s.%s.",
-				nLabel, implType, gosrc.PackageName(rootText), rootOwner, gosrc.PackageName(nText), nOwner))
+			rootIface, nIface := ifaceLabels(w, root.path, rootText, rootOwner, n.path, nText, nOwner)
+			notes = append(notes, fmt.Sprintf("%s changed too because %s implements both %s and %s.",
+				nLabel, implType, rootIface, nIface))
 		case rootOwner == "" && impl.key() == root.key():
 			notes = append(notes, fmt.Sprintf("%s changed too because %s satisfies %s.%s.",
 				nLabel, memberLabel(root.path, rootText, root.line, root.col), gosrc.PackageName(nText), nOwner))
@@ -628,6 +640,46 @@ func satisfactionNotes(ctx context.Context, w *Workspace, root member, members [
 		}
 	}
 	return notes, nil
+}
+
+// textCache reads each source file once for one pass: read is called for a path the first time only.
+type textCache struct {
+	read  func(path string) (string, error)
+	texts map[string]string
+}
+
+func newTextCache(read func(path string) (string, error)) *textCache {
+	return &textCache{read: read, texts: map[string]string{}}
+}
+
+// text is the source of path, read on first use.
+func (c *textCache) text(path string) (string, error) {
+	if s, ok := c.texts[path]; ok {
+		return s, nil
+	}
+	s, err := c.read(path)
+	if err != nil {
+		return "", err
+	}
+	c.texts[path] = s
+	return s, nil
+}
+
+// ifaceLabels names the two interfaces of a satisfaction note, "pkg.Owner" each. When both packages have the same
+// name (a/store and b/store) the note would read store.Store and store.Store, so each side is named by its directory
+// relative to the workspace root instead (a/store.Store, b/store.Store); a package at the root keeps its name.
+func ifaceLabels(w *Workspace, rootPath, rootText, rootOwner, nPath, nText, nOwner string) (string, string) {
+	rootPkg, nPkg := gosrc.PackageName(rootText), gosrc.PackageName(nText)
+	if rootPkg != nPkg {
+		return rootPkg + "." + rootOwner, nPkg + "." + nOwner
+	}
+	dirLabel := func(path, pkg string) string {
+		if rel := edits.RelativeName(filepath.Dir(path), w.Root); rel != "." {
+			return rel
+		}
+		return pkg
+	}
+	return dirLabel(rootPath, rootPkg) + "." + rootOwner, dirLabel(nPath, nPkg) + "." + nOwner
 }
 
 // ifaceMethod names the interface type and the method that the identifier at byte offset off of src is in

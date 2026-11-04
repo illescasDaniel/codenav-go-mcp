@@ -688,8 +688,14 @@ func (s *PlanStore) addLocked(p *edits.EditPlan) string {
 	s.plans[id] = p
 	s.ids = append(s.ids, id)
 	if len(s.ids) > 20 {
-		delete(s.plans, s.ids[0])
+		// The evicted id is remembered with the reason, so apply_edit of it says why it is gone (not a typo).
+		evicted := s.ids[0]
+		delete(s.plans, evicted)
 		s.ids = s.ids[1:]
+		if s.dropped == nil {
+			s.dropped = map[string]string{}
+		}
+		remember(s.dropped, &s.droppedIDs, evicted, "cap of 20 pending previews (newer previews pushed it out)")
 	}
 	return id
 }

@@ -315,6 +315,10 @@ func conclude(w *Workspace, plan *edits.EditPlan, delta diagdelta.Delta, apply b
 		plan.AllowLarge = false
 		id := w.Store.PreviewID(plan)
 		out = append(out, "", "Not written: "+txn.LargeRefusal(len(plan.Changes), w.Journal.Guard.FileLimit(), id), "", plan.RefusedDiff(w.Root, 2, 120))
+		if len(overridden) > 0 {
+			// The holds this apply_edit would write past stay held on the stored preview: the refusal names them too.
+			out = append(out, "", "Held (written past on apply_edit): "+strings.Join(overridden, " "))
+		}
 	case apply && (maxNew < 0 || newErrs <= maxNew):
 		if err := w.Journal.Guard.CheckWritesEnabled(ReadOnlyEnv); err != nil {
 			// The diff still goes with the refusal: a read-only server exists to show what would change.
@@ -826,12 +830,18 @@ func RegisterWrite(s *mcp.Server, h Host, readOnly bool) {
 						overridden = append(overridden, h)
 					}
 				}
+				// plan is the stored plan: when nothing is written, the refusal leaves its holds in place, so a later
+				// apply_edit(allow_large=true) still restates them.
+				savedHolds := plan.Holds
 				plan.Holds = nil
 				out, editID, err := conclude(w, plan, delta, true, -1, allowLarge, overridden, nil)
 				if err != nil {
+					plan.Holds = savedHolds
 					return "", err
 				}
-				if editID != "" {
+				if editID == "" {
+					plan.Holds = savedHolds
+				} else {
 					w.Store.MarkApplied(in.ID, editID)
 				}
 				return out, nil

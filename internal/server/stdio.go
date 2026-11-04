@@ -53,6 +53,27 @@ func (s *inflightSet) add(id jsonrpc.ID) bool {
 	return true
 }
 
+// addAll records the ids of one batch, or none of them: it reports false when any id is already in flight or
+// repeats within the batch.
+func (s *inflightSet) addAll(ids []jsonrpc.ID) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[jsonrpc.ID]bool{}
+	for _, id := range ids {
+		if s.ids[id] || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	if s.ids == nil && len(seen) > 0 {
+		s.ids = map[jsonrpc.ID]bool{}
+	}
+	for id := range seen {
+		s.ids[id] = true
+	}
+	return true
+}
+
 func (s *inflightSet) done(id jsonrpc.ID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -68,6 +89,20 @@ type answerWriter struct {
 func (a *answerWriter) Write(p []byte) (int, error) {
 	for _, line := range bytes.Split(p, []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		if bytes.TrimSpace(line)[0] == '[' {
+			// A batch answer: the SDK writes the responses of a batch as one array, once all its requests are answered.
+			var resps []json.RawMessage
+			if json.Unmarshal(bytes.TrimSpace(line), &resps) == nil {
+				for _, r := range resps {
+					if msg, err := jsonrpc.DecodeMessage(r); err == nil {
+						if resp, ok := msg.(*jsonrpc.Response); ok && resp.ID.IsValid() {
+							a.inflight.done(resp.ID)
+						}
+					}
+				}
+			}
 			continue
 		}
 		if msg, err := jsonrpc.DecodeMessage(line); err == nil {
@@ -128,6 +163,15 @@ func (f *frameReader) Read(p []byte) (int, error) {
 			f.replyError(codeInvalidRequest, "duplicate request id", rawID(line))
 			continue
 		}
+		if bytes.TrimSpace(line)[0] == '[' {
+			if !f.inflight.addAll(batchRequestIDs(line)) {
+				// One -32600 for the whole batch: an id in it is still in flight (or repeats in it, which frameProblem refused).
+				f.replyError(codeInvalidRequest, "duplicate request id", nil)
+				continue
+			}
+			// Only a batch that is forwarded counts: the SDK answers nothing for a notification, so it is noted here.
+			f.notifBatched = f.notifBatched || batchHasNotification(line)
+		}
 		f.noteInitialize(line)
 		f.pending = append(line, '\n')
 	}
@@ -178,6 +222,22 @@ func requestID(line []byte) (jsonrpc.ID, bool) {
 		return jsonrpc.ID{}, false
 	}
 	return req.ID, true
+}
+
+// batchRequestIDs returns the ids of the request elements of a batch line (requestID's objects); the batch was
+// checked by frameProblem, so it is a JSON array of valid JSON-RPC elements.
+func batchRequestIDs(line []byte) []jsonrpc.ID {
+	var elems []json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(line), &elems) != nil {
+		return nil
+	}
+	var ids []jsonrpc.ID
+	for _, e := range elems {
+		if id, ok := requestID(e); ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // rawID returns the id member of a JSON object as written, for a reply to echo.
@@ -254,7 +314,6 @@ func (f *frameReader) batchProblem(line []byte) (int, string) {
 		return codeInvalidRequest, "Invalid Request: an empty batch"
 	}
 	seen := map[jsonrpc.ID]bool{}
-	notif := false
 	for _, e := range elems {
 		if bytes.TrimSpace(e)[0] != '{' {
 			return codeInvalidRequest, "Invalid Request: a batch element is not a JSON object"
@@ -267,15 +326,31 @@ func (f *frameReader) batchProblem(line []byte) (int, string) {
 		if !ok {
 			continue
 		}
-		// A notification has no id, so the SDK keys it by the zero id, and two of them clash in one batch.
-		if seen[req.ID] || (!req.ID.IsValid() && f.notifBatched) {
+		switch {
+		case req.ID.IsValid() && seen[req.ID]:
+			return codeInvalidRequest, "duplicate request id"
+		case !req.ID.IsValid() && (seen[req.ID] || f.notifBatched):
+			// A notification has no id, so the SDK keys it by the zero id, and two of them clash in one batch.
 			return codeInvalidRequest, "Invalid Request: a batch repeats a request id"
 		}
 		seen[req.ID] = true
-		notif = notif || !req.ID.IsValid()
 	}
-	f.notifBatched = f.notifBatched || notif
 	return 0, ""
+}
+
+// batchHasNotification reports whether a batch line holds a notification (a request without an id, which the SDK
+// keys by the zero id). Read calls it only for a batch it forwards, so a refused batch never sets notifBatched.
+func batchHasNotification(line []byte) bool {
+	var elems []json.RawMessage
+	_ = json.Unmarshal(line, &elems)
+	for _, e := range elems {
+		if msg, err := jsonrpc.DecodeMessage(e); err == nil {
+			if req, ok := msg.(*jsonrpc.Request); ok && !req.ID.IsValid() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // noteInitialize records the protocol version an initialize request names. The SDK negotiates a version it does

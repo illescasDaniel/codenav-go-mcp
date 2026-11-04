@@ -15,6 +15,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/buildscope"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
@@ -466,6 +467,16 @@ func insertSymbol(ctx context.Context, w *Workspace, in editSymbolIn, source str
 			return nil, toolerr.Inputf("source is package %s, file is package %s.", pk, want)
 		}
 		if !exists {
+			// A new file takes the source whole: the same refusals as an existing file, for a source that holds no
+			// declaration (ESYM-006).
+			if _, body, serr := gosrc.SplitFile("source.go", source); serr == nil {
+				if strings.TrimSpace(body) == "" {
+					return nil, toolerr.Inputf("source has a package clause but no declaration.")
+				}
+				if declCount(body) == 0 {
+					return nil, toolerr.Inputf("source holds only comments; give a declaration.")
+				}
+			}
 			wholeFile = true
 		} else {
 			imps, body, serr := gosrc.SplitFile("source.go", source)
@@ -556,7 +567,11 @@ func packageFor(abs string) string {
 func packageSource(abs string) (name, from string) {
 	dir := filepath.Dir(abs)
 	entries, _ := os.ReadDir(dir)
-	tests := false
+	build := buildscope.Context()
+	dirName := strings.NewReplacer("-", "_", ".", "_").Replace(filepath.Base(dir))
+	tests, excluded := false, false
+	// fallback is the package of the first sibling the build leaves out that a new file may take (see excludedPackage).
+	fallback, fallbackFile := "", ""
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".go" {
 			continue
@@ -565,17 +580,55 @@ func packageSource(abs string) (name, from string) {
 			tests = true
 			continue
 		}
+		// A sibling the build leaves out (//go:build ignore, usually package main) does not say what package the
+		// new file is in (ESYM-005). Its package clause is the fallback when no sibling is included at all.
+		path := filepath.Join(dir, e.Name())
+		if reason, skip := buildscope.Excluded(build, path); skip {
+			excluded = true
+			if fallback == "" {
+				if raw, err := os.ReadFile(path); err == nil {
+					if n := excludedPackage(gosrc.PackageName(string(raw)), dirName, reason); n != "" {
+						fallback, fallbackFile = n, e.Name()
+					}
+				}
+			}
+			continue
+		}
 		if raw, err := os.ReadFile(filepath.Join(dir, e.Name())); err == nil {
 			if n := gosrc.PackageName(string(raw)); n != "" {
 				return n, fmt.Sprintf("package %s chosen from sibling file %s", n, e.Name())
 			}
 		}
 	}
-	name = strings.NewReplacer("-", "_", ".", "_").Replace(filepath.Base(dir))
-	if tests {
+	name = dirName
+	switch {
+	case fallback != "":
+		return fallback, fmt.Sprintf("package %s chosen from sibling file %s, which the build constraints leave out", fallback, fallbackFile)
+	case excluded:
+		return name, fmt.Sprintf("package %s chosen from the directory name (the sibling .go files are left out by their build constraints)", name)
+	case tests:
 		return name, fmt.Sprintf("package %s chosen from the directory name (the only sibling .go files are tests)", name)
 	}
 	return name, fmt.Sprintf("package %s chosen from the directory name (no sibling .go files)", name)
+}
+
+// excludedPackage is the package clause a build-excluded sibling offers a new file, or "" when it offers none: a
+// sibling of package main is no guide unless the directory is main itself and the file is not an ignore-tagged
+// script (ESYM-005); any other package clause is taken (a sibling for windows only, or behind a custom tag).
+func excludedPackage(pkg, dirName, reason string) string {
+	if pkg == "" {
+		return ""
+	}
+	ignored := false
+	for _, f := range strings.Fields(reason) {
+		if f == "ignore" {
+			ignored = true
+		}
+	}
+	if pkg == "main" && (dirName != "main" || ignored) {
+		return ""
+	}
+	return pkg
 }
 
 // declCount is the number of top-level declarations in src, a snippet without a package clause (an import

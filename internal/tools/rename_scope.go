@@ -21,24 +21,9 @@ import (
 
 // outsideRelative renders a path outside the workspace the way the "outside the workspace" refusals show it: `../`
 // steps up from root to the first ancestor that holds it, at any depth. edits.RelativeName keeps toolchain paths
-// (the module cache, GOROOT) absolute, which prints the user's home directory (WRX-004).
+// (the module cache, GOROOT) absolute, which prints the user's home directory (WRX-004). The walk is exclude's.
 func outsideRelative(path, root string) string {
-	if rel, err := filepath.Rel(root, path); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.ToSlash(rel)
-	}
-	up := ""
-	for dir := root; ; {
-		parent := filepath.Dir(dir)
-		up += "../"
-		if rel, err := filepath.Rel(parent, path); err == nil && !strings.HasPrefix(rel, "..") {
-			return up + filepath.ToSlash(rel)
-		}
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return filepath.ToSlash(path)
+	return exclude.OutsideRelative(path, root)
 }
 
 // namedResultAt is the position of the named result name of the function whose name starts at fn (0-based line and
