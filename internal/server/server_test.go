@@ -42,11 +42,17 @@ func copyTree(t *testing.T, from, to string) {
 // session runs the real server over an in-memory transport against a copy of the fixture.
 func session(t *testing.T, env map[string]string) (*mcp.ClientSession, string) {
 	t.Helper()
+	return sessionFrom(t, "../../testdata/fixture", env)
+}
+
+// sessionFrom is session over a copy of the given source tree.
+func sessionFrom(t *testing.T, src string, env map[string]string) (*mcp.ClientSession, string) {
+	t.Helper()
 	if _, err := exec.LookPath("gopls"); err != nil {
 		t.Skip("gopls not installed")
 	}
 	root := t.TempDir()
-	copyTree(t, "../../testdata/fixture", root)
+	copyTree(t, src, root)
 	t.Setenv(EnvWorkspace, root)
 	t.Setenv(EnvReadOnly, "")
 	t.Setenv(txn.StateDirEnv, t.TempDir())

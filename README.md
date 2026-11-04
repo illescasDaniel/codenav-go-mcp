@@ -37,6 +37,34 @@ See [.mcp.json.example](.mcp.json.example). In Cursor also set
 `"CODENAV_GO_MCP_WORKSPACE": "${workspaceFolder}"`, because Cursor may start MCP servers
 from your home directory. Prebuilt binaries are attached to each GitHub release.
 
+### Codex
+
+For a project-specific setup, add the following to `.codex/config.toml` in the
+root of a trusted project:
+
+```toml
+[mcp_servers.codenav-go]
+command = "go"
+args = ["run", "github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest"]
+startup_timeout_sec = 60
+```
+
+The first start may need extra time to download and build the server. For a
+user-wide setup instead, run:
+
+```bash
+codex mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
+```
+
+The CLI command writes to your user-wide Codex configuration. `@latest` follows
+new releases; replace it with a version such as `@v1.0.0` to pin one. Start a
+new Codex session or reload the client, approve the server if prompted, and use
+`codex mcp list` or `/mcp` to check it. Ask Codex to use `workspace` to confirm
+which project the server sees. For projects using build tags, set
+`CODENAV_GO_MCP_BUILD_FLAGS` in the server's `env` table; see the environment
+variables below. See [Codex MCP configuration](https://developers.openai.com/codex/mcp)
+for client settings.
+
 ## Stability
 
 From v1.0.0 the public surface is the MCP interface: tool names, parameter names and types, the `isError`
@@ -63,6 +91,8 @@ aliases. A missing required parameter (of any tool; an explicit JSON `null` coun
 ## Example
 
 Ask `symbol_info` about a type and get its declaration, doc comment, methods, definition and every use in one call.
+
+The example project is in [examples/shop](examples/README.md) (try it with the MCP Inspector or Claude Desktop).
 
 Request (`tools/call`):
 
