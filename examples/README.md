@@ -15,12 +15,14 @@ cd examples/shop
 claude mcp add codenav-demo -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
 ```
 
-Or run the local build instead of the published one: `claude mcp add codenav-demo -- go run /path/to/codenav-go-mcp/cmd/codenav-go-mcp`.
+To use a local build instead of the published one (`go run` cannot reach it from inside the example's module), build it first with `go build -o /tmp/codenav-go-mcp ./cmd/codenav-go-mcp` from the repository root and register `/tmp/codenav-go-mcp`.
 
 ## MCP Inspector
 
+Run from the repository root; the relative workspace is resolved against the server's working directory.
+
 ```bash
-cd examples/shop && npx @modelcontextprotocol/inspector go run ../../cmd/codenav-go-mcp
+npx @modelcontextprotocol/inspector -e CODENAV_GO_MCP_WORKSPACE=examples/shop go run ./cmd/codenav-go-mcp
 ```
 
 Then call `symbol_info` with `{"name": "Cart"}`, `implementations` with `{"name": "Pricer"}`, or
