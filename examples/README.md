@@ -4,18 +4,40 @@
 it is not part of the `codenav-go-mcp` build, binary or tests of the root module, but the integration tests in
 `internal/server` run the real server against a copy of it.
 
-You need `gopls` on your PATH. With no `CODENAV_GO_MCP_WORKSPACE`, the server uses the directory it is started in (or the
-project the client reports), so the simplest way is to start your client inside `examples/shop`. A relative
-`CODENAV_GO_MCP_WORKSPACE` such as `.` also works; it is resolved against the server's working directory.
+You need `gopls` on your PATH. With no `CODENAV_GO_MCP_WORKSPACE`, the server uses the project the client reports, or the
+directory it is started in, so start your client inside `examples/shop`. No environment variable is needed.
 
 ## Claude Code
 
-```bash
-cd examples/shop
-claude mcp add codenav-demo -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
+Add a `.mcp.json` to `examples/shop` (the same as [`.mcp.json.example`](../.mcp.json.example) at the repository root), then start
+`claude` there and approve the server:
+
+```json
+{
+	"mcpServers": {
+		"codenav-go": {
+			"command": "go",
+			"args": ["run", "github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest"]
+		}
+	}
+}
 ```
 
-To use a local build instead of the published one (`go run` cannot reach it from inside the example's module), build it first with `go build -o /tmp/codenav-go-mcp ./cmd/codenav-go-mcp` from the repository root and register `/tmp/codenav-go-mcp`.
+Or from `examples/shop`: `claude mcp add codenav-demo -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest`.
+
+## Codex
+
+Add this to `.codex/config.toml` in `examples/shop` (a trusted project), then start `codex` there:
+
+```toml
+[mcp_servers.codenav-go]
+command = "go"
+args = ["run", "github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest"]
+startup_timeout_sec = 60
+```
+
+Or from `examples/shop`: `codex mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest`
+(that one is user-wide). The first start needs extra time to download and build the server.
 
 ## MCP Inspector
 
@@ -25,27 +47,13 @@ Run from the repository root; the relative workspace is resolved against the ser
 npx @modelcontextprotocol/inspector -e CODENAV_GO_MCP_WORKSPACE=examples/shop go run ./cmd/codenav-go-mcp
 ```
 
-Then call `symbol_info` with `{"name": "Cart"}`, `implementations` with `{"name": "Pricer"}`, or
-`rename_symbol` with `apply=false` to see a preview.
+## Things to try
 
-## Claude Desktop
+Ask for `symbol_info` with `{"name": "Cart"}`, `implementations` with `{"name": "Pricer"}`, or `rename_symbol` with
+`apply=false` to see a preview. Ask the agent to use `workspace` to confirm which project the server sees.
 
-Claude Desktop does not start servers in your project, so here the workspace must be an absolute path (a relative one would
-resolve against Desktop's own directory). In `claude_desktop_config.json`:
+To use a local build instead of the published one (`go run` cannot reach it from inside the example's module), run
+`go build -o /tmp/codenav-go-mcp ./cmd/codenav-go-mcp` from the repository root and use `/tmp/codenav-go-mcp` as the command.
 
-```json
-{
-  "mcpServers": {
-    "codenav-go-demo": {
-      "command": "go",
-      "args": ["run", "github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest"],
-      "env": { "CODENAV_GO_MCP_WORKSPACE": "/absolute/path/to/examples/shop" }
-    }
-  }
-}
-```
-
-`go` must be on the PATH that Claude Desktop sees; if it is not, put the full path to `go` in `command`.
-
-Write tools change the files in `examples/shop`. Add `"CODENAV_GO_MCP_READ_ONLY": "1"` to the env to keep them read-only,
-or use `git checkout examples/shop` afterwards.
+Write tools change the files in `examples/shop`. Set `CODENAV_GO_MCP_READ_ONLY=1` in the server's `env` to keep them read-only,
+or run `git checkout examples/shop` afterwards.
