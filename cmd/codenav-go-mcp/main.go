@@ -10,7 +10,7 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/server"
 )
 
-var version = "0.1.0-dev"
+var version = "1.0.0"
 
 func main() {
 	for _, a := range os.Args[1:] {

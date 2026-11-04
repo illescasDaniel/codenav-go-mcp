@@ -37,6 +37,14 @@ See [.mcp.json.example](.mcp.json.example). In Cursor also set
 `"CODENAV_GO_MCP_WORKSPACE": "${workspaceFolder}"`, because Cursor may start MCP servers
 from your home directory. Prebuilt binaries are attached to each GitHub release.
 
+## Stability
+
+From v1.0.0 the public surface is the MCP interface: tool names, parameter names and types, the `isError`
+contract (see below) and the environment variables. Changes to it are additive (new tools, new optional
+parameters, new output fields); a removal or a changed meaning would be a major version. The wording of
+answers and refusals is written for agents to read and can change in any release, so don't parse it. The Go
+packages under `internal/` are not an API. Known limits are in [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
+
 ## Tools
 
 | Tool | Answers |
@@ -214,7 +222,6 @@ go vet ./... && go test ./...
 ```
 
 Live tests run against `testdata/fixture` and are skipped when gopls is missing.
-The design and the gopls findings behind it are in [PLAN.md](PLAN.md).
 
 ## License
 
