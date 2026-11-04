@@ -1,12 +1,14 @@
 package tools
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/mod/modfile"
 
@@ -66,11 +68,22 @@ var goRootDir struct {
 	dir  string
 }
 
+// goEnvTimeout bounds the `go env GOROOT` that stdlibTop runs; a hung go command must not hang a hover.
+var goEnvTimeout = 5 * time.Second
+
 // stdlibTop reports whether first is a top-level directory of the Go root's src tree, that is, a standard
-// library package path. When the Go root is unknown it answers true (keeps the link).
+// library package path. When the Go root is unknown (go env fails or does not answer in goEnvTimeout) it answers
+// true (keeps the link).
+//
+// The Go root is looked up once per process. A timed-out `go env GOROOT` is cached as unknown for the process
+// lifetime, so stdlib detection stays off until restart; the fallback keeps the link, so only the filtering is lost.
 func stdlibTop(first string) bool {
 	goRootDir.once.Do(func() {
-		if out, err := exec.Command("go", "env", "GOROOT").Output(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), goEnvTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "go", "env", "GOROOT")
+		cmd.WaitDelay = time.Second // a child of go that keeps the output pipe open must not hold the call
+		if out, err := cmd.Output(); err == nil {
 			goRootDir.dir = strings.TrimSpace(string(out))
 		}
 	})

@@ -771,6 +771,40 @@ func FormatDiagnosticsIn(items []lsp.Diagnostic, limit int, root, file string) s
 	return strings.Join(lines, "\n")
 }
 
+// brokenImportRE is gopls' wording for an import path that no required module provides: the parenthetical says
+// "no module", which is wrong when the module is required and its go.mod or go.sum is the problem.
+var brokenImportRE = regexp.MustCompile(`^could not import (\S+) \(no required module provides package "([^"]+)"\)`)
+
+// maxBrokenImportCauses bounds how many distinct import paths of one answer are looked up.
+const maxBrokenImportCauses = 5
+
+// ExplainBrokenImports returns copies of items whose "could not import X (no required module provides package "X")"
+// parenthetical is replaced by the cause cause(X) reports, when it reports one ("" keeps the message). cause is asked
+// once per distinct import path and for at most maxBrokenImportCauses paths; the input is not modified.
+func ExplainBrokenImports(items []lsp.Diagnostic, cause func(importPath string) string) []lsp.Diagnostic {
+	out := make([]lsp.Diagnostic, len(items))
+	copy(out, items)
+	looked := map[string]string{}
+	for i, d := range out {
+		m := brokenImportRE.FindStringSubmatch(d.Message)
+		if m == nil || m[1] != m[2] {
+			continue
+		}
+		c, ok := looked[m[1]]
+		if !ok {
+			if len(looked) >= maxBrokenImportCauses {
+				continue
+			}
+			c = cause(m[1])
+			looked[m[1]] = c
+		}
+		if c != "" {
+			out[i].Message = fmt.Sprintf("could not import %s (%s)", m[1], c) + d.Message[len(m[0]):]
+		}
+	}
+	return out
+}
+
 type pos struct{ line, col int }
 
 // FormatReferencesGrouped: compact "path: L12, L40" grouping, no snippets.

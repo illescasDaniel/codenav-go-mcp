@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gosrc"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
@@ -180,8 +181,19 @@ func probeReason(ctx context.Context, c *lsp.Client, file string, t probeTarget,
 	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	diags, _ := c.PullDiagnostics(dctx, lsp.PathToURI(file))
+	return explainProbe(diags, t, display, func(importPath string) string {
+		return gomod.ImportCause(ctx, c.Root(), file, importPath)
+	})
+}
+
+// explainProbe is probeReason's reading of the scratch file's diagnostics; cause gives the go command's reason for an
+// import path that does not load ("" when unknown, which keeps the generic sentence).
+func explainProbe(diags []lsp.Diagnostic, t probeTarget, display string, cause func(importPath string) string) string {
 	for _, d := range diags {
 		if strings.Contains(d.Message, "no required module") || strings.Contains(d.Message, "could not import") {
+			if c := cause(t.importPath); c != "" {
+				return fmt.Sprintf("package %q cannot be loaded: %s", t.importPath, c)
+			}
 			return fmt.Sprintf("package %q cannot be loaded: no required module provides it (or it is not in the standard library); add it to go.mod (go get) or check the import path", t.importPath)
 		}
 	}

@@ -65,13 +65,12 @@ func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.C
 	registerUsage[In](name)
 	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(false)}}
 	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
-		w, err := h.Acquire(ctx, req.Session)
-		var out string
-		if err == nil {
-			if err = w.checkReadable(filePathOf(in)); err == nil {
-				out, err = fn(ctx, w, in)
+		out, w, err := retryAfterRestart(ctx, h, req.Session, in, func(ctx context.Context, w *Workspace, in In) (string, error) {
+			if err := w.checkReadable(filePathOf(in)); err != nil {
+				return "", err
 			}
-		}
+			return fn(ctx, w, in)
+		})
 		res, rerr := finishResult(ctx, h, w, false, out, err)
 		return res, nil, rerr
 	})
@@ -552,6 +551,18 @@ func (w *Workspace) navErr(ctx context.Context, err error, file string, line, co
 	return friendlyNavErr(err, file, line, col)
 }
 
+// causeBudget bounds the go list lookups of one diagnostics answer together: the broken import paths are looked up
+// in turn, and a hung go command must not make the answer wait for each of them in full.
+var causeBudget = 10 * time.Second
+
+// explainBrokenImports names the causes of the broken imports of items (file abs of the module at root) within one
+// shared causeBudget; the lookups that run out of it keep the generic wording.
+func explainBrokenImports(ctx context.Context, root, abs string, items []lsp.Diagnostic) []lsp.Diagnostic {
+	cctx, cancel := context.WithTimeout(ctx, causeBudget)
+	defer cancel()
+	return format.ExplainBrokenImports(items, func(p string) string { return gomod.ImportCause(cctx, root, abs, p) })
+}
+
 // friendlyNavErr turns the language server's errors about a position or file that has no analysis into
 // plain sentences.
 func friendlyNavErr(err error, file string, line, col int) error {
@@ -562,6 +573,8 @@ func friendlyNavErr(err error, file string, line, col int) error {
 	switch {
 	case strings.Contains(re.Message, "no package metadata"):
 		return notCompiledErr(file)
+	case strings.Contains(re.Message, "no views"):
+		return toolerr.Inputf("the language server has no workspace for %s (no go.mod or go.work covers it)", file)
 	case strings.Contains(re.Message, "no identifier found"):
 		return toolerr.NotFoundf("No identifier at %s:%d:%d.", file, line, col)
 	}
@@ -613,24 +626,44 @@ func siblingSyntaxNote(root, abs, src string) string {
 	return ""
 }
 
+// maxSyntaxCheckBytes bounds the files whose syntax is checked for an answer about them; a larger file is not parsed
+// (its note says so, so that the answer is not an all-clear).
+const maxSyntaxCheckBytes = 2 << 20
+
 // ownSyntaxNote gives the first syntax error of abs itself, for an answer about that file (outline, hover,
 // definition): such an answer can be partial or "nothing here" for a valid identifier. "" when abs parses or
-// cannot be read.
+// cannot be read. A file over maxSyntaxCheckBytes gets a note that it was not checked.
 func ownSyntaxNote(w *Workspace, abs string) string {
+	if st, err := os.Stat(abs); err == nil && st.Size() > maxSyntaxCheckBytes {
+		return overSizeSyntaxNote(w.Root, abs)
+	}
 	text, _, err := edits.ReadSource(abs)
 	if err != nil {
 		return ""
+	}
+	return ownSyntaxNoteOf(w.Root, abs, text)
+}
+
+// ownSyntaxNoteOf is ownSyntaxNote for the text of abs, which the caller has read already.
+func ownSyntaxNoteOf(root, abs, text string) string {
+	if len(text) > maxSyntaxCheckBytes {
+		return overSizeSyntaxNote(root, abs)
 	}
 	_, perr := parser.ParseFile(token.NewFileSet(), abs, text, parser.SkipObjectResolution)
 	if perr == nil {
 		return ""
 	}
-	at := exclude.RelativeTo(abs, w.Root)
+	at := exclude.RelativeTo(abs, root)
 	var list scanner.ErrorList
 	if errors.As(perr, &list) && len(list) > 0 {
 		return fmt.Sprintf("%s:%d:%d: syntax error: %s (the file does not parse, so the answer may be incomplete)", at, list[0].Pos.Line, list[0].Pos.Column, list[0].Msg)
 	}
 	return fmt.Sprintf("%s: %v (the file does not parse, so the answer may be incomplete)", at, perr)
+}
+
+// overSizeSyntaxNote is the note for a file too large to check.
+func overSizeSyntaxNote(root, abs string) string {
+	return fmt.Sprintf("%s: not checked for syntax errors (file is over 2 MB)", exclude.RelativeTo(abs, root))
 }
 
 // withNote puts a note line before an answer ("" note: the answer as it is).
@@ -796,6 +829,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if err != nil {
 				return "", w.navErr(ctx, err, in.FilePath, 0, 0)
 			}
+			items = explainBrokenImports(ctx, w.Root, abs, items)
 			out := format.FormatDiagnosticsIn(items, format.DefaultDiagnosticsLimit, w.Root, filepath.ToSlash(rel))
 			if src, _, rerr := edits.ReadSource(abs); rerr == nil {
 				if note := siblingSyntaxNote(w.Root, abs, src); note != "" {
@@ -865,7 +899,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			syms, err := w.Client.DocumentSymbol(ctx, in.FilePath)
 			if err != nil {
-				return "", err
+				return "", w.navErr(ctx, err, in.FilePath, 0, 0)
 			}
 			ptrs := make([]*lsp.Symbol, len(syms))
 			for i := range syms {
@@ -876,12 +910,14 @@ func RegisterNav(s *mcp.Server, h Host) {
 			if !filepath.IsAbs(abs) {
 				abs = filepath.Join(w.Root, abs)
 			}
+			var note string
 			if text, _, err := edits.ReadSource(abs); err == nil {
+				note = ownSyntaxNoteOf(w.Root, abs, text)
 				if pf, err := gosrc.ParseFile(abs, text); err == nil {
 					groups = pf.Groups()
 				}
 			}
-			return withNote(ownSyntaxNote(w, abs), format.FormatOutlineGroups(ptrs, groups)), nil
+			return withNote(note, format.FormatOutlineGroups(ptrs, groups)), nil
 		})
 
 	add(s, h, "callers", "Who calls this function or method? Only real call sites, unlike references.",
@@ -899,14 +935,14 @@ func RegisterNav(s *mcp.Server, h Host) {
 				if strings.Contains(err.Error(), "is not a function") {
 					return "", toolerr.Inputf("%s is %snot a function; callers needs a function or method.", sym.Name, kindPhrase(sym.Kind))
 				}
-				return "", err
+				return "", w.navErr(ctx, err, sym.Rel(w.Root), sym.Line+1, sym.Column+1)
 			}
 			if len(items) == 0 {
 				return fmt.Sprintf("%s has no call hierarchy entry (it may not be callable).", sym.Name), nil
 			}
 			calls, err := w.Client.IncomingCalls(ctx, items[0])
 			if err != nil {
-				return "", err
+				return "", w.navErr(ctx, err, sym.Rel(w.Root), sym.Line+1, sym.Column+1)
 			}
 			calls, omitted := realCalls(dropGeneratedCalls(calls))
 			out := format.FormatCallers(calls, w.Root, callerReceivers(calls))
@@ -947,7 +983,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 				if strings.Contains(err.Error(), "is a function, not a method") {
 					return "", toolerr.Inputf("%s is a function; implementations needs an interface, a type or an interface method.", sym.Name)
 				}
-				return "", err
+				return "", w.navErr(ctx, err, sym.Rel(w.Root), sym.Line+1, sym.Column+1)
 			}
 			locs = dropGeneratedLocs(dropForeignUnexported(locs, w.Root))
 			out := fmt.Sprintf("No implementations or implemented interfaces found for %s.", sym.Name)
@@ -1054,12 +1090,16 @@ func implementerGroups(locs []lsp.Location, root string, dirs toolchainDirs) str
 	return strings.Join(parts, "\n") + "\n\n"
 }
 
-// The nested-module scan: at most nestedLimit modules, within nestedBudget, and the answer is kept for nestedTTL per
-// root so that repeated implementations and callers calls do not walk the tree again.
-const (
-	nestedLimit  = 3
-	nestedBudget = 2 * time.Second
-	nestedTTL    = 30 * time.Second
+// The nested-module scan: at most nestedLimit modules, within nestedBudget, and the answer is kept per root for
+// nestedTTL (nestedTruncatedTTL when the scan stopped early) so that repeated implementations and callers calls do not
+// walk the tree again. A cached answer is stale as soon as the Go configuration changes (gomod.Fingerprint: go.mod,
+// go.sum, go.work). A new go.mod below root is not in that fingerprint: it is seen when the entry expires.
+const nestedLimit = 3
+
+var (
+	nestedBudget       = 2 * time.Second
+	nestedTTL          = 30 * time.Second
+	nestedTruncatedTTL = 2 * time.Second
 )
 
 // nestedScanResult lists the modules below the root that the workspace does not cover. truncated says the scan
@@ -1069,26 +1109,37 @@ type nestedScanResult struct {
 	truncated bool
 }
 
+// nestedEntry is one cached scan: when it ran, the configuration fingerprint it ran under, and its result.
+type nestedEntry struct {
+	at  time.Time
+	key string
+	res nestedScanResult
+}
+
 var nestedCache struct {
 	sync.Mutex
-	at  map[string]time.Time
-	res map[string]nestedScanResult
+	byRoot map[string]nestedEntry
 }
 
 // nestedScan returns the scan of root, from the cache while it is fresh.
 func nestedScan(root string) nestedScanResult {
+	key := gomod.Fingerprint(root)
 	nestedCache.Lock()
 	defer nestedCache.Unlock()
-	if t, ok := nestedCache.at[root]; ok && time.Since(t) < nestedTTL {
-		return nestedCache.res[root]
+	if e, ok := nestedCache.byRoot[root]; ok && e.key == key {
+		ttl := nestedTTL
+		if e.res.truncated {
+			ttl = nestedTruncatedTTL
+		}
+		if time.Since(e.at) < ttl {
+			return e.res
+		}
 	}
 	res := scanNested(root, time.Now().Add(nestedBudget))
-	if nestedCache.at == nil {
-		nestedCache.at = map[string]time.Time{}
-		nestedCache.res = map[string]nestedScanResult{}
+	if nestedCache.byRoot == nil {
+		nestedCache.byRoot = map[string]nestedEntry{}
 	}
-	nestedCache.at[root] = time.Now()
-	nestedCache.res[root] = res
+	nestedCache.byRoot[root] = nestedEntry{at: time.Now(), key: key, res: res}
 	return res
 }
 
