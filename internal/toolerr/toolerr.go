@@ -79,7 +79,7 @@ func Format(err error) (text string, ok bool) {
 	case errors.Is(err, context.Canceled):
 		return "request cancelled", true
 	case errors.Is(err, dle):
-		return "the language server did not answer in time (it may be loading packages or stuck); retry shortly, or restart the server if this repeats", true
+		return "the language server did not answer in time (it may still be busy or loading packages); retry later", true
 	case errors.Is(err, os.ErrNotExist) && errors.As(err, &pe):
 		return fmt.Sprintf("File not found: %s (relative paths resolve against the workspace root).", pe.Path), true
 	case errors.As(err, &pe):

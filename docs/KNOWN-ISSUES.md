@@ -83,12 +83,7 @@ total, so it stays about 3.5 KB.
 - A Go package in a nested directory under `build/`, `dist/` or `venv/` that has no `.go` file directly in that
   directory is treated as build output and excluded from write tools (SHAPE-001). A test pins this shape.
 - A `go.mod` created below the root inside the 30 s nested-scan window is not seen until the cache expires.
-- `search_symbol` and the name-resolution errors in symbol lookup are not routed through the "no views" mapping.
-- `readableRoots` runs `go env` without a timeout; a timed-out `go env GOROOT` is remembered as unknown for the
-  process lifetime.
-- The "missing go.sum" hint uses the import path in `go get`, which may not be the module that provides it.
 - A request batch holds all its ids in flight until the whole answer array is written.
 - A repeated id inside one batch is refused with "duplicate request id".
-- Edit previews still describe a broken import with the generic "no required module" wording (`diagdelta`).
 
 Last reviewed: block 21

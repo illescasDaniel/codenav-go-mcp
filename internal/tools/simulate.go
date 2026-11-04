@@ -15,6 +15,7 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/diagdelta"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/edits"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/exclude"
+	"github.com/illescasDaniel/codenav-go-mcp/internal/format"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/gomod"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/index"
 	"github.com/illescasDaniel/codenav-go-mcp/internal/lsp"
@@ -23,9 +24,43 @@ import (
 // CheckLimit caps how many files are type-checked per simulation.
 const CheckLimit = 60
 
+// maxDeltaCauseLookups caps the go list lookups that name the causes of broken imports in one comparison.
+const maxDeltaCauseLookups = 5
+
+// causeNamer words the broken imports of the diagnostics of one comparison with their causes, as the diagnostics
+// tool does (explainBrokenImports). Both sides share its budget, its lookups and its answers: a broken import then
+// reads the same before and after the edit, and is not reported as new on one side and fixed on the other.
+type causeNamer struct {
+	ctx     context.Context
+	root    string
+	lookups int
+	known   map[string]string // file + "\x00" + import path -> cause ("" when unknown)
+}
+
+// explain returns items with the causes of their broken imports (file is the file the diagnostics belong to).
+func (c *causeNamer) explain(file string, items []lsp.Diagnostic) []lsp.Diagnostic {
+	abs := file
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(c.root, abs)
+	}
+	return format.ExplainBrokenImports(items, func(p string) string {
+		key := abs + "\x00" + p
+		if v, ok := c.known[key]; ok {
+			return v
+		}
+		if c.lookups >= maxDeltaCauseLookups {
+			return ""
+		}
+		c.lookups++
+		v := gomod.ImportCause(c.ctx, c.root, abs, p)
+		c.known[key] = v
+		return v
+	})
+}
+
 // collect pulls diagnostics for paths (skipping `skip`), labelling them with the text in
 // `overlays` when present, else the disk's. Call inside client.Overlay for the overlaid side.
-func collect(ctx context.Context, w *Workspace, overlays map[string]string, paths []string, skip map[string]bool) ([]diagdelta.Entry, []string) {
+func collect(ctx context.Context, w *Workspace, overlays map[string]string, paths []string, skip map[string]bool, causes *causeNamer) ([]diagdelta.Entry, []string) {
 	var entries []diagdelta.Entry
 	var unchecked []string
 	for _, p := range paths {
@@ -49,7 +84,7 @@ func collect(ctx context.Context, w *Workspace, overlays map[string]string, path
 		if err == nil {
 			var items []lsp.Diagnostic
 			if items, err = w.Client.PullDiagnostics(ctx, uri); err == nil {
-				entries = append(entries, diagdelta.FromLSP(rel, text, items)...)
+				entries = append(entries, diagdelta.FromLSP(rel, text, causes.explain(p, items))...)
 				continue
 			}
 		}
@@ -76,9 +111,12 @@ func keepDiagnostics(es []diagdelta.Entry, errDirs map[string]bool) []diagdelta.
 func Delta(ctx context.Context, w *Workspace, before, after map[string]string, check []string, skipBefore, skipAfter map[string]bool) (diagdelta.Delta, error) {
 	var be, ae []diagdelta.Entry
 	var ub, ua []string
+	cctx, cancel := context.WithTimeout(ctx, causeBudget)
+	defer cancel()
+	causes := &causeNamer{ctx: cctx, root: w.Root, known: map[string]string{}}
 	run := func(overlay map[string]string, skip map[string]bool, out *[]diagdelta.Entry, unchecked *[]string) error {
 		fn := func() error {
-			*out, *unchecked = collect(ctx, w, overlay, check, skip)
+			*out, *unchecked = collect(ctx, w, overlay, check, skip, causes)
 			return nil
 		}
 		if len(overlay) == 0 {

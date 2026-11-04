@@ -53,6 +53,14 @@ func TestB21FakeLSP(t *testing.T) {
 				Query string `json:"query"`
 			}
 			_ = json.Unmarshal(msg.Params, &q)
+			if os.Getenv("B22_FAKE_SYMBOL_NOVIEW") != "" { // block 22: the server has no view of the workspace
+				resp["error"] = map[string]any{"code": -32603, "message": "no views for " + os.Getenv("B21_FAKE_URI")}
+				break
+			}
+			if os.Getenv("B22_FAKE_SYMBOL_EMPTY") != "" { // block 22: no symbol of that name in the workspace
+				resp["result"] = []map[string]any{}
+				break
+			}
 			resp["result"] = []map[string]any{{
 				"name": q.Query, "kind": 12,
 				"location": map[string]any{
@@ -74,6 +82,18 @@ func TestB21FakeLSP(t *testing.T) {
 					"selectionRange": map[string]any{"start": map[string]any{"line": 4, "character": 5}, "end": map[string]any{"line": 4, "character": 11}},
 				}}
 			}
+		case "textDocument/definition": // block 22: the probe of a name outside the workspace fails with "no views"
+			if os.Getenv("B22_FAKE_DEF_NOVIEW") != "" {
+				resp["error"] = map[string]any{"code": -32603, "message": "no views for " + os.Getenv("B21_FAKE_URI")}
+			}
+		case "textDocument/diagnostic": // block 22: one error per line of B22_FAKE_DIAG
+			items := []map[string]any{}
+			for _, m := range strings.Split(os.Getenv("B22_FAKE_DIAG"), "\n") {
+				if m != "" {
+					items = append(items, map[string]any{"range": map[string]any{"start": map[string]any{"line": 0, "character": 0}, "end": map[string]any{"line": 0, "character": 1}}, "severity": 1, "message": m})
+				}
+			}
+			resp["result"] = map[string]any{"kind": "full", "items": items}
 		case "textDocument/prepareCallHierarchy", "textDocument/implementation":
 			resp["error"] = map[string]any{"code": -32603, "message": "no views for " + os.Getenv("B21_FAKE_URI")}
 		default:
@@ -120,6 +140,18 @@ func (h b21fLSPHost) Explain(source string) string { return "" }
 // b21fRouteCall runs one read tool of RegisterNav against the fake language server and returns the text of the answer.
 func b21fRouteCall(t *testing.T, tool string, args map[string]any) string {
 	t.Helper()
+	var b strings.Builder
+	for _, c := range b21fRouteResult(t, tool, args).Content {
+		if tc, ok := c.(*mcp.TextContent); ok {
+			b.WriteString(tc.Text)
+		}
+	}
+	return b.String()
+}
+
+// b21fRouteResult is b21fRouteCall with the whole result, isError included (block 22).
+func b21fRouteResult(t *testing.T, tool string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "go.mod"), []byte("module example.com/b21route\n\ngo 1.21\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -155,13 +187,7 @@ func b21fRouteCall(t *testing.T, tool string, args map[string]any) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var b strings.Builder
-	for _, c := range res.Content {
-		if tc, ok := c.(*mcp.TextContent); ok {
-			b.WriteString(tc.Text)
-		}
-	}
-	return b.String()
+	return res
 }
 
 // The language server's "no views" error is a refusal in the tool's words, for each tool that reads the file's

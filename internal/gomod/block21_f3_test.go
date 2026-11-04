@@ -152,13 +152,13 @@ func TestBlock21F3_ImportCauseUnknownStaysEmpty(t *testing.T) {
 func TestBlock21F3_CauseTextShape(t *testing.T) {
 	root := "/work/ws"
 	msg := "module ./dep: parsing dep/go.mod: /work/ws/dep/go.mod:7: syntax error\n\tmore detail"
-	if got, want := causeText(msg, "example.com/dep", root), "parsing dep/go.mod: dep/go.mod:7: syntax error"; got != want {
+	if got, want := causeText(msg, "example.com/dep", root, nil), "parsing dep/go.mod: dep/go.mod:7: syntax error"; got != want {
 		t.Errorf("causeText = %q, want %q", got, want)
 	}
-	if got := causeText("no required module provides package example.com/x; to add it:\n\tgo get example.com/x", "example.com/x", root); got != "" {
+	if got := causeText("no required module provides package example.com/x; to add it:\n\tgo get example.com/x", "example.com/x", root, nil); got != "" {
 		t.Errorf("generic error gave cause %q", got)
 	}
-	if got := causeText("package x is not in std (/usr/lib/go/src/x)", "x", root); got != "" {
+	if got := causeText("package x is not in std (/usr/lib/go/src/x)", "x", root, nil); got != "" {
 		t.Errorf("not-in-std gave cause %q", got)
 	}
 	if got := relativePaths("open /work/ws/dep/go.mod: no", root); got != "open dep/go.mod: no" {
@@ -177,7 +177,7 @@ func TestBlock21F3_CauseTextShape(t *testing.T) {
 	if got := truncateCause(long, 11); !strings.HasSuffix(got, "...") || len(got) > 14 {
 		t.Errorf("truncateCause = %q", got)
 	}
-	if got := causeText(`malformed import path "-toolexec=x": leading dash`, "-toolexec=x", root); got != "" {
+	if got := causeText(`malformed import path "-toolexec=x": leading dash`, "-toolexec=x", root, nil); got != "" {
 		t.Errorf("malformed import path gave cause %q, want none", got)
 	}
 }

@@ -15,41 +15,40 @@ import (
 	"github.com/illescasDaniel/codenav-go-mcp/internal/toolerr"
 )
 
-var readRoots sync.Map // workspace root -> []string
+var readRoots sync.Map // workspace root -> []string (the replace and use directories of go.mod and go.work)
 
 // readableRoots are the directories the read tools may look into besides the workspace: the Go
 // root, the module cache and the directories that go.mod / go.work replace directives point at.
 func readableRoots(root string) []string {
-	if v, ok := readRoots.Load(root); ok {
-		return v.([]string)
-	}
 	var dirs []string
 	for _, name := range []string{"GOROOT", "GOMODCACHE"} {
-		if out, err := exec.Command("go", "env", name).Output(); err == nil {
-			if d := strings.TrimSpace(string(out)); d != "" {
-				dirs = append(dirs, d)
-			}
+		if d, ok := goEnvValue(name); ok {
+			dirs = append(dirs, d)
 		}
 	}
+	if v, ok := readRoots.Load(root); ok {
+		return append(dirs, v.([]string)...)
+	}
+	var local []string
 	if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
 		if f, err := modfile.Parse("go.mod", data, nil); err == nil {
 			for _, r := range f.Replace {
-				dirs = append(dirs, replaceDir(root, r.New.Path))
+				local = append(local, replaceDir(root, r.New.Path))
 			}
 		}
 	}
 	if data, err := os.ReadFile(filepath.Join(root, "go.work")); err == nil {
 		if f, err := modfile.ParseWork("go.work", data, nil); err == nil {
 			for _, r := range f.Replace {
-				dirs = append(dirs, replaceDir(root, r.New.Path))
+				local = append(local, replaceDir(root, r.New.Path))
 			}
 			for _, u := range f.Use {
-				dirs = append(dirs, replaceDir(root, u.Path))
+				local = append(local, replaceDir(root, u.Path))
 			}
 		}
 	}
-	readRoots.Store(root, dirs)
-	return dirs
+	readRoots.Store(root, local)
+	return append(dirs, local...)
 }
 
 // replaceDir resolves a replace target; module paths (not directories) give "".
@@ -63,34 +62,52 @@ func replaceDir(root, p string) string {
 	return p
 }
 
-var goRootDir struct {
-	once sync.Once
-	dir  string
-}
-
-// goEnvTimeout bounds the `go env GOROOT` that stdlibTop runs; a hung go command must not hang a hover.
+// goEnvTimeout bounds each `go env` the read path runs; a hung go command must not hang a hover.
 var goEnvTimeout = 5 * time.Second
+
+// goEnvRetry is how long a failed or timed-out `go env` is left alone before it is run again.
+var goEnvRetry = 30 * time.Second
+
+// goEnvs remembers the answers of `go env`: a value that was found is kept for the process lifetime; a failed lookup
+// is run again after goEnvRetry, so one hung go command does not keep the Go root unknown until the process restarts.
+var goEnvs = struct {
+	sync.Mutex
+	vals  map[string]string
+	retry map[string]time.Time
+}{vals: map[string]string{}, retry: map[string]time.Time{}}
+
+// goEnvValue returns `go env name`; ok is false when go fails or does not answer in goEnvTimeout.
+func goEnvValue(name string) (string, bool) {
+	goEnvs.Lock()
+	defer goEnvs.Unlock()
+	if v, ok := goEnvs.vals[name]; ok {
+		return v, true
+	}
+	if time.Now().Before(goEnvs.retry[name]) {
+		return "", false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), goEnvTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "env", name)
+	cmd.WaitDelay = time.Second // a child of go that keeps the output pipe open must not hold the call
+	out, err := cmd.Output()
+	if v := strings.TrimSpace(string(out)); err == nil && v != "" {
+		goEnvs.vals[name] = v
+		return v, true
+	}
+	goEnvs.retry[name] = time.Now().Add(goEnvRetry)
+	return "", false
+}
 
 // stdlibTop reports whether first is a top-level directory of the Go root's src tree, that is, a standard
 // library package path. When the Go root is unknown (go env fails or does not answer in goEnvTimeout) it answers
-// true (keeps the link).
-//
-// The Go root is looked up once per process. A timed-out `go env GOROOT` is cached as unknown for the process
-// lifetime, so stdlib detection stays off until restart; the fallback keeps the link, so only the filtering is lost.
+// true (keeps the link). An unknown Go root is looked up again after goEnvRetry (see goEnvValue).
 func stdlibTop(first string) bool {
-	goRootDir.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), goEnvTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, "go", "env", "GOROOT")
-		cmd.WaitDelay = time.Second // a child of go that keeps the output pipe open must not hold the call
-		if out, err := cmd.Output(); err == nil {
-			goRootDir.dir = strings.TrimSpace(string(out))
-		}
-	})
-	if goRootDir.dir == "" {
+	goRoot, ok := goEnvValue("GOROOT")
+	if !ok {
 		return true
 	}
-	_, err := os.Stat(filepath.Join(goRootDir.dir, "src", first))
+	_, err := os.Stat(filepath.Join(goRoot, "src", first))
 	return err == nil
 }
 

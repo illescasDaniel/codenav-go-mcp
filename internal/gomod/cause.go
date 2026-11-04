@@ -85,9 +85,44 @@ func causeKey(root, dir, importPath string) string {
 	return dir + "\x00" + importPath + "\x00" + hex.EncodeToString(h.Sum(nil))
 }
 
-// replaceFiles lists the go.mod and go.sum files of the local directories that the go.mod in dir replaces modules with.
-// A module replaced by a version (not a directory) has no files here.
+// replaceFiles lists the go.mod and go.sum files of the local directories that the go.mod in dir replaces modules with,
+// and those that the go.work governing dir replaces modules with (relative to the go.work's directory). A module
+// replaced by a version (not a directory) has no files here.
 func replaceFiles(dir string) []string {
+	var out []string
+	if b, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil {
+		if f, err := modfile.Parse("go.mod", b, nil); err == nil {
+			for _, r := range f.Replace {
+				out = append(out, replaceTargetFiles(dir, r)...)
+			}
+		}
+	}
+	if work := findWork(dir); work != "" {
+		if b, err := os.ReadFile(work); err == nil {
+			if f, err := modfile.ParseWork(work, b, nil); err == nil {
+				for _, r := range f.Replace {
+					out = append(out, replaceTargetFiles(filepath.Dir(work), r)...)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// replaceTargetFiles gives the go.mod and go.sum of a replacement that is a directory, resolved against base.
+func replaceTargetFiles(base string, r *modfile.Replace) []string {
+	if r.New.Version != "" {
+		return nil
+	}
+	d := r.New.Path
+	if !filepath.IsAbs(d) {
+		d = filepath.Join(base, d)
+	}
+	return []string{filepath.Join(d, "go.mod"), filepath.Join(d, "go.sum")}
+}
+
+// requiredModules lists the module paths that the go.mod in dir requires.
+func requiredModules(dir string) []string {
 	b, err := os.ReadFile(filepath.Join(dir, "go.mod"))
 	if err != nil {
 		return nil
@@ -97,15 +132,8 @@ func replaceFiles(dir string) []string {
 		return nil
 	}
 	var out []string
-	for _, r := range f.Replace {
-		if r.New.Version != "" {
-			continue
-		}
-		d := r.New.Path
-		if !filepath.IsAbs(d) {
-			d = filepath.Join(dir, d)
-		}
-		out = append(out, filepath.Join(d, "go.mod"), filepath.Join(d, "go.sum"))
+	for _, r := range f.Require {
+		out = append(out, r.Mod.Path)
 	}
 	return out
 }
@@ -150,11 +178,12 @@ func runCause(ctx context.Context, dir, root, importPath string) (msg string, co
 	if err := json.NewDecoder(&out.buf).Decode(&p); err != nil {
 		return "", false
 	}
+	required := requiredModules(dir)
 	for _, e := range append([]*pkgError{p.Error}, p.DepsErrors...) {
 		if e == nil || e.Err == "" {
 			continue
 		}
-		if m := causeText(e.Err, importPath, root); m != "" {
+		if m := causeText(e.Err, importPath, root, required); m != "" {
 			return m, true
 		}
 	}
@@ -162,10 +191,10 @@ func runCause(ctx context.Context, dir, root, importPath string) (msg string, co
 }
 
 // causeText turns one load error of importPath into its cause, "" when the error is the generic "no module provides
-// it" (or something that names no cause).
-func causeText(text, importPath, root string) string {
+// it" (or something that names no cause). required lists the module paths of the owning go.mod.
+func causeText(text, importPath, root string, required []string) string {
 	if strings.Contains(text, "missing go.sum entry") {
-		return "missing go.sum entry; run: go mod tidy, or go get " + importPath
+		return goSumCause(importPath, required)
 	}
 	first := strings.TrimSpace(strings.SplitN(text, "\n", 2)[0])
 	if first == "" || strings.Contains(first, "no required module provides package") ||
@@ -179,6 +208,22 @@ func causeText(text, importPath, root string) string {
 		}
 	}
 	return truncateCause(relativePaths(first, root), maxCauseLen)
+}
+
+// goSumCause is the cause of a missing go.sum entry for importPath. It names `go get` for the required module the
+// import path belongs to (the longest required module path that is a prefix of it); with no such module only
+// `go mod tidy` is named, since a path that is not a required module would be a wrong command.
+func goSumCause(importPath string, required []string) string {
+	best := ""
+	for _, m := range required {
+		if (importPath == m || strings.HasPrefix(importPath, m+"/")) && len(m) > len(best) {
+			best = m
+		}
+	}
+	if best == "" {
+		return "missing go.sum entry; run: go mod tidy"
+	}
+	return "missing go.sum entry; run: go mod tidy, or go get " + best
 }
 
 // absPathRE finds an absolute path at the start of a word (a path with a "/" inside a relative one is not matched).

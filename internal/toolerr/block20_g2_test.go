@@ -63,9 +63,9 @@ func TestBlock20G2CanceledFromElsewhereDoesNotBlameClient(t *testing.T) {
 	}
 }
 
-// ENV-005 (wording): a hung server is described as possibly loading or stuck, with the restart advice.
+// ENV-005 (wording): a plain timeout (server not restarted) says the server may be busy, and asks for a retry.
 func TestBlock20G2TimeoutWording(t *testing.T) {
-	const want = "the language server did not answer in time (it may be loading packages or stuck); retry shortly, or restart the server if this repeats"
+	const want = "the language server did not answer in time (it may still be busy or loading packages); retry later"
 	for name, err := range map[string]error{
 		"20 s request": fmt.Errorf("symbol_info timed out: %w", context.DeadlineExceeded),
 		"3 s probe":    fmt.Errorf("probe: %w", context.DeadlineExceeded),

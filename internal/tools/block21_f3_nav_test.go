@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -168,12 +167,10 @@ func TestBlock21F3_StdlibTopBoundedWhenGoHangs(t *testing.T) {
 
 	oldTimeout := goEnvTimeout
 	goEnvTimeout = 300 * time.Millisecond
-	goRootDir.once = sync.Once{}
-	goRootDir.dir = ""
+	resetGoEnvs()
 	t.Cleanup(func() {
 		goEnvTimeout = oldTimeout
-		goRootDir.once = sync.Once{}
-		goRootDir.dir = ""
+		resetGoEnvs()
 	})
 
 	start := time.Now()

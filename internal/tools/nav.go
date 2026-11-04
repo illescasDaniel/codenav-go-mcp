@@ -551,6 +551,30 @@ func (w *Workspace) navErr(ctx context.Context, err error, file string, line, co
 	return friendlyNavErr(err, file, line, col)
 }
 
+// symbolNavErr routes the language server's answers to a name lookup (search_symbol, and the read tools that look a
+// name up without a position) through the same wording as navErr: "no views" with the file's name when the call names
+// a file, and in generic words when it does not. "no package metadata" is worded for a file only; the failure of the
+// lookup's own scratch file (resolve.ProbeDir) keeps the wording of toolerr, which says that no package is loaded. Any
+// other error is returned unchanged.
+func (w *Workspace) symbolNavErr(ctx context.Context, err error, file string) error {
+	var re *lsp.RequestError
+	if !errors.As(err, &re) {
+		return err
+	}
+	switch {
+	case strings.Contains(re.Message, "no views") && file != "":
+		return w.navErr(ctx, err, file, 0, 0)
+	case strings.Contains(re.Message, "no views"):
+		if p := gomod.Health(ctx, w.Root); p != "" {
+			return toolerr.Inputf("the Go configuration is broken, so the language server has no workspace to search: %s", p)
+		}
+		return toolerr.Inputf("the language server has no workspace to search (no go.mod or go.work covers the workspace root)")
+	case strings.Contains(re.Message, "no package metadata") && file != "" && !strings.Contains(re.Message, resolve.ProbeDir):
+		return w.navErr(ctx, err, file, 0, 0)
+	}
+	return err
+}
+
 // causeBudget bounds the go list lookups of one diagnostics answer together: the broken import paths are looked up
 // in turn, and a hung go command must not make the answer wait for each of them in full.
 var causeBudget = 10 * time.Second
@@ -807,7 +831,7 @@ func RegisterNav(s *mcp.Server, h Host) {
 			}
 			syms, partial, err := w.Client.WorkspaceSymbolCapped(ctx, q)
 			if err != nil {
-				return "", err
+				return "", w.symbolNavErr(ctx, err, "")
 			}
 			return searchAnswer(w.Root, w.Index, q, syms, partial, kinds, pathF, in.Fuzzy), nil
 		})

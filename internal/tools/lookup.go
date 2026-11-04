@@ -47,7 +47,7 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	sym, err := resolve.Resolve(ctx, w.Client, w.Index, w.Root, name, file)
 	var nf *resolve.NotFoundError
 	if !errors.As(err, &nf) {
-		return sym, err
+		return sym, w.symbolNavErr(ctx, err, file)
 	}
 	if cgoQualified(nf.Query) {
 		// NAVN-007: C is the pseudo-package of cgo, which go list cannot load, so no probe is launched for it. A
@@ -68,7 +68,7 @@ func resolveSymbolRO(ctx context.Context, w *Workspace, name, file string) (reso
 	if errors.As(perr, &pe) {
 		return sym, toolerr.NotFoundf("No symbol found matching %q: %s.", nf.Query, pe.Msg)
 	}
-	return sym, perr
+	return sym, w.symbolNavErr(ctx, perr, file)
 }
 
 // maxImportScan bounds how many workspace files workspaceImports parses.
