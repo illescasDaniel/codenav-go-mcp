@@ -1,6 +1,9 @@
 package server
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -61,6 +64,7 @@ func TestBlock20NWorkspaceToolNamesSettings(t *testing.T) {
 // so the answer must not read as "no workspace uses". The dependency is the offline
 // testify module, so the test needs no network.
 func TestBlock20NReferencesThroughSessionDropsDependencySites(t *testing.T) {
+	skipWithoutCachedModule(t, "github.com/stretchr/testify@v1.11.1")
 	cs, root := session(t, map[string]string{"GOPROXY": "off", "GOSUMDB": "off"})
 	writeFile(t, root, "go.mod", "module example.com/n2ref\n\ngo 1.21\n\nrequire github.com/stretchr/testify v1.11.1\n")
 	writeFile(t, root, "go.sum", n2TestifyGoSum)
@@ -85,3 +89,15 @@ gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8
 gopkg.in/yaml.v3 v3.0.1 h1:fxVm/GzAzEWqLHuvctI91KS9hhNmmWOoWu0XTYJS7CA=
 gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
 `
+
+// skipWithoutCachedModule skips a test that runs with GOPROXY=off when the module is not in the module cache.
+func skipWithoutCachedModule(t *testing.T, mod string) {
+	t.Helper()
+	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		t.Skip("go env GOMODCACHE failed")
+	}
+	if _, err := os.Stat(filepath.Join(strings.TrimSpace(string(out)), filepath.FromSlash(mod))); err != nil {
+		t.Skipf("%s is not in the offline module cache (go mod download %s)", mod, mod)
+	}
+}

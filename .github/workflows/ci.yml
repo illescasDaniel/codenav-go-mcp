@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version-file: go.mod }
       - run: go install golang.org/x/tools/gopls@v0.24.0
+      - run: go mod download github.com/stretchr/testify@v1.11.1 github.com/davecgh/go-spew@v1.1.1 github.com/pmezard/go-difflib@v1.0.0 gopkg.in/yaml.v3@v3.0.1 golang.org/x/sys@v0.30.0
       - run: test -z "$(gofmt -l .)"
       - run: go build ./...
       - run: go vet ./...
