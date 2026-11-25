@@ -13,7 +13,7 @@ import (
 // tools write nothing, so they are read-only there too. A new tool must be classified here.
 func TestToolAnnotations(t *testing.T) {
 	writeTools := map[string]bool{"edit": true, "edit_symbol": true, "rename_symbol": true, "change_signature": true,
-		"move": true, "quick_fix": true, "apply_edit": true, "undo_edit": true}
+		"move": true, "quick_fix": true, "apply_edit": true, "undo_edit": true, "batch": true}
 	readTools := map[string]bool{"workspace": true, "hover": true, "definition": true, "references": true,
 		"search_symbol": true, "diagnostics": true, "symbol_info": true, "outline": true, "callers": true,
 		"implementations": true, "verify_changes": true}

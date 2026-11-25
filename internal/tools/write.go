@@ -442,6 +442,9 @@ func readOnlyDesc(desc string, readOnly bool) string {
 // read-only server it writes nothing, so it is read-only there.
 func addWrite[In any](s *mcp.Server, h Host, readOnly bool, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	registerUsage[In](name)
+	if r, ok := h.(interface{ RegisterBatchTool(string, bool) }); ok {
+		r.RegisterBatchTool(name, true)
+	}
 	t := &mcp.Tool{Name: name, Description: readOnlyDesc(desc, readOnly), Annotations: &mcp.ToolAnnotations{
 		ReadOnlyHint: readOnly, DestructiveHint: boolPtr(true), IdempotentHint: false, OpenWorldHint: boolPtr(false),
 	}}

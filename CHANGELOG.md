@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0
+
+- Add `batch` to run up to 25 navigation and edit calls sequentially in one MCP request,
+  with per-call results, configurable error handling, and the existing write safeguards.
+
 ## 1.0.1
 
 - Documentation: the command now has a package comment, shown on pkg.go.dev.

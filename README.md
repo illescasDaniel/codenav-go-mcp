@@ -89,9 +89,30 @@ packages under `internal/` are not an API. Known limits are in [docs/KNOWN-ISSUE
 | `search_symbol` | Workspace symbol search (ranked; `kind=`, `path=`, `fuzzy=` filters). Exact and prefix matches come from an own declaration index, so they are never capped or missed and give the count; gopls adds the fuzzy ones after them, as a labelled sample when it is capped at 100 |
 | `workspace` | Which directory is being navigated, and why |
 | `hover`, `definition`, `references` | Position tools: `file_path`, `line`, `column` (1-indexed). `diagnostics` takes `file_path` only |
+| `batch` | Run several tool calls in one request |
 
 Names may be dotted: `Type.Method`, `Type.Field`, `pkg.Name` (`pkg` is the package name or its directory's name). `name` and `query` are
 aliases. A missing required parameter (of any tool; an explicit JSON `null` counts as missing, and as not given for an optional one) gets `Missing required parameter(s): x, y.` plus the tool's usage, not a raw schema error.
+
+## Several calls in one request: `batch`
+
+Use `batch` to combine navigation and edits into one request:
+
+```json
+{"calls": [
+  {"tool": "outline", "args": {"file_path": "cart/cart.go"}},
+  {"tool": "symbol_info", "args": {"name": "Cart"}},
+  {"tool": "edit", "args": {"file_path": "cart/cart.go", "old_string": "oldName", "new_string": "newName", "apply": false}}
+]}
+```
+
+Calls run sequentially through the same tools and safety checks as individual requests.
+Each has a numbered result, followed by a summary. By default a batch containing a write
+stops after a failure; a read-only batch continues. Set `stop_on_error` explicitly to
+override that behavior. A batch is not atomic: successful edits remain applied if a later
+call fails, and each edit retains its own preview or undo ID. Later calls can see earlier
+edits; prefer names over positions calculated before an edit. A batch accepts at most 25
+calls, cannot contain another batch, and limits the size of each result.
 
 ## Example
 

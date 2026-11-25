@@ -63,6 +63,9 @@ func text(s string) *mcp.CallToolResult {
 // add registers a read-only text tool; expected errors become tool text (isError set, see finishResult).
 func add[In any](s *mcp.Server, h Host, name, desc string, fn func(ctx context.Context, w *Workspace, in In) (string, error)) {
 	registerUsage[In](name)
+	if r, ok := h.(interface{ RegisterBatchTool(string, bool) }); ok {
+		r.RegisterBatchTool(name, false)
+	}
 	t := &mcp.Tool{Name: name, Description: desc, Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, OpenWorldHint: boolPtr(false)}}
 	mcp.AddTool(s, t, func(ctx context.Context, req *mcp.CallToolRequest, in In) (*mcp.CallToolResult, any, error) {
 		out, w, err := retryAfterRestart(ctx, h, req.Session, in, func(ctx context.Context, w *Workspace, in In) (string, error) {

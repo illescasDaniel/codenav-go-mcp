@@ -1,5 +1,6 @@
 /codenav-go-mcp
 *.test
+/dist/
 
 # QA workspace (beds, bug notes, fix patches, logs)
 qa/

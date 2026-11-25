@@ -33,8 +33,9 @@ const (
 
 // Manager owns the selected workspace and the gopls client serving it.
 type Manager struct {
-	selector *workspace.Selector
-	board    *notices.Board
+	selector   *workspace.Selector
+	board      *notices.Board
+	batchTools map[string]bool
 
 	mu     sync.Mutex
 	client *lsp.Client
@@ -49,8 +50,11 @@ type Manager struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{selector: workspace.NewSelector(EnvWorkspace), board: notices.NewBoard(ServerName)}
+	return &Manager{selector: workspace.NewSelector(EnvWorkspace), board: notices.NewBoard(ServerName), batchTools: make(map[string]bool)}
 }
+
+// RegisterBatchTool records the tools actually installed on this server instance.
+func (m *Manager) RegisterBatchTool(name string, writes bool) { m.batchTools[name] = writes }
 
 func (m *Manager) Notes() *notices.Board { return m.board }
 
@@ -244,11 +248,14 @@ func New(version string) (*mcp.Server, *Manager) {
 			"The edit tools (edit, edit_symbol, rename_symbol, change_signature, move, quick_fix) only preview here: this server is read-only, so they type-check the change in memory and show the diff and the new errors, but write nothing. " +
 			"verify_changes re-checks the workspace."
 	}
+	instructions += " Use batch(calls=[{tool, args}, ...]) to run several tools in order in one request."
 	s := mcp.NewServer(&mcp.Implementation{Name: ServerName, Version: version}, &mcp.ServerOptions{Instructions: instructions})
 	s.AddReceivingMiddleware(tools.FriendlyValidation)
+	s.AddReceivingMiddleware(batchDispatch)
 	s.AddReceivingMiddleware(m.rootsChanged)
 	tools.RegisterNav(s, m)
 	tools.RegisterWrite(s, m, readOnly)
+	registerBatch(s, m.batchTools, readOnly)
 	return s, m
 }
 
