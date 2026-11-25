@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.1.1
+
+- Fix the version reported by binaries installed with `go install`.
+
 ## 1.1.0
 
 - Add `batch` to run up to 25 navigation and edit calls sequentially in one MCP request,

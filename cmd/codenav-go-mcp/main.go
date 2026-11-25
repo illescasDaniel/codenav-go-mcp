@@ -23,13 +23,20 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strings"
 
 	"github.com/illescasDaniel/codenav-go-mcp/internal/server"
 )
 
-var version = "1.0.1"
+var version = "dev"
 
 func main() {
+	if version == "dev" {
+		if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = strings.TrimPrefix(info.Main.Version, "v")
+		}
+	}
 	for _, a := range os.Args[1:] {
 		switch a {
 		case "--version", "-v":
