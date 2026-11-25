@@ -15,5 +15,5 @@
 <path d="M850 141h35m-10-8 10 8-10 8" stroke="#5fc6d4" stroke-width="3" fill="none"/>
 <rect x="895" y="76" width="169" height="132" rx="16" fill="#21384b" stroke="#5fc6d4"/>
 <text x="915" y="113" fill="#ffffff" font-size="23" font-weight="bold">Go project</text><text x="915" y="144" fill="#c4d6df" font-size="16">Files and</text><text x="915" y="170" fill="#c4d6df" font-size="16">packages</text>
-<text x="36" y="256" fill="#c4d6df" font-size="16">Edits are checked before writing • Batches run in order and are not atomic</text>
+<text x="36" y="256" fill="#c4d6df" font-size="16">Edits are normally checked before writing • Batches run in order and are not atomic</text>
 </g></svg>

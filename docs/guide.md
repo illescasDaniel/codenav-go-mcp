@@ -2,7 +2,7 @@
 
 ## Quick start
 
-You need Go and `gopls` (`go install golang.org/x/tools/gopls@latest`).
+You need Go 1.27.3 or newer and `gopls` (`go install golang.org/x/tools/gopls@latest`).
 
 ```bash
 go install github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
@@ -22,9 +22,14 @@ Or without installing, in a project `.mcp.json` (Claude Code) / `.cursor/mcp.jso
 }
 ```
 
-See [.mcp.json.example](../.mcp.json.example). In Cursor also set
-`"CODENAV_GO_MCP_WORKSPACE": "${workspaceFolder}"`, because Cursor may start MCP servers
-from your home directory. Prebuilt binaries are attached to each GitHub release.
+See [.mcp.json.example](../.mcp.json.example). In Cursor, add an `env` property inside
+the `codenav-go` server object because Cursor may start MCP servers from your home directory:
+
+```json
+"env": {"CODENAV_GO_MCP_WORKSPACE": "${workspaceFolder}"}
+```
+
+Prebuilt binaries are attached to each GitHub release.
 
 ### Codex
 
@@ -53,6 +58,21 @@ which project the server sees. For projects using build tags, set
 `CODENAV_GO_MCP_BUILD_FLAGS` in the server's `env` table; see the environment
 variables below. See [Codex MCP configuration](https://developers.openai.com/codex/mcp)
 for client settings.
+
+### OpenCode
+
+With OpenCode 2, from your Go project's directory, add the local server and check its connection:
+
+```bash
+opencode mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
+opencode mcp list
+```
+
+This writes the project configuration. Add `--global` before `--` to make the server
+available across projects. Replace `@latest` with a version such as `@v1.1.1` to pin it.
+OpenCode can also configure environment variables with `--env`; see its
+[MCP server documentation](https://opencode.ai/docs/mcp-servers/). Start OpenCode in
+your project and ask it to use `workspace` to verify the selected directory.
 
 ## Stability
 
@@ -86,7 +106,7 @@ Use `batch` to combine navigation and edits into one request:
 {"calls": [
   {"tool": "outline", "args": {"file_path": "cart/cart.go"}},
   {"tool": "symbol_info", "args": {"name": "Cart"}},
-  {"tool": "edit", "args": {"file_path": "cart/cart.go", "old_string": "oldName", "new_string": "newName", "apply": false}}
+  {"tool": "rename_symbol", "args": {"name": "Cart", "new_name": "Basket", "apply": false}}
 ]}
 ```
 
@@ -97,6 +117,8 @@ override that behavior. A batch is not atomic: successful edits remain applied i
 call fails, and each edit retains its own preview or undo ID. Later calls can see earlier
 edits; prefer names over positions calculated before an edit. A batch accepts at most 25
 calls, cannot contain another batch, and limits the size of each result.
+Individual child failures appear in the sections and summary; the batch result itself
+does not set `isError` for them. Invalid batch requests set `isError`.
 
 ## Example
 
@@ -153,14 +175,14 @@ Edits work the same way: `rename_symbol` writes when the change type-checks, and
 
 ## Errors and empty answers (isError)
 
-Every tool result carries `isError`. It is `true` when the call was refused or failed: a bad or unknown argument, an unknown preview or edit id, a gopls failure, or a write that was not made (new errors over `max_new_errors`, a check the gate cannot make, a write over the file limit, or a read-only server). It is `false` for a valid query that finds nothing (no symbol matches, `No references found at that position.`, `No diagnostics.`) and for a preview. A read tool reports a query with no match as a result, not an error; a write tool reports the same case as an error, because the change was not made. A refused write still shows its diff in the text.
+`isError` is `true` when a call was refused or failed: a bad or unknown argument, an unknown preview or edit id, a gopls failure, or a write that was not made (new errors over `max_new_errors`, a check the gate cannot make, a write over the file limit, or a read-only server). It is false or omitted for a valid query that finds nothing (no symbol matches, `No references found at that position.`, `No diagnostics.`) and for a preview. A read tool reports a query with no match as a result, not an error; a write tool reports the same case as an error, because the change was not made. A refused write still shows its diff in the text.
 
 ## Write tools: type check before every write
 
 The edit is applied to in-memory copies first (a gopls overlay), gopls re-checks the edited
 files, their package and the packages importing them (including external `_test`
 packages), and the response says which diagnostics the edit adds or fixes. Nothing is
-written until that is on the table. Output is gofmt-ed; imports are not added or removed (put the import change in the same edit, or run `quick_fix` with `organize_imports=true`, and the refusal says so), except in a file that was not gofmt-clean before the edit: that one keeps its formatting, so the diff shows the edit only (the output says so).
+normally written until that is on the table. `apply_edit` is an explicit override: it can apply a preview despite diagnostic or other holds, including when checking could not be completed. Output is gofmt-ed; imports are not added or removed (put the import change in the same edit, or run `quick_fix` with `organize_imports=true`, and the refusal says so), except in a file that was not gofmt-clean before the edit: that one keeps its formatting, so the diff shows the edit only (the output says so).
 
 | Tool | Does |
 |------|------|
@@ -169,13 +191,13 @@ written until that is on the table. Output is gofmt-ed; imports are not added or
 | `rename_symbol` | Rename across the workspace (`parameter=` renames a function's parameter instead). Interface methods are renamed together with every implementer (gopls alone leaves them behind and breaks the interface). Lists remaining mentions in comments, strings and docs (for a method or field only selectors, declarations and literal keys count as code, so a package-level func of the same name is not listed; other packages count only as `pkg.Name`). Lower-case names of one or two letters (and `A`, `I`) are also English words, so in comments and text files they count only as `name`, [name], name( or .name; upper-case ones (`U`, `ID`) are searched like any name. A Go function exported to C with `//export` is refused, with the locations in the directive and the cgo preamble to change by hand. Renaming a field that carries a struct tag notes that the tag values (`json:"user_name"`, ...) were not changed |
 | `change_signature` | Add / remove / reorder parameters and rewrite every call site; linked methods follow. Uses as a value are listed as manual work |
 | `move` | With `name`: move a top-level func, type, const or var to another file, in the same or another package (qualifiers and imports rewritten; refuses unexported-use problems, import cycles and name clashes). Without `name`: move a package directory (`file_path` -> `to_file`) and rewrite every import |
-| `quick_fix` | Apply gopls's quick fixes (plus own fixes for `declared and not used`: mark it used, or remove it) and organize imports; ambiguous fixes are listed instead of guessed; organizing imports also drops the heading comments of the imports it removes. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
+| `quick_fix` | Apply gopls's quick fixes (plus own fixes for `declared and not used`: mark it used, or remove it) and organize imports; ambiguous fixes are listed instead of guessed; organizing imports also drops the heading comments of the imports it removes. Ends with `Applied:` and `Not fixed:` lines (with reasons); `choice` that fits only some diagnostics applies nothing unless `strict=false`, and `strict=true` applies nothing unless every targeted diagnostic is fixed |
 | `verify_changes` | Which errors the uncommitted changes gained or lost against git `HEAD` (`include_dependents`) |
 | `apply_edit` / `undo_edit` | Write a previewed edit by id; revert an applied one |
 
-Every write tool writes when the edit adds no more than `max_new_errors` (default 0; `-1` =
+The edit-producing tools normally write when the edit adds no more than `max_new_errors` (default 0; `-1` =
 unlimited; other negative values are refused) errors. Otherwise nothing is written and you get the diagnostics plus an id for
-`apply_edit`. `apply=false` always previews.
+`apply_edit`, which explicitly overrides that limit and other holds. `apply=false` always previews.
 
 Safety rules, enforced in code:
 
@@ -184,7 +206,7 @@ Safety rules, enforced in code:
   leaving the workspace are refused.
 - A preview remembers the exact bytes of every file; `apply_edit` refuses if any file
   changed since. Files are replaced atomically; a failure part-way restores the written ones.
-- Every applied edit is undoable unless the files changed afterwards.
+- Undo history retains the most recent 20 edits in memory and is lost when the server restarts or changes workspaces. Undo also refuses if the affected files changed afterwards.
 - Code that does not parse is never written. CRLF and BOM are preserved.
 - Edits touching more than 40 files need `allow_large=true`.
 - `CODENAV_GO_MCP_READ_ONLY=1` turns every write into a refusal that still shows the full diff; `apply=false` previews as usual and `apply=true` is refused (`apply` stays in the schemas so clients that always send it keep working). `apply_edit` and `undo_edit` are not listed.

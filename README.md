@@ -13,7 +13,7 @@ An agent calls the server, which consults gopls for type-aware answers and check
 
 ## Quick start
 
-Install Go and [gopls](https://pkg.go.dev/golang.org/x/tools/gopls), then add the server to your client:
+Install Go 1.27.3 or newer and [gopls](https://pkg.go.dev/golang.org/x/tools/gopls), then add the server to your client:
 
 ```bash
 # Codex
@@ -21,9 +21,12 @@ codex mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/
 
 # Claude Code
 claude mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
+
+# OpenCode 2 (from your project directory)
+opencode mcp add codenav-go -- go run github.com/illescasDaniel/codenav-go-mcp/cmd/codenav-go-mcp@latest
 ```
 
-Start a new client session in your Go project and ask it to use `workspace` to confirm the selected directory. For project-specific configuration, Cursor, version pinning and environment settings, see the [installation and reference guide](docs/guide.md#quick-start).
+Start a new client session in your Go project and ask it to use `workspace` to confirm the selected directory. For project-specific configuration, [OpenCode options](docs/guide.md#opencode), Cursor, version pinning and environment settings, see the [installation and reference guide](docs/guide.md#quick-start).
 
 ## What it does
 
@@ -34,11 +37,11 @@ Start a new client session in your Go project and ask it to use `workspace` to c
 | Check or recover edits | `verify_changes`, `apply_edit`, `undo_edit` |
 | Combine calls | `batch` runs up to 25 calls in order, with per-call results and configurable failure handling |
 
-Edits are previewable and checked before writing. A batch is **not atomic**: earlier successful edits remain applied if a later call fails. See the [batch examples and write safety rules](docs/guide.md#several-calls-in-one-request-batch).
+Edits are previewable and normally checked before writing; `apply_edit` explicitly overrides diagnostic and other holds. A batch is **not atomic**: earlier successful edits remain applied if a later call fails. See the [batch examples and write safety rules](docs/guide.md#several-calls-in-one-request-batch).
 
 ## Requirements and limits
 
-The server requires Go and gopls. It uses the selected workspace and respects the write safeguards described in the [guide](docs/guide.md#write-tools-type-check-before-every-write). Known limitations and issues are documented in [limitations](docs/LIMITATIONS.md) and [known issues](docs/KNOWN-ISSUES.md). The MCP interface is stable from v1.0.0; response wording can change.
+The server requires Go 1.27.3 or newer and gopls. It uses the selected workspace and respects the write safeguards described in the [guide](docs/guide.md#write-tools-type-check-before-every-write). Known limitations and issues are documented in [limitations](docs/LIMITATIONS.md) and [known issues](docs/KNOWN-ISSUES.md). The MCP interface is stable from v1.0.0; response wording can change.
 
 ## Try it and develop
 
