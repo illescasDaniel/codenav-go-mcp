@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="290" viewBox="0 0 1100 290" role="img" aria-labelledby="title desc">
+<title id="title">How codenav-go-mcp works</title>
+<desc id="desc">An agent sends individual or batched calls to codenav-go-mcp. The server uses gopls to navigate Go code and checks edits before applying them. Results and undo identifiers return to the agent.</desc>
+<rect width="1100" height="290" rx="24" fill="#101e2e"/>
+<text x="36" y="45" fill="#a8dfe8" font-family="sans-serif" font-size="17" font-weight="bold" letter-spacing="2">FROM QUESTION TO SAFE CHANGE</text>
+<g font-family="sans-serif">
+<rect x="36" y="76" width="210" height="132" rx="16" fill="#21384b" stroke="#5fc6d4"/>
+<text x="56" y="113" fill="#ffffff" font-size="23" font-weight="bold">AI agent</text><text x="56" y="144" fill="#c4d6df" font-size="16">One call or a batch</text><text x="56" y="170" fill="#c4d6df" font-size="16">of up to 25 calls</text>
+<path d="M255 141h45m-10-8 10 8-10 8" stroke="#5fc6d4" stroke-width="3" fill="none"/>
+<rect x="310" y="76" width="245" height="132" rx="16" fill="#21384b" stroke="#5fc6d4"/>
+<text x="330" y="113" fill="#ffffff" font-size="23" font-weight="bold">codenav-go-mcp</text><text x="330" y="144" fill="#c4d6df" font-size="16">Navigate, edit, preview</text><text x="330" y="170" fill="#c4d6df" font-size="16">and undo</text>
+<path d="M565 141h45m-10-8 10 8-10 8" stroke="#5fc6d4" stroke-width="3" fill="none"/>
+<rect x="620" y="76" width="220" height="132" rx="16" fill="#21384b" stroke="#5fc6d4"/>
+<text x="640" y="113" fill="#ffffff" font-size="23" font-weight="bold">gopls</text><text x="640" y="144" fill="#c4d6df" font-size="16">Type-resolved answers</text><text x="640" y="170" fill="#c4d6df" font-size="16">and edit checks</text>
+<path d="M850 141h35m-10-8 10 8-10 8" stroke="#5fc6d4" stroke-width="3" fill="none"/>
+<rect x="895" y="76" width="169" height="132" rx="16" fill="#21384b" stroke="#5fc6d4"/>
+<text x="915" y="113" fill="#ffffff" font-size="23" font-weight="bold">Go project</text><text x="915" y="144" fill="#c4d6df" font-size="16">Files and</text><text x="915" y="170" fill="#c4d6df" font-size="16">packages</text>
+<text x="36" y="256" fill="#c4d6df" font-size="16">Edits are checked before writing • Batches run in order and are not atomic</text>
+</g></svg>
